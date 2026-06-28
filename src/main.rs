@@ -1,10 +1,11 @@
-use std::convert::Infallible;
-use std::ffi::CString;
+mod cstring;
+
 use std::mem;
 use std::process::ExitCode;
 
 use clap::Parser;
 use clap::Subcommand;
+use cstring::CString;
 use nix::errno::Errno;
 use nix::sched::CloneFlags;
 use nix::unistd::Pid;
@@ -111,13 +112,9 @@ fn run_container(
                 tracing::error!(%e, "sethostname failed");
             }
 
-            match execvp(command) {
-                Ok(_) => unreachable!(),
-                Err(errno) => {
-                    tracing::error!(%errno, "execvp failed");
-                    std::process::exit(1)
-                }
-            }
+            let errno = execvp(command);
+            tracing::error!(%errno, "execvp failed");
+            std::process::exit(1)
         }
         Ok(Some(pid)) => {
             // Parent — monitor the child
@@ -161,7 +158,7 @@ fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
     };
 
     if ret < 0 {
-        return Err(nix::errno::Errno::last());
+        return Err(Errno::last());
     }
 
     Ok(if ret == 0 {
@@ -172,15 +169,11 @@ fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
 }
 
 /// Replace the current process with the given command.
-fn execvp(command: Vec<CString>) -> nix::Result<Infallible> {
-    assert!(!command.is_empty());
-    let mut cargs: Vec<*const libc::c_char> = command
-        .into_iter()
-        .map(|x| x.into_raw() as *const _)
-        .collect();
-    cargs.push(std::ptr::null());
-    let errno = unsafe { libc::execvp(cargs[0], cargs.as_ptr()) };
-    Err(Errno::from_raw(errno))
+fn execvp(command: Vec<CString>) -> Errno {
+    let mut argv = CString::into_ptr_vec(command);
+    argv.push(std::ptr::null());
+    unsafe { libc::execvp(argv[0], argv.as_ptr()) };
+    Errno::last()
 }
 
 /// Wait for a child process and return its exit code.
