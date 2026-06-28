@@ -1,9 +1,11 @@
+use std::convert::Infallible;
 use std::ffi::CString;
 use std::mem;
 use std::process::ExitCode;
 
 use clap::Parser;
 use clap::Subcommand;
+use nix::errno::Errno;
 use nix::sched::CloneFlags;
 use nix::unistd::Pid;
 use tracing::level_filters::LevelFilter;
@@ -37,7 +39,7 @@ enum Command {
         t: bool,
 
         /// Command to run inside the container
-        command: Vec<String>,
+        command: Vec<CString>,
     },
     /// Start the daemon
     Daemon,
@@ -91,7 +93,7 @@ fn run_container(
     _cpu: Option<u8>,
     _memory: Option<String>,
     _tty: bool,
-    command: Vec<String>,
+    command: Vec<CString>,
 ) -> ExitCode {
     let flags = CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNS
@@ -108,7 +110,14 @@ fn run_container(
             if let Err(e) = nix::unistd::sethostname("conrt") {
                 tracing::error!(%e, "sethostname failed");
             }
-            execvp_or_exit(&command);
+
+            match execvp(command) {
+                Ok(_) => unreachable!(),
+                Err(errno) => {
+                    tracing::error!(%errno, "execvp failed");
+                    std::process::exit(1)
+                }
+            }
         }
         Ok(Some(pid)) => {
             // Parent — monitor the child
@@ -155,27 +164,23 @@ fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
         return Err(nix::errno::Errno::last());
     }
 
-    if ret == 0 {
-        Ok(None)
+    Ok(if ret == 0 {
+        None
     } else {
-        Ok(Some(Pid::from_raw(ret as i32)))
-    }
+        Some(Pid::from_raw(ret as i32))
+    })
 }
 
 /// Replace the current process with the given command.
-fn execvp_or_exit(command: &[String]) -> ! {
-    if !command.is_empty() {
-        let c_cmd = CString::new(command[0].as_bytes()).unwrap();
-        let mut cargs: Vec<*const libc::c_char> = command
-            .iter()
-            .map(|a| CString::new(a.as_bytes()).unwrap().into_raw() as *const libc::c_char)
-            .collect();
-        cargs.push(std::ptr::null());
-        unsafe {
-            libc::execvp(c_cmd.as_ptr(), cargs.as_ptr());
-        }
-    }
-    std::process::exit(1);
+fn execvp(command: Vec<CString>) -> nix::Result<Infallible> {
+    assert!(!command.is_empty());
+    let mut cargs: Vec<*const libc::c_char> = command
+        .into_iter()
+        .map(|x| x.into_raw() as *const _)
+        .collect();
+    cargs.push(std::ptr::null());
+    let errno = unsafe { libc::execvp(cargs[0], cargs.as_ptr()) };
+    Err(Errno::from_raw(errno))
 }
 
 /// Wait for a child process and return its exit code.
