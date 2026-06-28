@@ -11,9 +11,6 @@ use cstring::CString;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
-const CLONE_FLAGS: c_int =
-    libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
-
 #[derive(Parser)]
 #[command(name = "conrt")]
 struct Cli {
@@ -98,7 +95,7 @@ fn run_container(
     _tty: bool,
     command: Vec<CString>,
 ) -> ExitCode {
-    match clone3(CLONE_FLAGS as _, libc::SIGCHLD) {
+    match clone3_container() {
         Err(e) => {
             tracing::error!(%e, "clone3 failed");
             ExitCode::FAILURE
@@ -126,6 +123,13 @@ fn run_container(
             }
         }
     }
+}
+
+fn clone3_container() -> io::Result<Option<libc::pid_t>> {
+    const CLONE_FLAGS: c_int =
+        libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+
+    clone3(CLONE_FLAGS as _, libc::SIGCHLD)
 }
 
 /// Raw clone3 syscall wrapper (Linux 5.3+).
