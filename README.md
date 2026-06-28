@@ -9,33 +9,34 @@ seccomp), process and memory management in Rust, and a few classic data structur
 conrt uses a **single daemon** process model:
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │                    Daemon (host ns)                      │
 │                                                          │
-│  Event loop (epoll or tokio)                             │
-│  ├── clone() → child₁ ───┬── PID 1 in ns₁               │
-│  ├── clone() → child₂ ───┬── PID 1 in ns₂               │
-│  ├── clone() → child₃ ───┬── PID 1 in ns₃               │
-│  │                                                        │
-│  ├── PTY reader thread per container                      │
-│  │    └── reads bytes from PTY master FD                 │
-│  │         ├── line-buffer until \n                       │
-│  │         ├── push(Vec<u8>) to RingBuffer                │
-│  │         └── write to attached caller's stdout          │
-│  │                                                        │
-│  ├── Unix socket listener for conrt logs <id>            │
-│  │    └── reads from RingBuffer, sends to client         │
-│  │                                                        │
-│  └── SIGCHLD handler → reap exited children, clean up    │
-└─────────────────────────────────────────────────────────┘
+│  Single io_uring ring (no epoll, no tokio)               │
+│                                                          │
+│  SQEs:                                                   │
+│  ├── IORING_OP_WAITID → child₁                           │
+│  ├── IORING_OP_WAITID → child₂                           │
+│  ├── IORING_OP_READ    → PTY master for container 1      │
+│  ├── IORING_OP_READ    → PTY master for container 2      │
+│  ├── IORING_OP_ACCEPT  → Unix socket                     │
+│  ├── IORING_OP_READ    → connected client socket         │
+│  ├── IORING_OP_WRITE   → connected client socket         │
+│  └── ...                                                 │
+│                                                          │
+│  loop: io_uring_wait_cqe() → match op → submit new SQEs  │
+│                                                          │
+│  No separate threads. All I/O through one ring.          │
+└──────────────────────────────────────────────────────────┘
 ```
 
 Key points:
 - **One daemon** manages N containers, not a parent process per container
-- Daemon `waitpid()`s on all children through an event loop
+- All I/O goes through a single `io_uring` ring — PTY reads, socket accept/read/write, child reaping (`IORING_OP_WAITID`). No separate threads.
 - Daemon handles all host-side teardown (cgroup deletion, veth cleanup, overlay unmount)
 - PTY interception gives `conrt logs <id>` access to historical output
 - No container-level reaper in v1 (user command is PID 1; `--init` can be added later)
+- `io-uring` crate used directly — no wrapper abstractions on top
 
 ## RingBuffer Data Structure
 
@@ -64,11 +65,11 @@ container process ──write()──► PTY slave
                                     ▼
                               PTY master FD (daemon)
                                     │
-                          daemon reader thread
+                         io_uring IORING_OP_READ
                                     │
                          line-buffer until \n
                                     │
-                         ┌──────────┼──────────┐
+                         ┌──────────┼───────────┐
                          ▼          ▼          ▼
                     RingBuffer   caller stdout  (future: file)
                     (conrt logs)  (--attach)
@@ -134,7 +135,8 @@ container process ──write()──► PTY slave
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `tokio` or `mio` — async I/O for event loop (deferred to implementation)
+- `io-uring` — raw io_uring bindings for the daemon event loop (no wrapper)
+- `libc` — direct syscall access for clone3
 
 ## Building
 
