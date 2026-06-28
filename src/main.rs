@@ -1,6 +1,11 @@
-use anyhow::Result;
+use std::ffi::CString;
+use std::mem;
+use std::process::ExitCode;
+
 use clap::Parser;
 use clap::Subcommand;
+use nix::sched::CloneFlags;
+use nix::unistd::Pid;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -15,9 +20,9 @@ struct Cli {
 enum Command {
     /// Run a container
     Run {
-        /// Path to the root filesystem
+        /// Path to the root filesystem (optional; uses host rootfs if omitted)
         #[arg(long)]
-        rootfs: String,
+        rootfs: Option<String>,
 
         /// CPU limit as a percentage (1-100)
         #[arg(long)]
@@ -50,13 +55,13 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
                 .from_env()
-                .unwrap(), // .add_directive("some-crate=warn".parse().unwrap()),
+                .unwrap(),
         )
         .init();
 
@@ -65,42 +70,127 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Daemon => run_daemon(),
         Command::Run {
-            rootfs,
+            rootfs: _rootfs,
             cpu,
             memory,
             t,
             command,
-        } => run_container(rootfs, cpu, memory, t, command),
+        } => run_container(cpu, memory, t, command),
         Command::Logs { id } => show_logs(id),
         Command::List => list_containers(),
         Command::Kill { id } => kill_container(id),
     }
 }
 
-fn run_daemon() -> Result<()> {
+fn run_daemon() -> ExitCode {
     tracing::info!("starting daemon");
     todo!("daemon event loop")
 }
 
 fn run_container(
-    _rootfs: String,
     _cpu: Option<u8>,
     _memory: Option<String>,
     _tty: bool,
-    _command: Vec<String>,
-) -> Result<()> {
-    tracing::info!("running container");
-    todo!("container creation")
+    command: Vec<String>,
+) -> ExitCode {
+    let flags = CloneFlags::CLONE_NEWPID
+        | CloneFlags::CLONE_NEWNS
+        | CloneFlags::CLONE_NEWUTS
+        | CloneFlags::CLONE_NEWIPC;
+
+    let child_pid = clone3_exec(&command, flags);
+
+    match child_pid {
+        Ok(pid) => {
+            tracing::info!(child = %pid, "container started");
+
+            match nix::sys::wait::waitpid(pid, None) {
+                Ok(status) => {
+                    tracing::info!(?status, "container exited");
+                    match status {
+                        nix::sys::wait::WaitStatus::Exited(_, code) => ExitCode::from(code as u8),
+                        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+                            ExitCode::from(128 + sig as i32 as u8)
+                        }
+                        _ => ExitCode::FAILURE,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(%e, "waitpid failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "clone3 failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn show_logs(_id: String) -> Result<()> {
+/// Create a child process in new namespaces via the clone3 syscall.
+///
+/// Uses clone3 (Linux 5.3+) instead of glibc's clone wrapper to avoid
+/// CLI>NEWPID making the child PID 1 in the new PID namespace.
+fn clone3_exec(command: &[String], flags: CloneFlags) -> nix::Result<Pid> {
+    let args = libc::clone_args {
+        flags: flags.bits() as u64,
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: libc::SIGCHLD as u64,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
+    };
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const libc::clone_args as i64,
+            mem::size_of::<libc::clone_args>() as i64,
+        )
+    };
+
+    if ret < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+
+    if ret == 0 {
+        // Child process — in new namespaces, PID 1
+        if let Err(e) = nix::unistd::sethostname("conrt") {
+            tracing::error!(%e, "sethostname failed");
+        }
+
+        if !command.is_empty() {
+            let c_cmd = CString::new(command[0].as_bytes()).unwrap();
+            let mut cargs: Vec<*const libc::c_char> = command
+                .iter()
+                .map(|a| CString::new(a.as_bytes()).unwrap().into_raw() as *const libc::c_char)
+                .collect();
+            cargs.push(std::ptr::null());
+            unsafe {
+                libc::execvp(c_cmd.as_ptr(), cargs.as_ptr());
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // Parent
+    Ok(Pid::from_raw(ret as i32))
+}
+
+fn show_logs(_id: String) -> ExitCode {
     todo!("container logs")
 }
 
-fn list_containers() -> Result<()> {
+fn list_containers() -> ExitCode {
     todo!("list containers")
 }
 
-fn kill_container(_id: String) -> Result<()> {
+fn kill_container(_id: String) -> ExitCode {
     todo!("kill container")
 }
