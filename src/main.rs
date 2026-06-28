@@ -98,47 +98,43 @@ fn run_container(
         | CloneFlags::CLONE_NEWUTS
         | CloneFlags::CLONE_NEWIPC;
 
-    let child_pid = clone3_exec(&command, flags);
-
-    match child_pid {
-        Ok(pid) => {
-            tracing::info!(child = %pid, "container started");
-
-            match nix::sys::wait::waitpid(pid, None) {
-                Ok(status) => {
-                    tracing::info!(?status, "container exited");
-                    match status {
-                        nix::sys::wait::WaitStatus::Exited(_, code) => ExitCode::from(code as u8),
-                        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
-                            ExitCode::from(128 + sig as i32 as u8)
-                        }
-                        _ => ExitCode::FAILURE,
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(%e, "waitpid failed");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+    match clone3(flags, libc::SIGCHLD) {
         Err(e) => {
             tracing::error!(%e, "clone3 failed");
             ExitCode::FAILURE
         }
+        Ok(None) => {
+            // Child process — in new namespaces as PID 1
+            if let Err(e) = nix::unistd::sethostname("conrt") {
+                tracing::error!(%e, "sethostname failed");
+            }
+            execvp_or_exit(&command);
+        }
+        Ok(Some(pid)) => {
+            // Parent — monitor the child
+            tracing::info!(child = %pid, "container started");
+            match wait_for_child(pid) {
+                Ok(code) => code,
+                Err(e) => {
+                    tracing::error!(%e, "wait failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
-/// Create a child process in new namespaces via the clone3 syscall.
+/// Raw clone3 syscall wrapper (Linux 5.3+).
 ///
-/// Uses clone3 (Linux 5.3+) instead of glibc's clone wrapper to avoid
-/// CLI>NEWPID making the child PID 1 in the new PID namespace.
-fn clone3_exec(command: &[String], flags: CloneFlags) -> nix::Result<Pid> {
+/// Returns `Ok(None)` in the child, `Ok(Some(pid))` in the parent.
+/// Avoids glibc's clone wrapper entirely — no stack allocation needed.
+fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
     let args = libc::clone_args {
         flags: flags.bits() as u64,
         pidfd: 0,
         child_tid: 0,
         parent_tid: 0,
-        exit_signal: libc::SIGCHLD as u64,
+        exit_signal: exit_signal as u64,
         stack: 0,
         stack_size: 0,
         tls: 0,
@@ -160,27 +156,39 @@ fn clone3_exec(command: &[String], flags: CloneFlags) -> nix::Result<Pid> {
     }
 
     if ret == 0 {
-        // Child process — in new namespaces, PID 1
-        if let Err(e) = nix::unistd::sethostname("conrt") {
-            tracing::error!(%e, "sethostname failed");
-        }
-
-        if !command.is_empty() {
-            let c_cmd = CString::new(command[0].as_bytes()).unwrap();
-            let mut cargs: Vec<*const libc::c_char> = command
-                .iter()
-                .map(|a| CString::new(a.as_bytes()).unwrap().into_raw() as *const libc::c_char)
-                .collect();
-            cargs.push(std::ptr::null());
-            unsafe {
-                libc::execvp(c_cmd.as_ptr(), cargs.as_ptr());
-            }
-        }
-        std::process::exit(1);
+        Ok(None)
+    } else {
+        Ok(Some(Pid::from_raw(ret as i32)))
     }
+}
 
-    // Parent
-    Ok(Pid::from_raw(ret as i32))
+/// Replace the current process with the given command.
+fn execvp_or_exit(command: &[String]) -> ! {
+    if !command.is_empty() {
+        let c_cmd = CString::new(command[0].as_bytes()).unwrap();
+        let mut cargs: Vec<*const libc::c_char> = command
+            .iter()
+            .map(|a| CString::new(a.as_bytes()).unwrap().into_raw() as *const libc::c_char)
+            .collect();
+        cargs.push(std::ptr::null());
+        unsafe {
+            libc::execvp(c_cmd.as_ptr(), cargs.as_ptr());
+        }
+    }
+    std::process::exit(1);
+}
+
+/// Wait for a child process and return its exit code.
+fn wait_for_child(pid: Pid) -> nix::Result<ExitCode> {
+    let status = nix::sys::wait::waitpid(pid, None)?;
+    tracing::info!(?status, "container exited");
+    match status {
+        nix::sys::wait::WaitStatus::Exited(_, code) => Ok(ExitCode::from(code as u8)),
+        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
+            Ok(ExitCode::from(128 + sig as i32 as u8))
+        }
+        _ => Ok(ExitCode::FAILURE),
+    }
 }
 
 fn show_logs(_id: String) -> ExitCode {
