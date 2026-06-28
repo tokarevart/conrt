@@ -131,7 +131,7 @@ container process ──write()──► PTY slave
 ## Dependencies
 
 - Rust edition 2024
-- `nix` — syscall wrappers (clone, mount, pivot_root, sethostname, ...)
+- `libc` — raw C FFI (syscalls, wait macros, hostname, ...)
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging

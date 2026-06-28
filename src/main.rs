@@ -1,16 +1,18 @@
 mod cstring;
 
+use std::ffi::c_int;
+use std::io;
 use std::mem;
 use std::process::ExitCode;
 
 use clap::Parser;
 use clap::Subcommand;
 use cstring::CString;
-use nix::errno::Errno;
-use nix::sched::CloneFlags;
-use nix::unistd::Pid;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
+
+const CLONE_FLAGS: c_int =
+    libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
 
 #[derive(Parser)]
 #[command(name = "conrt")]
@@ -96,19 +98,15 @@ fn run_container(
     _tty: bool,
     command: Vec<CString>,
 ) -> ExitCode {
-    let flags = CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWIPC;
-
-    match clone3(flags, libc::SIGCHLD) {
+    match clone3(CLONE_FLAGS as _, libc::SIGCHLD) {
         Err(e) => {
             tracing::error!(%e, "clone3 failed");
             ExitCode::FAILURE
         }
         Ok(None) => {
             // Child process — in new namespaces as PID 1
-            if let Err(e) = nix::unistd::sethostname("conrt") {
+            if unsafe { libc::sethostname(c"conrt".as_ptr() as _, 5) } < 0 {
+                let e = io::Error::last_os_error();
                 tracing::error!(%e, "sethostname failed");
             }
 
@@ -118,7 +116,7 @@ fn run_container(
         }
         Ok(Some(pid)) => {
             // Parent — monitor the child
-            tracing::info!(child = %pid, "container started");
+            tracing::info!(child = pid, "container started");
             match wait_for_child(pid) {
                 Ok(code) => code,
                 Err(e) => {
@@ -134,9 +132,9 @@ fn run_container(
 ///
 /// Returns `Ok(None)` in the child, `Ok(Some(pid))` in the parent.
 /// Avoids glibc's clone wrapper entirely — no stack allocation needed.
-fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
+fn clone3(flags: u64, exit_signal: i32) -> io::Result<Option<libc::pid_t>> {
     let args = libc::clone_args {
-        flags: flags.bits() as u64,
+        flags,
         pidfd: 0,
         child_tid: 0,
         parent_tid: 0,
@@ -158,34 +156,38 @@ fn clone3(flags: CloneFlags, exit_signal: i32) -> nix::Result<Option<Pid>> {
     };
 
     if ret < 0 {
-        return Err(Errno::last());
+        return Err(io::Error::last_os_error());
     }
 
     Ok(if ret == 0 {
         None
     } else {
-        Some(Pid::from_raw(ret as i32))
+        Some(ret as libc::pid_t)
     })
 }
 
 /// Replace the current process with the given command.
-fn execvp(command: Vec<CString>) -> Errno {
+fn execvp(command: Vec<CString>) -> io::Error {
     let mut argv = CString::into_ptr_vec(command);
     argv.push(std::ptr::null());
     unsafe { libc::execvp(argv[0], argv.as_ptr()) };
-    Errno::last()
+    io::Error::last_os_error()
 }
 
 /// Wait for a child process and return its exit code.
-fn wait_for_child(pid: Pid) -> nix::Result<ExitCode> {
-    let status = nix::sys::wait::waitpid(pid, None)?;
-    tracing::info!(?status, "container exited");
-    match status {
-        nix::sys::wait::WaitStatus::Exited(_, code) => Ok(ExitCode::from(code as u8)),
-        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => {
-            Ok(ExitCode::from(128 + sig as i32 as u8))
-        }
-        _ => Ok(ExitCode::FAILURE),
+fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
+    let mut status: i32 = 0;
+    let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    tracing::info!(%status, "container exited");
+    if libc::WIFEXITED(status) {
+        Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
+    } else if libc::WIFSIGNALED(status) {
+        Ok(ExitCode::from(128 + libc::WTERMSIG(status) as u8))
+    } else {
+        Ok(ExitCode::FAILURE)
     }
 }
 

@@ -65,7 +65,7 @@ fn demo_glibc_clone() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let pid = nix::unistd::Pid::from_raw(ret);
+    let pid = ret;
     eprintln!("glibc clone: child PID = {}", pid);
     eprintln!("  -> 1 MB stack allocated via vec![0u8; 1 << 20] (see strace for mmap)");
 
@@ -111,7 +111,7 @@ fn demo_clone3() -> ExitCode {
         std::process::exit(1);
     }
 
-    let pid = nix::unistd::Pid::from_raw(ret as i32);
+    let pid = ret as i32;
     eprintln!("clone3: child PID = {}", pid);
     eprintln!("  -> No stack allocation (stack=0, kernel uses COW)");
 
@@ -145,16 +145,18 @@ fn demo_null_stack() -> ExitCode {
     }
 }
 
-fn wait_and_exit(pid: nix::unistd::Pid) -> ExitCode {
-    match nix::sys::wait::waitpid(pid, None) {
-        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => ExitCode::from(code as u8),
-        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-            ExitCode::from(128 + sig as i32 as u8)
-        }
-        Ok(_) => ExitCode::FAILURE,
-        Err(e) => {
-            eprintln!("waitpid failed: {}", e);
-            ExitCode::FAILURE
-        }
+fn wait_and_exit(pid: i32) -> ExitCode {
+    let mut status: i32 = 0;
+    let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if ret < 0 {
+        eprintln!("waitpid failed: {}", std::io::Error::last_os_error());
+        return ExitCode::FAILURE;
+    }
+    if libc::WIFEXITED(status) {
+        ExitCode::from(libc::WEXITSTATUS(status) as u8)
+    } else if libc::WIFSIGNALED(status) {
+        ExitCode::from(128 + libc::WTERMSIG(status) as u8)
+    } else {
+        ExitCode::FAILURE
     }
 }
