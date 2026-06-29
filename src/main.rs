@@ -115,7 +115,8 @@ fn run_container(
                 std::process::exit(1);
             }
 
-            if unsafe { libc::sethostname(c"conrt".as_ptr() as _, 5) } < 0 {
+            const HOSTNAME: &str = "conrt";
+            if unsafe { libc::sethostname(HOSTNAME.as_ptr() as _, HOSTNAME.len()) } < 0 {
                 let e = io::Error::last_os_error();
                 tracing::error!(%e, "sethostname failed");
             }
