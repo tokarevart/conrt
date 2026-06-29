@@ -1,5 +1,6 @@
 mod cstring;
 mod interprocess;
+mod sys;
 
 use std::ffi::c_int;
 use std::io;
@@ -115,9 +116,10 @@ fn run_container(
                 std::process::exit(1);
             }
 
-            const HOSTNAME: &str = "conrt";
-            if unsafe { libc::sethostname(HOSTNAME.as_ptr() as _, HOSTNAME.len()) } < 0 {
-                let e = io::Error::last_os_error();
+            const HOSTNAME: &[u8] = b"conrt";
+            if let Err(e) =
+                unsafe { sys::sethostname(HOSTNAME.as_ptr() as *const (), HOSTNAME.len()) }
+            {
                 tracing::error!(%e, "sethostname failed");
             }
 
@@ -153,20 +155,12 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWUSER;
 
-    clone3(CLONE_FLAGS as _, libc::SIGCHLD)
-}
-
-/// Raw clone3 syscall wrapper (Linux 5.3+).
-///
-/// Returns `Ok(None)` in the child, `Ok(Some(pid))` in the parent.
-/// Avoids glibc's clone wrapper entirely — no stack allocation needed.
-fn clone3(flags: u64, exit_signal: i32) -> io::Result<Option<libc::pid_t>> {
     let args = libc::clone_args {
-        flags,
+        flags: CLONE_FLAGS as u64,
         pidfd: 0,
         child_tid: 0,
         parent_tid: 0,
-        exit_signal: exit_signal as u64,
+        exit_signal: libc::SIGCHLD as u64,
         stack: 0,
         stack_size: 0,
         tls: 0,
@@ -176,16 +170,11 @@ fn clone3(flags: u64, exit_signal: i32) -> io::Result<Option<libc::pid_t>> {
     };
 
     let ret = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            &args as *const libc::clone_args as i64,
-            mem::size_of::<libc::clone_args>() as i64,
+        sys::clone3(
+            &args as *const libc::clone_args,
+            mem::size_of::<libc::clone_args>(),
         )
-    };
-
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    }?;
 
     Ok(if ret == 0 {
         None
@@ -198,17 +187,13 @@ fn clone3(flags: u64, exit_signal: i32) -> io::Result<Option<libc::pid_t>> {
 fn execvp(command: Vec<CString>) -> io::Error {
     let mut argv = CString::into_ptr_vec(command);
     argv.push(std::ptr::null());
-    unsafe { libc::execvp(argv[0], argv.as_ptr()) };
-    io::Error::last_os_error()
+    sys::execvp(argv.as_ptr())
 }
 
 /// Wait for a child process and return its exit code.
 fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
     let mut status: i32 = 0;
-    let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let _ = unsafe { sys::wait4(pid, &mut status, 0) }?;
     tracing::info!(%status, "container exited");
     if libc::WIFEXITED(status) {
         Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
