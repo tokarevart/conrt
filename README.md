@@ -88,12 +88,15 @@ container process ──write()──► PTY slave
 
 ### Phase 1 — Process & Filesystem Isolation
 
-- `clone(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC)`
+- `clone3` with `CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC`
+- Parent writes UID/GID maps (`/proc/<pid>/uid_map`, `/proc/<pid>/gid_map`)
+  after clone so the child becomes UID 0 with full capabilities
+- Pipe-based synchronization: child blocks until parent finishes writing maps
 - `pivot_root` into prepared rootfs (bind-mount rootfs dir onto itself first to
   satisfy same-filesystem requirement)
 - Unmount `/.old_root` after pivot (`umount2(MNT_DETACH)`)
 - Mount `/proc`, `/sys`, `/dev`
-- PTY allocation (`nix::pty::openpty`) for interactive `-t` containers
+- PTY allocation (`openpty`) for interactive `-t` containers
 - Daemon ensures child reaps correctly (SIGCHLD in event loop)
 
 ### Phase 2 — Cgroups v2
@@ -135,8 +138,7 @@ container process ──write()──► PTY slave
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `io-uring` — raw io_uring bindings for the daemon event loop (no wrapper)
-- `libc` — direct syscall access for clone3
+- `io-uring` — raw io_uring bindings for the daemon event loop
 
 ## Building
 
@@ -147,7 +149,8 @@ sudo ./target/release/conrt run --rootfs /tmp/alpine /bin/sh
 sudo ./target/release/conrt logs <container-id>
 ```
 
-Requires `root` for namespaces, cgroups, network setup, and mount operations.
+No root required — user namespaces handle privilege escalation. Cgroups and network
+setup may require additional capabilities.
 
 ## Status
 

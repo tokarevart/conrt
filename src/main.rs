@@ -1,4 +1,5 @@
 mod cstring;
+mod interprocess;
 
 use std::ffi::c_int;
 use std::io;
@@ -95,13 +96,25 @@ fn run_container(
     _tty: bool,
     command: Vec<CString>,
 ) -> ExitCode {
+    let signal = match interprocess::OneshotSignal::new() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(%e, "sync pipe creation failed");
+            return ExitCode::FAILURE;
+        }
+    };
+
     match clone3_container() {
         Err(e) => {
             tracing::error!(%e, "clone3 failed");
             ExitCode::FAILURE
         }
         Ok(None) => {
-            // Child process — in new namespaces as PID 1
+            if let Err(e) = signal.wait() {
+                tracing::error!(%e, "sync wait failed");
+                std::process::exit(1);
+            }
+
             if unsafe { libc::sethostname(c"conrt".as_ptr() as _, 5) } < 0 {
                 let e = io::Error::last_os_error();
                 tracing::error!(%e, "sethostname failed");
@@ -112,7 +125,14 @@ fn run_container(
             std::process::exit(1)
         }
         Ok(Some(pid)) => {
-            // Parent — monitor the child
+            let maps_result = setup_userns_maps(pid);
+            signal.signal();
+
+            if let Err(e) = maps_result {
+                tracing::error!(%e, "container aborted");
+                return ExitCode::FAILURE;
+            }
+
             tracing::info!(child = pid, "container started");
             match wait_for_child(pid) {
                 Ok(code) => code,
@@ -126,8 +146,11 @@ fn run_container(
 }
 
 fn clone3_container() -> io::Result<Option<libc::pid_t>> {
-    const CLONE_FLAGS: c_int =
-        libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+    const CLONE_FLAGS: c_int = libc::CLONE_NEWPID
+        | libc::CLONE_NEWNS
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER;
 
     clone3(CLONE_FLAGS as _, libc::SIGCHLD)
 }
@@ -193,6 +216,24 @@ fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
     } else {
         Ok(ExitCode::FAILURE)
     }
+}
+
+fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    let setgroups_path = format!("/proc/{}/setgroups", pid);
+    if std::fs::write(&setgroups_path, "deny\n").is_err() {
+        // setgroups file may not exist on older kernels; ignore
+    }
+
+    let uid_map_path = format!("/proc/{}/uid_map", pid);
+    std::fs::write(&uid_map_path, format!("0 {} 1\n", uid))?;
+
+    let gid_map_path = format!("/proc/{}/gid_map", pid);
+    std::fs::write(&gid_map_path, format!("0 {} 1\n", gid))?;
+
+    Ok(())
 }
 
 fn show_logs(_id: String) -> ExitCode {
