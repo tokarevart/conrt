@@ -117,9 +117,7 @@ fn run_container(
             }
 
             const HOSTNAME: &[u8] = b"conrt";
-            if let Err(e) =
-                unsafe { sys::sethostname(HOSTNAME.as_ptr() as *const (), HOSTNAME.len()) }
-            {
+            if let Err(e) = unsafe { sys::sethostname(HOSTNAME.as_ptr(), HOSTNAME.len()) } {
                 tracing::error!(%e, "sethostname failed");
             }
 

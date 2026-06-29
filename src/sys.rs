@@ -25,13 +25,13 @@ macro_rules! syscall {
 
 /// `read(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub unsafe fn read(fd: i32, buf: *mut (), count: usize) -> io::Result<isize> {
+pub unsafe fn read<T>(fd: i32, buf: *mut T, count: usize) -> io::Result<isize> {
     syscall!(libc::SYS_read, fd, buf, count)
 }
 
 /// `write(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub unsafe fn write(fd: i32, buf: *const (), count: usize) -> io::Result<isize> {
+pub unsafe fn write<T>(fd: i32, buf: *const T, count: usize) -> io::Result<isize> {
     syscall!(libc::SYS_write, fd, buf, count)
 }
 
@@ -45,14 +45,14 @@ pub unsafe fn close(fd: i32) {
 /// `pipe2(pipefd, flags)` — caller owns the buffer; any `repr(C)` pair of
 /// `i32` works.
 #[inline]
-pub unsafe fn pipe2(pipefd: *mut (), flags: i32) -> io::Result<()> {
+pub unsafe fn pipe2<I32Pair>(pipefd: *mut I32Pair, flags: i32) -> io::Result<()> {
     syscall!(libc::SYS_pipe2, pipefd, flags).map(|_| ())
 }
 
 /// `sethostname(name, len)` — caller provides pointer + length. No null
 /// terminator needed.
 #[inline]
-pub unsafe fn sethostname(name: *const (), len: usize) -> io::Result<()> {
+pub unsafe fn sethostname(name: *const u8, len: usize) -> io::Result<()> {
     syscall!(libc::SYS_sethostname, name, len).map(|_| ())
 }
 
@@ -61,19 +61,6 @@ pub unsafe fn sethostname(name: *const (), len: usize) -> io::Result<()> {
 #[inline]
 pub unsafe fn wait4(pid: i32, status: *mut i32, options: i32) -> io::Result<i32> {
     syscall!(libc::SYS_wait4, pid, status, options, 0usize).map(|r| r as i32)
-}
-
-/// `execve(filename, argv, envp)` — raw syscall. Always returns
-/// `io::Error` (the one from the kernel).
-#[inline]
-#[allow(dead_code)]
-pub unsafe fn execve(
-    filename: *const libc::c_char,
-    argv: *const *const libc::c_char,
-    envp: *const *const libc::c_char,
-) -> io::Error {
-    unsafe { libc::execve(filename, argv, envp) };
-    io::Error::last_os_error()
 }
 
 /// `execvp(argv)` — thin wrapper over `libc::execvp` for PATH search.

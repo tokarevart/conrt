@@ -11,7 +11,7 @@ pub struct OneshotSignal {
 impl OneshotSignal {
     pub fn new() -> io::Result<Self> {
         let mut s = Self { rfd: -1, wfd: -1 };
-        unsafe { sys::pipe2(&mut s as *mut Self as *mut (), libc::O_CLOEXEC) }?;
+        unsafe { sys::pipe2(&mut s as *mut Self, libc::O_CLOEXEC) }?;
         Ok(s)
     }
 
@@ -19,7 +19,7 @@ impl OneshotSignal {
         unsafe {
             sys::close(self.rfd);
             let val = 1u8;
-            sys::write(self.wfd, &val as *const u8 as *const (), 1).ok();
+            sys::write(self.wfd, &val as *const u8, 1).ok();
             sys::close(self.wfd);
         }
         std::mem::forget(self);
@@ -28,7 +28,7 @@ impl OneshotSignal {
     pub fn wait(self) -> io::Result<()> {
         unsafe { sys::close(self.wfd) };
         let mut val = 0u8;
-        let ret = unsafe { sys::read(self.rfd, &mut val as *mut u8 as *mut (), 1) };
+        let ret = unsafe { sys::read(self.rfd, &mut val as *mut u8, 1) };
         unsafe { sys::close(self.rfd) };
         std::mem::forget(self);
         match ret {
