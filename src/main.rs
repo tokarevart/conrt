@@ -4,7 +4,6 @@ mod sys;
 
 use std::ffi::c_int;
 use std::io;
-use std::mem;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -116,8 +115,7 @@ fn run_container(
                 std::process::exit(1);
             }
 
-            const HOSTNAME: &[u8] = b"conrt";
-            if let Err(e) = unsafe { sys::sethostname(HOSTNAME.as_ptr(), HOSTNAME.len()) } {
+            if let Err(e) = sys::sethostname(b"conrt") {
                 tracing::error!(%e, "sethostname failed");
             }
 
@@ -167,12 +165,7 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
         cgroup: 0,
     };
 
-    let ret = unsafe {
-        sys::clone3(
-            &args as *const libc::clone_args,
-            mem::size_of::<libc::clone_args>(),
-        )
-    }?;
+    let ret = unsafe { sys::clone3(&args) }?;
 
     Ok(if ret == 0 {
         None
@@ -183,15 +176,15 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
 
 /// Replace the current process with the given command.
 fn execvp(command: Vec<CString>) -> io::Error {
-    let mut argv = CString::into_ptr_vec(command);
-    argv.push(std::ptr::null());
-    sys::execvp(argv.as_ptr())
+    let mut argv = CString::into_vec_of_options(command);
+    argv.push(None);
+    sys::execvp(&argv)
 }
 
 /// Wait for a child process and return its exit code.
 fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
     let mut status: i32 = 0;
-    let _ = unsafe { sys::wait4(pid, &mut status, 0) }?;
+    let _ = sys::wait4(pid, &mut status, 0, None)?;
     tracing::info!(%status, "container exited");
     if libc::WIFEXITED(status) {
         Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))

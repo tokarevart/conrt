@@ -1,9 +1,12 @@
+#![allow(dead_code)]
+
 use core::ffi::CStr;
 use core::ffi::c_char;
 use core::fmt;
 use core::mem;
 use core::str::FromStr;
 use std::convert::Infallible;
+use std::ptr::NonNull;
 
 /// A null-terminated C string whose memory representation is exactly one
 /// pointer — the same as `char*` in C.
@@ -12,44 +15,46 @@ use std::convert::Infallible;
 /// size by walking the null terminator, so no inline bookkeeping is needed.
 #[repr(transparent)]
 pub struct CString {
-    buf: *mut c_char,
+    buf: NonNull<c_char>,
 }
 
 unsafe impl Send for CString {}
 unsafe impl Sync for CString {}
 
-#[allow(dead_code)]
 impl CString {
-    pub fn as_ptr(&self) -> *const c_char {
+    pub fn as_ptr(&mut self) -> NonNull<c_char> {
         self.buf
     }
 
-    pub fn to_bytes(&self) -> &[u8] {
-        unsafe { CStr::from_ptr(self.buf).to_bytes() }
+    pub fn as_raw(&self) -> *const c_char {
+        self.buf.as_ptr()
     }
 
-    pub fn into_raw(self) -> *mut c_char {
+    pub fn to_bytes(&self) -> &[u8] {
+        unsafe { CStr::from_ptr(self.buf.as_ptr()).to_bytes() }
+    }
+
+    pub fn into_ptr(self) -> NonNull<c_char> {
         let ptr = self.buf;
         mem::forget(self);
         ptr
+    }
+
+    pub fn into_raw(self) -> *mut c_char {
+        self.into_ptr().as_ptr()
     }
 
     /// Zero-cost reinterpret of `Vec<CString>` into `Vec<*mut c_char>`.
     ///
     /// Each `CString` is leaked — `Drop` does not run. Use this when handing
     /// memory off to a C API like `execvp`.
-    pub fn into_raw_vec(v: Vec<CString>) -> Vec<*mut c_char> {
+    pub fn into_raw_vec(v: Vec<CString>) -> Vec<NonNull<c_char>> {
         let (ptr, len, cap) = v.into_raw_parts();
-        unsafe { Vec::from_raw_parts(ptr as *mut *mut c_char, len, cap) }
+        unsafe { Vec::from_raw_parts(ptr as *mut NonNull<c_char>, len, cap) }
     }
 
-    /// Zero-cost reinterpret of `Vec<CString>` into `Vec<*const c_char>`.
-    ///
-    /// Each `CString` is leaked — `Drop` does not run. Use this when handing
-    /// memory off to a C API that expects `*const` pointers.
-    pub fn into_ptr_vec(v: Vec<CString>) -> Vec<*const c_char> {
-        let (ptr, len, cap) = v.into_raw_parts();
-        unsafe { Vec::from_raw_parts(ptr as *mut *const c_char, len, cap) }
+    pub fn into_vec_of_options(v: Vec<CString>) -> Vec<Option<CString>> {
+        unsafe { core::mem::transmute::<_, _>(v) }
     }
 }
 
@@ -60,23 +65,21 @@ impl FromStr for CString {
         let len = s.len() + 1;
         let layout = std::alloc::Layout::array::<u8>(len).unwrap();
         let alloc = unsafe { std::alloc::alloc(layout) };
-        assert!(!alloc.is_null(), "CString allocation failed");
+        let buf = NonNull::new(alloc).expect("CString allocation failed");
         unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), alloc, s.len());
-            *alloc.add(s.len()) = 0;
+            std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_ptr(), s.len());
+            *buf.add(s.len()).as_ptr() = 0;
         }
-        Ok(Self {
-            buf: alloc as *mut c_char,
-        })
+        Ok(Self { buf: buf.cast() })
     }
 }
 
 impl Drop for CString {
     fn drop(&mut self) {
-        let len = unsafe { CStr::from_ptr(self.buf).to_bytes().len() + 1 };
+        let len = unsafe { CStr::from_ptr(self.buf.as_ptr()).to_bytes().len() + 1 };
         let layout = std::alloc::Layout::array::<u8>(len).unwrap();
         unsafe {
-            std::alloc::dealloc(self.buf as *mut u8, layout);
+            std::alloc::dealloc(self.buf.as_ptr().cast(), layout);
         }
     }
 }
@@ -100,6 +103,7 @@ mod tests {
     use super::*;
 
     const _: () = assert!(mem::size_of::<CString>() == mem::size_of::<*mut c_char>());
+    const _: () = assert!(mem::size_of::<Option<CString>>() == mem::size_of::<*mut c_char>());
 
     #[test]
     fn roundtrip() {
@@ -113,7 +117,7 @@ mod tests {
         let s = "test";
         let c = CString::from_str(s).unwrap();
         let bytes = c.to_bytes();
-        let after = unsafe { *(c.as_ptr() as *const u8).add(bytes.len()) };
+        let after = unsafe { *c.as_raw().add(bytes.len()) };
         assert_eq!(after, 0);
     }
 
@@ -121,7 +125,7 @@ mod tests {
     fn empty_string() {
         let c = CString::from_str("").unwrap();
         assert_eq!(c.to_bytes(), b"");
-        let after = unsafe { *(c.as_ptr() as *const u8) };
+        let after = unsafe { *c.as_raw() };
         assert_eq!(after, 0);
     }
 
@@ -147,29 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_reclaims_memory() {
-        let _p = {
-            let c = CString::from_str("memory").unwrap();
-            c.as_ptr() as *const u8
-        };
-    }
-
-    #[test]
-    fn into_ptr_vec_reinterprets() {
-        let v = vec![
-            CString::from_str("arg1").unwrap(),
-            CString::from_str("arg2").unwrap(),
-            CString::from_str("arg3").unwrap(),
-        ];
-        let ptrs = CString::into_ptr_vec(v);
-        assert_eq!(ptrs.len(), 3);
-        for (i, p) in ptrs.iter().enumerate() {
-            let s = unsafe { CStr::from_ptr(*p).to_str().unwrap() };
-            assert_eq!(s, format!("arg{}", i + 1));
-        }
-    }
-
-    #[test]
     fn into_raw_vec_reinterprets() {
         let v = vec![
             CString::from_str("a").unwrap(),
@@ -177,9 +158,9 @@ mod tests {
         ];
         let ptrs = CString::into_raw_vec(v);
         assert_eq!(ptrs.len(), 2);
-        let s0 = unsafe { CStr::from_ptr(ptrs[0]).to_str().unwrap() };
+        let s0 = unsafe { CStr::from_ptr(ptrs[0].as_ptr()).to_str().unwrap() };
         assert_eq!(s0, "a");
-        let s1 = unsafe { CStr::from_ptr(ptrs[1]).to_str().unwrap() };
+        let s1 = unsafe { CStr::from_ptr(ptrs[1].as_ptr()).to_str().unwrap() };
         assert_eq!(s1, "b");
     }
 }

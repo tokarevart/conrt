@@ -1,35 +1,34 @@
+use std::ffi::c_int;
 use std::io;
 
 use crate::sys;
 
-#[repr(C)]
 pub struct OneshotSignal {
-    rfd: i32,
-    wfd: i32,
+    rfd: c_int,
+    wfd: c_int,
 }
 
 impl OneshotSignal {
     pub fn new() -> io::Result<Self> {
-        let mut s = Self { rfd: -1, wfd: -1 };
-        unsafe { sys::pipe2(&mut s as *mut Self, libc::O_CLOEXEC) }?;
-        Ok(s)
+        let mut fds = [-1, -1];
+        sys::pipe2(&mut fds, libc::O_CLOEXEC)?;
+        Ok(Self {
+            rfd: fds[0],
+            wfd: fds[1],
+        })
     }
 
     pub fn signal(self) {
-        unsafe {
-            sys::close(self.rfd);
-            let val = 1u8;
-            sys::write(self.wfd, &val as *const u8, 1).ok();
-            sys::close(self.wfd);
-        }
+        sys::close(self.rfd);
+        sys::write(self.wfd, &[1]).ok();
+        sys::close(self.wfd);
         std::mem::forget(self);
     }
 
     pub fn wait(self) -> io::Result<()> {
-        unsafe { sys::close(self.wfd) };
-        let mut val = 0u8;
-        let ret = unsafe { sys::read(self.rfd, &mut val as *mut u8, 1) };
-        unsafe { sys::close(self.rfd) };
+        sys::close(self.wfd);
+        let ret = sys::read(self.rfd, &mut [0u8]);
+        sys::close(self.rfd);
         std::mem::forget(self);
         match ret {
             Ok(1) => Ok(()),
@@ -44,9 +43,7 @@ impl OneshotSignal {
 
 impl Drop for OneshotSignal {
     fn drop(&mut self) {
-        unsafe {
-            sys::close(self.rfd);
-            sys::close(self.wfd);
-        }
+        sys::close(self.rfd);
+        sys::close(self.wfd);
     }
 }
