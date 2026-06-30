@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use core::ffi::c_char;
 use core::ffi::c_int;
 use core::ptr::NonNull;
 use std::io;
@@ -73,7 +74,7 @@ pub fn pipe2(pipefd: &mut [c_int; 2], flags: c_int) -> io::Result<()> {
 /// `sethostname(name, len)` — caller provides pointer + length. No null
 /// terminator needed.
 #[inline]
-pub fn sethostname(name: &[u8]) -> io::Result<()> {
+pub fn sethostname(name: &str) -> io::Result<()> {
     let (ptr, len) = (name.as_ptr(), name.len());
     syscall!(libc::SYS_sethostname, ptr, len).map(|_| ())
 }
@@ -91,16 +92,55 @@ pub fn wait4(
     syscall!(libc::SYS_wait4, pid, status as *mut _, options, rusage).map(|r| r as _)
 }
 
+/// Owned argv array for execvp. Guarantees the last element is `None`.
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct Argv {
+    args: Vec<Option<CString>>,
+}
+
+impl Argv {
+    pub fn new(command: Vec<CString>) -> Self {
+        let mut args: Vec<Option<CString>> = unsafe { core::mem::transmute::<_, _>(command) };
+        args.push(None);
+        Self { args }
+    }
+
+    pub fn as_slice(&self) -> &ArgvSlice {
+        let slice = self.args.as_slice();
+        unsafe { core::mem::transmute::<_, _>(slice) }
+    }
+
+    pub fn as_raw(&self) -> *const *const c_char {
+        self.args.as_ptr().cast()
+    }
+
+    pub fn into_inner(self) -> Vec<Option<CString>> {
+        self.args
+    }
+
+    pub fn into_command(mut self) -> Vec<CString> {
+        assert!(self.args.pop().is_none());
+        unsafe { core::mem::transmute::<_, _>(self.args) }
+    }
+}
+
+/// Borrowed argv slice. Invariant: the last element is `None`.
+#[repr(transparent)]
+#[derive(PartialEq, Eq, Debug)]
+pub struct ArgvSlice {
+    args: [Option<CString>],
+}
+
+impl ArgvSlice {
+    pub fn as_raw(&self) -> *const *const c_char {
+        self.args.as_ptr().cast()
+    }
+}
+
 /// `execvp(argv)` — thin wrapper over `libc::execvp` for PATH search.
 #[inline]
-pub fn execvp(argv: &[Option<CString>]) -> io::Error {
-    assert!(
-        argv.last().expect("argv must not be empty").is_none(),
-        "argv must be null-terminated"
-    );
-
-    let argv = argv.as_ptr().cast();
-    unsafe { libc::execvp(*argv, argv) };
+pub fn execvp(argv: &ArgvSlice) -> io::Error {
+    unsafe { libc::execvp(*argv.as_raw(), argv.as_raw()) };
     io::Error::last_os_error()
 }
 
@@ -129,9 +169,9 @@ pub fn mount(
 
     syscall!(
         libc::SYS_mount,
-        CStr::as_raw_option(source.into()),
+        CStr::as_raw_option(source),
         target.as_raw(),
-        CStr::as_raw_option(fstype.into()),
+        CStr::as_raw_option(fstype),
         flags,
         data
     )

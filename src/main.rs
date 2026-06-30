@@ -132,7 +132,7 @@ fn run_container(args: RunArgs) -> ExitCode {
                 std::process::exit(1);
             }
 
-            if let Err(e) = sys::sethostname(b"conrt") {
+            if let Err(e) = sys::sethostname("conrt") {
                 tracing::error!(%e, "sethostname failed");
             }
 
@@ -143,7 +143,8 @@ fn run_container(args: RunArgs) -> ExitCode {
                 std::process::exit(1);
             }
 
-            let errno = execvp(args.command);
+            let argv = sys::Argv::new(args.command);
+            let errno = execvp(argv.as_slice());
             tracing::error!(%errno, "execvp failed");
             std::process::exit(1)
         }
@@ -227,7 +228,7 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
     // 2. Bind-mount rootfs onto itself (so it's a mount point)
     sys::mount(
         rootfs_c.borrow().into(),
-        rootfs_c.borrow().into(),
+        rootfs_c.borrow(),
         None,
         libc::MS_BIND | libc::MS_REC,
         None,
@@ -258,10 +259,8 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
 }
 
 /// Replace the current process with the given command.
-fn execvp(command: Vec<CString>) -> io::Error {
-    let mut argv = CString::into_vec_of_options(command);
-    argv.push(None);
-    sys::execvp(&argv)
+fn execvp(argv: &sys::ArgvSlice) -> io::Error {
+    sys::execvp(argv)
 }
 
 /// Wait for a child process and return its exit code.
