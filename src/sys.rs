@@ -10,6 +10,7 @@ use core::ffi::c_char;
 use core::ffi::c_int;
 use core::ptr::NonNull;
 use std::io;
+use std::os::fd::RawFd;
 
 use libc::pid_t;
 
@@ -35,39 +36,46 @@ macro_rules! syscall {
 
 /// `read(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub unsafe fn read_value<T>(fd: c_int, buf: &mut T) -> io::Result<isize> {
+pub unsafe fn read_value<T>(fd: RawFd, buf: &mut T) -> io::Result<isize> {
     syscall!(libc::SYS_read, fd, buf as *mut _, size_of::<T>())
 }
 
 /// `read(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub fn read(fd: c_int, buf: &mut [u8]) -> io::Result<isize> {
+pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<isize> {
     syscall!(libc::SYS_read, fd, buf.as_mut_ptr(), buf.len())
 }
 
 /// `write(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub fn write_value<T>(fd: c_int, buf: &T) -> io::Result<isize> {
+pub unsafe fn write_value<T>(fd: RawFd, buf: &T) -> io::Result<isize> {
     syscall!(libc::SYS_write, fd, buf as *const _, size_of::<T>())
 }
 
 /// `write(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
 #[inline]
-pub fn write(fd: c_int, buf: &[u8]) -> io::Result<isize> {
+pub fn write(fd: RawFd, buf: &[u8]) -> io::Result<isize> {
     syscall!(libc::SYS_write, fd, buf.as_ptr(), buf.len())
 }
 
 /// `close(fd)` — raw syscall. Kernel guarantees the fd is released even on
 /// `EINTR`. Return value discarded intentionally.
 #[inline]
-pub fn close(fd: c_int) {
+pub fn close(fd: RawFd) {
     syscall_unchecked!(libc::SYS_close, fd);
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FdPair {
+    pub read: RawFd,
+    pub write: RawFd,
 }
 
 /// `pipe2(pipefd, flags)` — caller owns the buffer; any `repr(C)` pair of
 /// `i32` works.
 #[inline]
-pub fn pipe2(pipefd: &mut [c_int; 2], flags: c_int) -> io::Result<()> {
+pub fn pipe2(pipefd: &mut FdPair, flags: c_int) -> io::Result<()> {
     syscall!(libc::SYS_pipe2, pipefd as *mut _, flags).map(|_| ())
 }
 
