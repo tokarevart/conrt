@@ -7,6 +7,9 @@ cd "$PROJECT_DIR"
 
 BINARY="target/debug/conrt"
 
+# Rootfs path: first arg, or env var, or default
+ALPINE_ROOTFS="${1:-${CONRT_TEST_ROOTFS:-/tmp/alpine}}"
+
 echo "=== Building ==="
 cargo build 2>&1
 
@@ -46,6 +49,53 @@ if echo "$OUTPUT" | grep -q hello; then
 else
     echo "FAIL: hello not found in output"
 fi
+
+echo ""
+echo "=== Container rootfs tests ==="
+if [ ! -f "$ALPINE_ROOTFS/bin/busybox" ]; then
+    echo "  Rootfs not found at $ALPINE_ROOTFS — downloading..."
+    "$SCRIPT_DIR/download_test_rootfs.sh" "$ALPINE_ROOTFS"
+    echo ""
+fi
+echo "--- Test: conrt run --rootfs $ALPINE_ROOTFS /bin/true ---"
+$BINARY run --rootfs "$ALPINE_ROOTFS" -- /bin/true 2>&1 && echo "PASS: exit 0" || echo "FAIL: non-zero exit"
+
+echo ""
+echo "--- Test: conrt run --rootfs $ALPINE_ROOTFS /bin/hostname ---"
+OUTPUT=$($BINARY run --rootfs "$ALPINE_ROOTFS" -- /bin/hostname 2>&1)
+echo "$OUTPUT"
+if echo "$OUTPUT" | grep -q conrt; then
+    echo "PASS: hostname is conrt"
+else
+    echo "FAIL: unexpected hostname"
+fi
+
+echo ""
+echo "--- Test: conrt run --rootfs $ALPINE_ROOTFS /bin/sh -c 'id' ---"
+OUTPUT=$($BINARY run --rootfs "$ALPINE_ROOTFS" -- /bin/sh -c 'id' 2>&1)
+echo "$OUTPUT"
+if echo "$OUTPUT" | grep -q 'uid=0(root)'; then
+    echo "PASS: running as root inside container"
+else
+    echo "FAIL: not running as root"
+fi
+
+echo ""
+echo "--- Test: conrt run --rootfs $ALPINE_ROOTFS /bin/sh -c 'head -1 /proc/self/status' ---"
+OUTPUT=$($BINARY run --rootfs "$ALPINE_ROOTFS" -- /bin/sh -c 'head -1 /proc/self/status' 2>&1)
+echo "$OUTPUT"
+if echo "$OUTPUT" | grep -q 'Name:'; then
+    echo "PASS: /proc mounted"
+else
+    echo "FAIL: /proc not properly mounted"
+fi
+
+echo ""
+echo "=== Edge cases ==="
+echo ""
+echo "--- Test: conrt run --rootfs /nonexistent /bin/true (should fail gracefully) ---"
+OUTPUT=$($BINARY run --rootfs /nonexistent -- /bin/true 2>&1) && echo "FAIL: should have failed" || echo "PASS: gracefully failed"
+echo "$OUTPUT"
 
 echo ""
 echo "=== Done ==="

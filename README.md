@@ -92,9 +92,9 @@ container process ──write()──► PTY slave
 - Parent writes UID/GID maps (`/proc/<pid>/uid_map`, `/proc/<pid>/gid_map`)
   after clone so the child becomes UID 0 with full capabilities
 - Pipe-based synchronization: child blocks until parent finishes writing maps
-- `pivot_root` into prepared rootfs (bind-mount rootfs dir onto itself first to
-  satisfy same-filesystem requirement)
-- Unmount `/.old_root` after pivot (`umount2(MNT_DETACH)`)
+- `chroot` into prepared rootfs (bind-mount rootfs dir onto itself first)
+  — uses `chroot` instead of `pivot_root` because unprivileged user namespaces
+  cannot unmount the old root (requires init-namespace `CAP_SYS_ADMIN`)
 - Mount `/proc`, `/sys`, `/dev`
 - PTY allocation (`openpty`) for interactive `-t` containers
 - Daemon ensures child reaps correctly (SIGCHLD in event loop)
@@ -133,12 +133,12 @@ container process ──write()──► PTY slave
 
 ## Dependencies
 
-- Rust edition 2024
-- `libc` — raw C FFI (syscalls, wait macros, hostname, ...)
+- Rust edition 2024 (nightly)
+- `libc` — raw C FFI (syscalls, wait macros, hostname, mount, chroot, ...)
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `io-uring` — raw io_uring bindings for the daemon event loop
+- `io-uring` — raw io_uring bindings for the daemon event loop (planned)
 
 ## Building
 
@@ -154,4 +154,29 @@ setup may require additional capabilities.
 
 ## Status
 
-Scaffolding in progress.
+### Phase 0 — Project Scaffolding ✅
+
+- Rust project with `clap` for CLI, `libc` for syscalls, `tracing` for logging,
+  `anyhow` for errors
+- Daemon subcommand: `conrt daemon` (stub)
+- Client subcommands: `conrt run [OPTIONS] <COMMAND>...`, `conrt logs <id>`,
+  `conrt list`, `conrt kill <id>` (logs/list/kill are stubs)
+- Communication between client and daemon via Unix socket (planned)
+
+### Phase 1 — Process & Filesystem Isolation ✅
+
+- `clone3` with `CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC`
+- Parent writes UID/GID maps after clone so the child becomes UID 0 with full capabilities
+- Pipe-based synchronization: child blocks until parent finishes writing maps
+- `chroot` into prepared rootfs (bind-mount rootfs dir onto itself first)
+- Mount `/proc`, `/dev`, best-effort `/sys`
+- PTY allocation (planned)
+- Daemon child reaping (planned)
+
+### Phase 2 — Cgroups v2 (not started)
+
+### Phase 3 — Network Namespace & veth (not started)
+
+### Phase 4 — OverlayFS (not started)
+
+### Phase 5 — Security (Capabilities + Seccomp) (not started)

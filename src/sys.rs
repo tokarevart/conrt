@@ -112,3 +112,53 @@ pub unsafe fn clone3(args: &libc::clone_args) -> io::Result<isize> {
         size_of::<libc::clone_args>()
     )
 }
+
+/// `mount(source, target, fstype, flags, data)` — raw syscall.
+/// All string pointers must be valid null-terminated C strings or null.
+#[inline]
+pub fn mount(
+    source: *const libc::c_char,
+    target: *const libc::c_char,
+    fstype: *const libc::c_char,
+    flags: u64,
+    data: *const libc::c_void,
+) -> io::Result<()> {
+    syscall!(libc::SYS_mount, source, target, fstype, flags, data).map(|_| ())
+}
+
+/// `pivot_root(new_root, put_old)` — raw syscall.
+#[inline]
+pub fn pivot_root(new_root: *const libc::c_char, put_old: *const libc::c_char) -> io::Result<()> {
+    syscall!(libc::SYS_pivot_root, new_root, put_old).map(|_| ())
+}
+
+/// `umount2(target, flags)` — raw syscall.
+#[inline]
+pub fn umount2(target: *const libc::c_char, flags: c_int) -> io::Result<()> {
+    syscall!(libc::SYS_umount2, target, flags).map(|_| ())
+}
+
+/// `chdir(path)` — raw syscall. `path` must be a valid null-terminated C
+/// string.
+#[inline]
+pub fn chdir(path: *const libc::c_char) -> io::Result<()> {
+    syscall!(libc::SYS_chdir, path).map(|_| ())
+}
+
+/// `mkdir(path, mode)` — raw syscall.
+#[inline]
+pub fn mkdir(path: *const libc::c_char, mode: libc::mode_t) -> io::Result<()> {
+    syscall!(libc::SYS_mkdir, path, mode).map(|_| ())
+}
+
+/// `rmdir(path)` — raw syscall.
+#[inline]
+pub fn rmdir(path: *const libc::c_char) -> io::Result<()> {
+    syscall!(libc::SYS_rmdir, path).map(|_| ())
+}
+
+/// `chroot(path)` — raw syscall.
+#[inline]
+pub fn chroot(path: *const libc::c_char) -> io::Result<()> {
+    syscall!(libc::SYS_chroot, path).map(|_| ())
+}

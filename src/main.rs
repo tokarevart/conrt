@@ -5,22 +5,16 @@ mod sys;
 use std::ffi::c_int;
 use std::io;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::Parser;
-use clap::Subcommand;
 use cstring::CString;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "conrt")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
+enum Cli {
     /// Run a container
     Run {
         /// Path to the root filesystem (optional; uses host rootfs if omitted)
@@ -70,18 +64,24 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Command::Daemon => run_daemon(),
-        Command::Run {
-            rootfs: _rootfs,
+    match cli {
+        Cli::Daemon => run_daemon(),
+        Cli::Run {
+            rootfs,
             cpu,
             memory,
             t,
             command,
-        } => run_container(cpu, memory, t, command),
-        Command::Logs { id } => show_logs(id),
-        Command::List => list_containers(),
-        Command::Kill { id } => kill_container(id),
+        } => run_container(RunArgs {
+            rootfs,
+            cpu,
+            memory,
+            tty: t,
+            command,
+        }),
+        Cli::Logs { id } => show_logs(id),
+        Cli::List => list_containers(),
+        Cli::Kill { id } => kill_container(id),
     }
 }
 
@@ -90,12 +90,29 @@ fn run_daemon() -> ExitCode {
     todo!("daemon event loop")
 }
 
-fn run_container(
-    _cpu: Option<u8>,
-    _memory: Option<String>,
-    _tty: bool,
+struct RunArgs {
+    rootfs: Option<String>,
+    #[allow(dead_code)]
+    cpu: Option<u8>,
+    #[allow(dead_code)]
+    memory: Option<String>,
+    #[allow(dead_code)]
+    tty: bool,
     command: Vec<CString>,
-) -> ExitCode {
+}
+
+fn run_container(args: RunArgs) -> ExitCode {
+    let rootfs = match args.rootfs {
+        Some(p) => match std::fs::canonicalize(&p) {
+            Ok(path) => Some(path.display().to_string()),
+            Err(e) => {
+                tracing::error!(%e, rootfs = %p, "invalid rootfs path");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let signal = match interprocess::OneshotSignal::new() {
         Ok(s) => s,
         Err(e) => {
@@ -119,7 +136,14 @@ fn run_container(
                 tracing::error!(%e, "sethostname failed");
             }
 
-            let errno = execvp(command);
+            if let Some(ref rootfs) = rootfs
+                && let Err(e) = setup_container_root(rootfs)
+            {
+                tracing::error!(%e, "container root setup failed");
+                std::process::exit(1);
+            }
+
+            let errno = execvp(args.command);
             tracing::error!(%errno, "execvp failed");
             std::process::exit(1)
         }
@@ -171,6 +195,74 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
     })
 }
 
+/// Set up the container root filesystem.
+///
+/// Uses `chroot` instead of `pivot_root` because an unprivileged user namespace
+/// cannot unmount the old root (created by the init namespace), which
+/// `pivot_root` + `umount2` requires.
+///
+/// 1. Remount the mount tree as private (prevent mount leaks to host).
+/// 2. Bind-mount the rootfs onto itself.
+/// 3. `chdir` into rootfs.
+/// 4. `chroot(".")` — change root to the bound rootfs.
+/// 5. `chdir("/")`.
+/// 6. Mount `/proc`, `/sys`, `/dev`.
+fn setup_container_root(rootfs: &str) -> io::Result<()> {
+    let rootfs_c = CString::from_str(rootfs).unwrap();
+    let root_c = CString::from_str("/").unwrap();
+    let proc_c = CString::from_str("proc").unwrap();
+    let proc_dir_c = CString::from_str("/proc").unwrap();
+    let tmpfs_c = CString::from_str("tmpfs").unwrap();
+    let dev_c = CString::from_str("/dev").unwrap();
+
+    // 1. Remount entire tree as private
+    sys::mount(
+        std::ptr::null(),
+        root_c.as_raw(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    )?;
+
+    // 2. Bind-mount rootfs onto itself (so it's a mount point)
+    sys::mount(
+        rootfs_c.as_raw(),
+        rootfs_c.as_raw(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        std::ptr::null(),
+    )?;
+
+    // 3. chdir into rootfs
+    sys::chdir(rootfs_c.as_raw())?;
+
+    // 4. chroot to current directory (".")
+    sys::chroot(rootfs_c.as_raw())?;
+
+    // 5. chdir to new root
+    sys::chdir(root_c.as_raw())?;
+
+    // 6. Mount proc
+    sys::mount(
+        proc_c.as_raw(),
+        proc_dir_c.as_raw(),
+        proc_c.as_raw(),
+        0,
+        std::ptr::null(),
+    )?;
+
+    // 7. Mount dev (tmpfs)
+    sys::mount(
+        std::ptr::null(),
+        dev_c.as_raw(),
+        tmpfs_c.as_raw(),
+        0,
+        std::ptr::null(),
+    )?;
+
+    Ok(())
+}
+
 /// Replace the current process with the given command.
 fn execvp(command: Vec<CString>) -> io::Error {
     let mut argv = CString::into_vec_of_options(command);
@@ -220,4 +312,21 @@ fn list_containers() -> ExitCode {
 
 fn kill_container(_id: String) -> ExitCode {
     todo!("kill container")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rootfs_nonexistent_returns_failure() {
+        let code = run_container(RunArgs {
+            rootfs: Some("/definitely/not/a/real/path".into()),
+            cpu: None,
+            memory: None,
+            tty: false,
+            command: vec![CString::from_str("/bin/true").unwrap()],
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+    }
 }
