@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
+use core::convert::Infallible;
 use core::ffi::c_char;
 use core::fmt;
+use core::marker::PhantomData;
 use core::mem;
+use core::ptr::NonNull;
 use core::str::FromStr;
-use std::convert::Infallible;
-use std::marker::PhantomData;
-use std::ptr::NonNull;
 
 /// A null-terminated C string whose memory representation is exactly one
 /// pointer — the same as `char*` in C.
@@ -30,7 +30,7 @@ impl CString {
         self.buf.as_ptr()
     }
 
-    pub fn as_c_str(&self) -> CStr<'_> {
+    pub fn borrow(&self) -> CStr<'_> {
         CStr {
             buf: self.buf,
             _borrow: PhantomData,
@@ -116,7 +116,7 @@ impl Drop for CString {
 
 impl PartialEq for CString {
     fn eq(&self, other: &Self) -> bool {
-        self.as_c_str() == other.as_c_str()
+        self.borrow() == other.borrow()
     }
 }
 
@@ -188,6 +188,12 @@ impl<'a> CStr<'a> {
     }
 }
 
+impl<'a> From<&'a CString> for CStr<'a> {
+    fn from(s: &'a CString) -> Self {
+        s.borrow()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem;
@@ -202,7 +208,7 @@ mod tests {
     #[test]
     fn cstr_borrow_from_cstring() {
         let c = CString::from_str("hello").unwrap();
-        let borrowed = c.as_c_str();
+        let borrowed = c.borrow();
         assert_eq!(borrowed.to_bytes(), b"hello");
         assert_eq!(borrowed.as_raw(), c.as_raw());
     }

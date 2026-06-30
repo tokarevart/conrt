@@ -218,7 +218,7 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
     // 1. Remount entire tree as private
     sys::mount(
         None,
-        root_c.as_c_str(),
+        root_c.borrow(),
         None,
         libc::MS_REC | libc::MS_PRIVATE,
         None,
@@ -226,33 +226,33 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
 
     // 2. Bind-mount rootfs onto itself (so it's a mount point)
     sys::mount(
-        rootfs_c.as_c_str(),
-        rootfs_c.as_c_str(),
+        rootfs_c.borrow().into(),
+        rootfs_c.borrow().into(),
         None,
         libc::MS_BIND | libc::MS_REC,
         None,
     )?;
 
     // 3. chdir into rootfs
-    sys::chdir(rootfs_c.as_raw())?;
+    sys::chdir(rootfs_c.borrow())?;
 
     // 4. chroot to current directory (".")
-    sys::chroot(rootfs_c.as_raw())?;
+    sys::chroot(rootfs_c.borrow())?;
 
     // 5. chdir to new root
-    sys::chdir(root_c.as_raw())?;
+    sys::chdir(root_c.borrow())?;
 
     // 6. Mount proc
     sys::mount(
-        proc_c.as_c_str(),
-        proc_dir_c.as_c_str(),
-        proc_c.as_c_str(),
+        proc_c.borrow().into(),
+        proc_dir_c.borrow(),
+        proc_c.borrow().into(),
         0,
         None,
     )?;
 
     // 7. Mount dev (tmpfs)
-    sys::mount(None, dev_c.as_c_str(), tmpfs_c.as_c_str(), 0, None)?;
+    sys::mount(None, dev_c.borrow(), tmpfs_c.borrow().into(), 0, None)?;
 
     Ok(())
 }

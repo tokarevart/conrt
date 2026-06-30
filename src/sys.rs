@@ -6,9 +6,9 @@
 
 #![allow(dead_code)]
 
-use std::ffi::c_int;
+use core::ffi::c_int;
+use core::ptr::NonNull;
 use std::io;
-use std::ptr::NonNull;
 
 use libc::pid_t;
 
@@ -118,22 +118,14 @@ pub unsafe fn clone3(args: &libc::clone_args) -> io::Result<isize> {
 /// `mount(source, target, fstype, flags, data)` — raw syscall.
 /// All string pointers must be valid null-terminated C strings or null.
 #[inline]
-pub fn mount<'a, 'b, S, F, D>(
-    source: S,
+pub fn mount(
+    source: Option<CStr>,
     target: CStr,
-    fstype: F,
+    fstype: Option<CStr>,
     flags: u64,
-    data: D,
-) -> io::Result<()>
-where
-    S: Into<Option<CStr<'a>>>,
-    F: Into<Option<CStr<'b>>>,
-    D: Into<Option<NonNull<()>>>,
-{
-    let data = data
-        .into()
-        .map(|d| d.as_ptr())
-        .unwrap_or(std::ptr::null_mut());
+    data: Option<NonNull<()>>,
+) -> io::Result<()> {
+    let data = data.map(|d| d.as_ptr()).unwrap_or(std::ptr::null_mut());
 
     syscall!(
         libc::SYS_mount,
@@ -161,8 +153,8 @@ pub fn umount2(target: *const libc::c_char, flags: c_int) -> io::Result<()> {
 /// `chdir(path)` — raw syscall. `path` must be a valid null-terminated C
 /// string.
 #[inline]
-pub fn chdir(path: *const libc::c_char) -> io::Result<()> {
-    syscall!(libc::SYS_chdir, path).map(|_| ())
+pub fn chdir(path: CStr) -> io::Result<()> {
+    syscall!(libc::SYS_chdir, path.as_raw()).map(|_| ())
 }
 
 /// `mkdir(path, mode)` — raw syscall.
@@ -179,6 +171,6 @@ pub fn rmdir(path: *const libc::c_char) -> io::Result<()> {
 
 /// `chroot(path)` — raw syscall.
 #[inline]
-pub fn chroot(path: *const libc::c_char) -> io::Result<()> {
-    syscall!(libc::SYS_chroot, path).map(|_| ())
+pub fn chroot(path: CStr) -> io::Result<()> {
+    syscall!(libc::SYS_chroot, path.as_raw()).map(|_| ())
 }
