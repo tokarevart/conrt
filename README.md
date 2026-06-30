@@ -170,7 +170,9 @@ setup may require additional capabilities.
 - Pipe-based synchronization: child blocks until parent finishes writing maps
 - `chroot` into prepared rootfs (bind-mount rootfs dir onto itself first)
 - Mount `/proc`, `/dev`, best-effort `/sys`
-- PTY allocation (planned)
+- PTY allocation (`-t` flag): `openpty` + `setsid` + `TIOCSCTTY` + `dup2` to 0/1/2,
+  then `poll`-based I/O relay between host terminal and PTY master, with raw mode
+  for interactive use
 - Daemon child reaping (planned)
 
 ### Phase 2 — Cgroups v2 (not started)

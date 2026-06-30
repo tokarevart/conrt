@@ -222,3 +222,27 @@ pub fn rmdir(path: *const libc::c_char) -> io::Result<()> {
 pub fn chroot(path: CStr) -> io::Result<()> {
     syscall!(libc::SYS_chroot, path.as_raw()).map(|_| ())
 }
+
+/// `setsid()` — create a new session. The caller must not be a process group
+/// leader.
+#[inline]
+pub fn setsid() -> io::Result<pid_t> {
+    let ret = unsafe { libc::setsid() };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+/// `dup2(oldfd, newfd)` — duplicate a file descriptor. If `newfd` is already
+/// open, it is atomically closed before the duplication.
+#[inline]
+pub fn dup2(oldfd: RawFd, newfd: RawFd) -> io::Result<()> {
+    let ret = unsafe { libc::dup2(oldfd, newfd) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
