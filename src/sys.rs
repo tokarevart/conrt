@@ -8,9 +8,11 @@
 
 use std::ffi::c_int;
 use std::io;
+use std::ptr::NonNull;
 
 use libc::pid_t;
 
+use crate::cstring::CStr;
 use crate::cstring::CString;
 
 macro_rules! syscall_unchecked {
@@ -116,14 +118,32 @@ pub unsafe fn clone3(args: &libc::clone_args) -> io::Result<isize> {
 /// `mount(source, target, fstype, flags, data)` — raw syscall.
 /// All string pointers must be valid null-terminated C strings or null.
 #[inline]
-pub fn mount(
-    source: *const libc::c_char,
-    target: *const libc::c_char,
-    fstype: *const libc::c_char,
+pub fn mount<'a, 'b, S, F, D>(
+    source: S,
+    target: CStr,
+    fstype: F,
     flags: u64,
-    data: *const libc::c_void,
-) -> io::Result<()> {
-    syscall!(libc::SYS_mount, source, target, fstype, flags, data).map(|_| ())
+    data: D,
+) -> io::Result<()>
+where
+    S: Into<Option<CStr<'a>>>,
+    F: Into<Option<CStr<'b>>>,
+    D: Into<Option<NonNull<()>>>,
+{
+    let data = data
+        .into()
+        .map(|d| d.as_ptr())
+        .unwrap_or(std::ptr::null_mut());
+
+    syscall!(
+        libc::SYS_mount,
+        CStr::as_raw_option(source.into()),
+        target.as_raw(),
+        CStr::as_raw_option(fstype.into()),
+        flags,
+        data
+    )
+    .map(|_| ())
 }
 
 /// `pivot_root(new_root, put_old)` — raw syscall.

@@ -217,20 +217,20 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
 
     // 1. Remount entire tree as private
     sys::mount(
-        std::ptr::null(),
-        root_c.as_raw(),
-        std::ptr::null(),
+        None,
+        root_c.as_c_str(),
+        None,
         libc::MS_REC | libc::MS_PRIVATE,
-        std::ptr::null(),
+        None,
     )?;
 
     // 2. Bind-mount rootfs onto itself (so it's a mount point)
     sys::mount(
-        rootfs_c.as_raw(),
-        rootfs_c.as_raw(),
-        std::ptr::null(),
+        rootfs_c.as_c_str(),
+        rootfs_c.as_c_str(),
+        None,
         libc::MS_BIND | libc::MS_REC,
-        std::ptr::null(),
+        None,
     )?;
 
     // 3. chdir into rootfs
@@ -244,21 +244,15 @@ fn setup_container_root(rootfs: &str) -> io::Result<()> {
 
     // 6. Mount proc
     sys::mount(
-        proc_c.as_raw(),
-        proc_dir_c.as_raw(),
-        proc_c.as_raw(),
+        proc_c.as_c_str(),
+        proc_dir_c.as_c_str(),
+        proc_c.as_c_str(),
         0,
-        std::ptr::null(),
+        None,
     )?;
 
     // 7. Mount dev (tmpfs)
-    sys::mount(
-        std::ptr::null(),
-        dev_c.as_raw(),
-        tmpfs_c.as_raw(),
-        0,
-        std::ptr::null(),
-    )?;
+    sys::mount(None, dev_c.as_c_str(), tmpfs_c.as_c_str(), 0, None)?;
 
     Ok(())
 }

@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-use core::ffi::CStr;
 use core::ffi::c_char;
 use core::fmt;
 use core::mem;
 use core::str::FromStr;
 use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 /// A null-terminated C string whose memory representation is exactly one
@@ -30,12 +30,19 @@ impl CString {
         self.buf.as_ptr()
     }
 
-    pub fn as_c_str(&self) -> &CStr {
-        unsafe { CStr::from_ptr(self.buf.as_ptr()) }
+    pub fn as_c_str(&self) -> CStr<'_> {
+        CStr {
+            buf: self.buf,
+            _borrow: PhantomData,
+        }
+    }
+
+    pub fn as_std_c_str(&self) -> &core::ffi::CStr {
+        unsafe { core::ffi::CStr::from_ptr(self.as_raw()) }
     }
 
     pub fn to_bytes(&self) -> &[u8] {
-        self.as_c_str().to_bytes()
+        self.as_std_c_str().to_bytes()
     }
 
     pub fn into_ptr(self) -> NonNull<c_char> {
@@ -46,6 +53,13 @@ impl CString {
 
     pub fn into_raw(self) -> *mut c_char {
         self.into_ptr().as_ptr()
+    }
+
+    pub fn into_raw_option(this: Option<Self>) -> *mut c_char {
+        match this {
+            Some(s) => s.into_raw(),
+            None => std::ptr::null_mut(),
+        }
     }
 
     /// Zero-cost reinterpret of `Vec<CString>` into `Vec<*mut c_char>`.
@@ -84,21 +98,29 @@ impl FromStr for CString {
     }
 }
 
-impl From<&CStr> for CString {
-    fn from(s: &CStr) -> Self {
+impl From<&core::ffi::CStr> for CString {
+    fn from(s: &core::ffi::CStr) -> Self {
         Self::from(s.to_bytes())
     }
 }
 
 impl Drop for CString {
     fn drop(&mut self) {
-        let len = unsafe { CStr::from_ptr(self.buf.as_ptr()).to_bytes().len() + 1 };
+        let len = self.as_std_c_str().to_bytes().len() + 1;
         let layout = std::alloc::Layout::array::<u8>(len).unwrap();
         unsafe {
             std::alloc::dealloc(self.buf.as_ptr().cast(), layout);
         }
     }
 }
+
+impl PartialEq for CString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_c_str() == other.as_c_str()
+    }
+}
+
+impl Eq for CString {}
 
 impl Clone for CString {
     fn clone(&self) -> Self {
@@ -112,6 +134,60 @@ impl fmt::Debug for CString {
     }
 }
 
+/// A borrowed C string reference. Only constructible via `CString::as_c_str()`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct CStr<'a> {
+    buf: NonNull<c_char>,
+    _borrow: PhantomData<&'a CString>,
+}
+
+unsafe impl Send for CStr<'_> {}
+unsafe impl Sync for CStr<'_> {}
+
+impl PartialEq for CStr<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let ptr_a = self.buf.as_ptr();
+        let ptr_b = other.buf.as_ptr();
+
+        let mut i = 0isize;
+        loop {
+            let a = unsafe { *ptr_a.offset(i) };
+            let b = unsafe { *ptr_b.offset(i) };
+            if a != b {
+                return false;
+            }
+            if a == 0 {
+                return true;
+            }
+            i += 1;
+        }
+    }
+}
+
+impl Eq for CStr<'_> {}
+
+impl<'a> CStr<'a> {
+    pub fn as_std(self) -> &'a core::ffi::CStr {
+        unsafe { core::ffi::CStr::from_ptr(self.as_raw()) }
+    }
+
+    pub fn to_bytes(self) -> &'a [u8] {
+        self.as_std().to_bytes()
+    }
+
+    pub fn as_raw(self) -> *const c_char {
+        self.buf.as_ptr()
+    }
+
+    pub fn as_raw_option(this: Option<Self>) -> *const c_char {
+        match this {
+            Some(s) => s.as_raw(),
+            None => std::ptr::null(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem;
@@ -120,6 +196,16 @@ mod tests {
 
     const _: () = assert!(mem::size_of::<CString>() == mem::size_of::<*mut c_char>());
     const _: () = assert!(mem::size_of::<Option<CString>>() == mem::size_of::<*mut c_char>());
+    const _: () = assert!(mem::size_of::<CStr>() == mem::size_of::<*mut c_char>());
+    const _: () = assert!(mem::size_of::<Option<CStr>>() == mem::size_of::<*mut c_char>());
+
+    #[test]
+    fn cstr_borrow_from_cstring() {
+        let c = CString::from_str("hello").unwrap();
+        let borrowed = c.as_c_str();
+        assert_eq!(borrowed.to_bytes(), b"hello");
+        assert_eq!(borrowed.as_raw(), c.as_raw());
+    }
 
     #[test]
     fn roundtrip() {
@@ -162,7 +248,7 @@ mod tests {
     fn into_raw_returns_valid_ptr() {
         let c = CString::from_str("leaked").unwrap();
         let ptr = c.into_raw();
-        let bytes = unsafe { CStr::from_ptr(ptr).to_bytes() };
+        let bytes = unsafe { core::ffi::CStr::from_ptr(ptr).to_bytes() };
         assert_eq!(bytes, b"leaked");
     }
 
@@ -174,9 +260,17 @@ mod tests {
         ];
         let ptrs = CString::into_raw_vec(v);
         assert_eq!(ptrs.len(), 2);
-        let s0 = unsafe { CStr::from_ptr(ptrs[0].as_ptr()).to_str().unwrap() };
+        let s0 = unsafe {
+            core::ffi::CStr::from_ptr(ptrs[0].as_ptr())
+                .to_str()
+                .unwrap()
+        };
         assert_eq!(s0, "a");
-        let s1 = unsafe { CStr::from_ptr(ptrs[1].as_ptr()).to_str().unwrap() };
+        let s1 = unsafe {
+            core::ffi::CStr::from_ptr(ptrs[1].as_ptr())
+                .to_str()
+                .unwrap()
+        };
         assert_eq!(s1, "b");
     }
 }
