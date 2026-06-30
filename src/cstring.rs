@@ -30,8 +30,12 @@ impl CString {
         self.buf.as_ptr()
     }
 
+    pub fn as_c_str(&self) -> &CStr {
+        unsafe { CStr::from_ptr(self.buf.as_ptr()) }
+    }
+
     pub fn to_bytes(&self) -> &[u8] {
-        unsafe { CStr::from_ptr(self.buf.as_ptr()).to_bytes() }
+        self.as_c_str().to_bytes()
     }
 
     pub fn into_ptr(self) -> NonNull<c_char> {
@@ -58,10 +62,8 @@ impl CString {
     }
 }
 
-impl FromStr for CString {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Infallible> {
+impl From<&[u8]> for CString {
+    fn from(s: &[u8]) -> Self {
         let len = s.len() + 1;
         let layout = std::alloc::Layout::array::<u8>(len).unwrap();
         let alloc = unsafe { std::alloc::alloc(layout) };
@@ -70,7 +72,21 @@ impl FromStr for CString {
             std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_ptr(), s.len());
             *buf.add(s.len()).as_ptr() = 0;
         }
-        Ok(Self { buf: buf.cast() })
+        Self { buf: buf.cast() }
+    }
+}
+
+impl FromStr for CString {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
+        Ok(Self::from(s.as_bytes()))
+    }
+}
+
+impl From<&CStr> for CString {
+    fn from(s: &CStr) -> Self {
+        Self::from(s.to_bytes())
     }
 }
 
