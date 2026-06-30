@@ -165,12 +165,9 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
         cgroup: 0,
     };
 
-    let ret = unsafe { sys::clone3(&args) }?;
-
-    Ok(if ret == 0 {
-        None
-    } else {
-        Some(ret as libc::pid_t)
+    Ok(match unsafe { sys::clone3(&args) }? {
+        0 => None,
+        x => Some(x as libc::pid_t),
     })
 }
 
