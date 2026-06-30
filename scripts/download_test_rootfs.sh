@@ -5,8 +5,7 @@ if [ $# -ne 1 ]; then
     echo "Usage: $0 <target-directory>"
     echo ""
     echo "Downloads and extracts the Alpine minirootfs to the given directory."
-    echo "The directory will be created if it doesn't exist, and its contents"
-    echo "will be chowned to the current user for rootless container testing."
+    echo "The directory will be created if it doesn't exist."
     exit 1
 fi
 
@@ -38,13 +37,8 @@ echo "  Downloaded: $(du -h "$TARBALL_PATH" | cut -f1)"
 echo ""
 echo "=== Extracting ==="
 mkdir -p "$TARGET"
-sudo tar xzf "$TARBALL_PATH" -C "$TARGET"
+tar xzf "$TARBALL_PATH" -C "$TARGET" --no-same-owner
 echo "  Extracted to $TARGET"
-
-echo ""
-echo "=== Setting ownership ==="
-sudo chown -R "$(id -u):$(id -g)" "$TARGET"
-echo "  Chowned to $(id -u):$(id -g)"
 
 echo ""
 echo "=== Verifying ==="
