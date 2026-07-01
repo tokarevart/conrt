@@ -76,31 +76,63 @@ impl CString {
     }
 }
 
-impl From<&[u8]> for CString {
-    fn from(s: &[u8]) -> Self {
-        let len = s.len() + 1;
-        let layout = std::alloc::Layout::array::<u8>(len).unwrap();
-        let alloc = unsafe { std::alloc::alloc(layout) };
-        let buf = NonNull::new(alloc).expect("CString allocation failed");
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_ptr(), s.len());
-            *buf.add(s.len()).as_ptr() = 0;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CStringError {
+    /// Input contains a null byte at the given position.
+    ContainsNull(usize),
+}
+
+impl fmt::Display for CStringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContainsNull(pos) => write!(f, "null byte at position {pos}"),
         }
-        Self { buf: buf.cast() }
     }
+}
+
+impl std::error::Error for CStringError {}
+
+impl TryFrom<&[u8]> for CString {
+    type Error = CStringError;
+
+    fn try_from(s: &[u8]) -> Result<Self, Self::Error> {
+        if let Some(pos) = s.iter().position(|&b| b == 0) {
+            return Err(CStringError::ContainsNull(pos));
+        }
+        // SAFETY: we just verified there are no interior null bytes.
+        Ok(unsafe { from_bytes_unchecked(s) })
+    }
+}
+
+/// # Safety
+///
+/// `s` must not contain interior null bytes. Callers that cannot guarantee
+/// this should use `TryFrom<&[u8]>` instead.
+unsafe fn from_bytes_unchecked(s: &[u8]) -> CString {
+    let len = s.len() + 1;
+    let layout = std::alloc::Layout::array::<u8>(len).unwrap();
+    let alloc = unsafe { std::alloc::alloc(layout) };
+    let buf = NonNull::new(alloc).expect("CString allocation failed");
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_ptr(), s.len());
+        *buf.add(s.len()).as_ptr() = 0;
+    }
+    CString { buf: buf.cast() }
 }
 
 impl FromStr for CString {
     type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Infallible> {
-        Ok(Self::from(s.as_bytes()))
+        // SAFETY: &str is guaranteed to not contain interior null bytes.
+        Ok(unsafe { from_bytes_unchecked(s.as_bytes()) })
     }
 }
 
 impl From<&core::ffi::CStr> for CString {
     fn from(s: &core::ffi::CStr) -> Self {
-        Self::from(s.to_bytes())
+        // SAFETY: &CStr is guaranteed null-terminated with no interior nulls.
+        unsafe { from_bytes_unchecked(s.to_bytes()) }
     }
 }
 
@@ -278,5 +310,41 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(s1, "b");
+    }
+
+    #[test]
+    fn try_from_valid() {
+        let c = CString::try_from(b"hello".as_slice()).unwrap();
+        assert_eq!(c.to_bytes(), b"hello");
+    }
+
+    #[test]
+    fn try_from_empty() {
+        let c = CString::try_from(b"".as_slice()).unwrap();
+        assert_eq!(c.to_bytes(), b"");
+    }
+
+    #[test]
+    fn try_from_interior_null() {
+        let err = CString::try_from(b"ab\0cd".as_slice()).unwrap_err();
+        assert_eq!(err, CStringError::ContainsNull(2));
+    }
+
+    #[test]
+    fn try_from_leading_null() {
+        let err = CString::try_from(b"\0hello".as_slice()).unwrap_err();
+        assert_eq!(err, CStringError::ContainsNull(0));
+    }
+
+    #[test]
+    fn try_from_trailing_null() {
+        let err = CString::try_from(b"hello\0".as_slice()).unwrap_err();
+        assert_eq!(err, CStringError::ContainsNull(5));
+    }
+
+    #[test]
+    fn try_from_display() {
+        let err = CStringError::ContainsNull(3);
+        assert_eq!(format!("{err}"), "null byte at position 3");
     }
 }

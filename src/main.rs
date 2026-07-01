@@ -5,6 +5,9 @@ mod sys;
 
 use std::ffi::c_int;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
@@ -21,7 +24,7 @@ enum Cli {
     Run {
         /// Path to the root filesystem (optional; uses host rootfs if omitted)
         #[arg(long)]
-        rootfs: Option<String>,
+        rootfs: Option<PathBuf>,
 
         /// CPU limit as a percentage (1-100)
         #[arg(long)]
@@ -93,7 +96,7 @@ fn run_daemon() -> ExitCode {
 }
 
 struct RunArgs {
-    rootfs: Option<String>,
+    rootfs: Option<PathBuf>,
     #[allow(dead_code)]
     cpu: Option<u8>,
     #[allow(dead_code)]
@@ -105,10 +108,10 @@ struct RunArgs {
 
 fn run_container(args: RunArgs) -> ExitCode {
     let rootfs = match args.rootfs {
-        Some(p) => match std::fs::canonicalize(&p) {
-            Ok(path) => Some(path.display().to_string()),
+        Some(p) => match p.canonicalize() {
+            Ok(path) => Some(path),
             Err(e) => {
-                tracing::error!(%e, rootfs = %p, "invalid rootfs path");
+                tracing::error!(%e, rootfs = %p.display(), "invalid rootfs path");
                 return ExitCode::FAILURE;
             }
         },
@@ -278,8 +281,8 @@ fn clone3_container() -> io::Result<Option<libc::pid_t>> {
 /// 4. `chroot(".")` — change root to the bound rootfs.
 /// 5. `chdir("/")`.
 /// 6. Mount `/proc`, `/sys`, `/dev`.
-fn setup_container_root(rootfs: &str) -> io::Result<()> {
-    let rootfs_c = CString::from_str(rootfs).unwrap();
+fn setup_container_root(rootfs: &Path) -> io::Result<()> {
+    let rootfs_c = CString::try_from(rootfs.as_os_str().as_bytes()).unwrap();
     let root_c = CString::from_str("/").unwrap();
     let proc_c = CString::from_str("proc").unwrap();
     let proc_dir_c = CString::from_str("/proc").unwrap();
