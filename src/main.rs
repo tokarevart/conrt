@@ -25,14 +25,6 @@ enum Cli {
         #[arg(long)]
         rootfs: Option<PathBuf>,
 
-        /// CPU limit as a percentage (1-100)
-        #[arg(long)]
-        cpu: Option<u8>,
-
-        /// Memory limit (e.g. 128M, 1G)
-        #[arg(long)]
-        memory: Option<String>,
-
         /// Allocate a PTY for interactive use
         #[arg(short)]
         t: bool,
@@ -70,16 +62,8 @@ fn main() -> ExitCode {
 
     match cli {
         Cli::Daemon => run_daemon(),
-        Cli::Run {
+        Cli::Run { rootfs, t, command } => run_container(RunArgs {
             rootfs,
-            cpu,
-            memory,
-            t,
-            command,
-        } => run_container(RunArgs {
-            rootfs,
-            cpu,
-            memory,
             tty: t,
             command,
         }),
@@ -96,11 +80,6 @@ fn run_daemon() -> ExitCode {
 
 struct RunArgs {
     rootfs: Option<PathBuf>,
-    #[allow(dead_code)]
-    cpu: Option<u8>,
-    #[allow(dead_code)]
-    memory: Option<String>,
-    #[allow(dead_code)]
     tty: bool,
     command: Vec<CString>,
 }
@@ -366,8 +345,6 @@ mod tests {
     fn rootfs_nonexistent_returns_failure() {
         let code = run_container(RunArgs {
             rootfs: Some("/definitely/not/a/real/path".into()),
-            cpu: None,
-            memory: None,
             tty: false,
             command: vec![CString::from_str("/bin/true").unwrap()],
         });

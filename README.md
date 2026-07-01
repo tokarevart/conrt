@@ -99,12 +99,14 @@ container process ──write()──► PTY slave
 - PTY allocation (`openpty`) for interactive `-t` containers
 - Daemon ensures child reaps correctly (SIGCHLD in event loop)
 
-### Phase 2 — Cgroups v2
+### Phase 2 — Cgroups v2 (skipped)
 
-- `--cpu <percent>` → write quota/period to `cpu.max`
-- `--memory <bytes>` → write to `memory.max`
-- Create `/sys/fs/cgroup/conrt-<id>/`, write child PID to `cgroup.procs`
-- Cleanup: remove cgroup dir on container exit
+Resource limits via cgroups v2 are not viable in rootless mode unless the kernel
+delegates `cpu` and `memory` controllers. On this system, `user.slice/` only has
+`pids` in `subtree_control` and the user's processes live in `/init.scope`
+(outside the delegated subtree). Both `CLONE_INTO_CGROUP` and post-clone
+`cgroup.procs` writes fail with EACCES/ENOENT. Only `pids.max` works without
+root intervention.
 
 ### Phase 3 — Network Namespace & veth
 
@@ -175,7 +177,7 @@ setup may require additional capabilities.
   for interactive use
 - Daemon child reaping (planned)
 
-### Phase 2 — Cgroups v2 (not started)
+### Phase 2 — Cgroups v2 (skipped)
 
 ### Phase 3 — Network Namespace & veth (not started)
 
