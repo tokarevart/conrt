@@ -3,41 +3,75 @@ use std::os::fd::RawFd;
 
 use crate::sys;
 
-/// A PTY pair (master + slave).
-pub struct Pty {
-    pub master: RawFd,
-    pub slave: RawFd,
+/// A PTY master fd. The fd is closed on drop.
+pub struct PtyMaster(RawFd);
+
+/// A PTY slave fd. The fd is closed on drop.
+pub struct PtySlave(RawFd);
+
+impl PtyMaster {
+    pub fn raw_fd(&self) -> RawFd {
+        self.0
+    }
 }
 
-impl Pty {
-    pub fn open() -> io::Result<Self> {
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
-        let ret = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
+impl Drop for PtyMaster {
+    fn drop(&mut self) {
+        sys::close(self.0);
+    }
+}
+
+impl PtySlave {
+    /// Make this PTY slave the controlling terminal of the current process.
+    ///
+    /// Consumes `self`:
+    /// 1. `setsid()` — create a new session.
+    /// 2. `ioctl(TIOCSCTTY)` — attach the slave as the controlling terminal.
+    /// 3. `dup2(slave, 0)`, `dup2(slave, 1)`, `dup2(slave, 2)` — redirect
+    ///    stdin, stdout, and stderr to the slave.
+    ///
+    /// The original slave fd is closed on drop.  dup2 guarantees the
+    /// duplicated 0/1/2 refer to the same open file description, so closing
+    /// the original fd does not affect them.
+    pub fn make_controlling(self) -> io::Result<()> {
+        sys::setsid()?;
+
+        let ret = unsafe { libc::ioctl(self.0, libc::TIOCSCTTY, 0) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { master, slave })
+
+        for fd in [0, 1, 2] {
+            sys::dup2(self.0, fd)?;
+        }
+
+        Ok(())
     }
 }
 
-impl Drop for Pty {
+impl Drop for PtySlave {
     fn drop(&mut self) {
-        if self.master >= 0 {
-            unsafe { libc::close(self.master) };
-        }
-        if self.slave >= 0 {
-            unsafe { libc::close(self.slave) };
-        }
+        sys::close(self.0);
     }
+}
+
+/// Allocate a PTY pair. Returns `(master, slave)`.
+pub fn open_pty() -> io::Result<(PtyMaster, PtySlave)> {
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((PtyMaster(master), PtySlave(slave)))
 }
 
 /// Put the terminal attached to stdin into raw mode.
@@ -97,41 +131,34 @@ pub fn relay_pty(master: RawFd) -> io::Result<()> {
             return Err(err);
         }
 
+        if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(());
+        }
         if poll_fds[0].revents & libc::POLLIN != 0 {
             let n = sys::read(libc::STDIN_FILENO, &mut buf)?;
             if n == 0 {
-                break;
+                return Ok(());
             }
             if let Err(e) = sys::write(master, &buf[..n as usize]) {
                 if e.raw_os_error() == Some(libc::EIO) {
-                    break;
+                    return Ok(());
                 }
                 return Err(e);
             }
         }
 
+        if poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(());
+        }
         if poll_fds[1].revents & libc::POLLIN != 0 {
             match sys::read(master, &mut buf) {
-                Ok(0) => break,
+                Ok(0) => return Ok(()),
                 Ok(n) => {
                     sys::write(libc::STDOUT_FILENO, &buf[..n as usize])?;
                 }
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::EIO) {
-                        break;
-                    }
-                    return Err(e);
-                }
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(e) => return Err(e),
             }
         }
-
-        if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            break;
-        }
-        if poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            break;
-        }
     }
-
-    Ok(())
 }

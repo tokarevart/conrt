@@ -13,7 +13,6 @@ use std::str::FromStr;
 
 use clap::Parser;
 use cstring::CString;
-use pty::Pty;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -118,16 +117,16 @@ fn run_container(args: RunArgs) -> ExitCode {
         None => None,
     };
 
-    let mut pty = if args.tty {
-        match Pty::open() {
-            Ok(p) => Some(p),
+    let (master, slave) = if args.tty {
+        match pty::open_pty() {
+            Ok((m, s)) => (Some(m), Some(s)),
             Err(e) => {
                 tracing::error!(%e, "pty allocation failed");
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let signal = match interprocess::OneshotSignal::new() {
@@ -146,34 +145,15 @@ fn run_container(args: RunArgs) -> ExitCode {
         Ok(None) => {
             // ---- CHILD ----
 
-            // Set up PTY slave as the controlling terminal before anything else
-            if let Some(ref mut p) = pty {
-                sys::close(p.master);
-                p.master = -1;
+            // Close master — only the parent needs it
+            drop(master);
 
-                if let Err(e) = sys::setsid() {
-                    tracing::error!(%e, "setsid failed");
-                    std::process::exit(1);
-                }
-
-                let ret = unsafe { libc::ioctl(p.slave, libc::TIOCSCTTY, 0) };
-                if ret != 0 {
-                    let err = std::io::Error::last_os_error();
-                    tracing::error!(%err, "TIOCSCTTY failed");
-                    std::process::exit(1);
-                }
-
-                for fd in &[0, 1, 2] {
-                    if let Err(e) = sys::dup2(p.slave, *fd) {
-                        tracing::error!(%e, "dup2 failed");
-                        std::process::exit(1);
-                    }
-                }
-
-                if p.slave > 2 {
-                    sys::close(p.slave);
-                    p.slave = -1;
-                }
+            // Set up PTY slave as the controlling terminal
+            if let Some(slave) = slave
+                && let Err(e) = slave.make_controlling()
+            {
+                tracing::error!(%e, "pty setup failed");
+                std::process::exit(1);
             }
 
             if let Err(e) = signal.wait() {
@@ -201,10 +181,7 @@ fn run_container(args: RunArgs) -> ExitCode {
             // ---- PARENT ----
 
             // Close slave — only the child needs it
-            if let Some(ref mut p) = pty {
-                sys::close(p.slave);
-                p.slave = -1;
-            }
+            drop(slave);
 
             let maps_result = setup_userns_maps(pid);
             signal.signal();
@@ -217,19 +194,20 @@ fn run_container(args: RunArgs) -> ExitCode {
             tracing::info!(child = pid, "container started");
 
             // PTY I/O relay — blocks until the child closes the slave
-            if let Some(ref p) = pty {
+            if let Some(ref master) = master {
                 let raw = if unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
                     pty::set_raw_terminal().ok()
                 } else {
                     None
                 };
-                if let Err(e) = pty::relay_pty(p.master) {
+                if let Err(e) = pty::relay_pty(master.raw_fd()) {
                     tracing::error!(%e, "pty relay failed");
                 }
                 if let Some(termios) = raw {
                     pty::restore_terminal(&termios).ok();
                 }
             }
+            // master dropped here if Some — closes the master fd
 
             match wait_for_child(pid) {
                 Ok(code) => code,
