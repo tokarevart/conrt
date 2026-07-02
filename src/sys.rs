@@ -235,6 +235,57 @@ pub fn setsid() -> io::Result<pid_t> {
     }
 }
 
+/// Bring up the loopback interface (`lo`) inside the current network namespace.
+///
+/// Uses `SIOCGIFFLAGS`/`SIOCSIFFLAGS` ioctls rather than shelling out to
+/// `ip(8)` so it works regardless of what's in the container rootfs.
+pub fn bring_up_lo() -> io::Result<()> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let name = b"lo\0";
+    for (i, &b) in name.iter().enumerate() {
+        ifr.ifr_name[i] = b as libc::c_char;
+    }
+
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr as *mut _) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    unsafe {
+        ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+    }
+
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut ifr as *mut _) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// `setns(fd, nstype)` — reassociate the calling thread with the namespace
+/// referred to by `fd`. `nstype` specifies which namespace type (e.g.
+/// `CLONE_NEWNET`, `CLONE_NEWUSER`) and must match or be zero.
+#[inline]
+pub fn setns(fd: RawFd, nstype: c_int) -> io::Result<()> {
+    let ret = unsafe { libc::setns(fd, nstype) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// `dup2(oldfd, newfd)` — duplicate a file descriptor. If `newfd` is already
 /// open, it is atomically closed before the duplication.
 #[inline]

@@ -108,14 +108,12 @@ delegates `cpu` and `memory` controllers. On this system, `user.slice/` only has
 `cgroup.procs` writes fail with EACCES/ENOENT. Only `pids.max` works without
 root intervention.
 
-### Phase 3 — Network Namespace & veth
+### Phase 3 — Network Namespace
 
-- Add `CLONE_NEWNET` at clone time
-- Daemon creates veth pair via `ip link` (or netlink crate later)
-- Moves one end into child's netns, attaches host end to bridge
-- Child brings up `lo`, renames veth → `eth0`, assigns IP, sets default gateway
-- Host NAT via iptables MASQUERADE
-- Writes `/etc/resolv.conf` inside container
+- `CLONE_NEWNET` gives the container an isolated network stack
+- Child brings up `lo` via `SIOCSIFFLAGS` ioctl (works without `ip(8)` in rootfs)
+- Veth pair + NAT (bridge, iptables) require `CAP_NET_ADMIN` in the init netns
+  — not available rootlessly. External connectivity would need `slirp4netns`.
 
 ### Phase 4 — OverlayFS
 
@@ -179,7 +177,7 @@ setup may require additional capabilities.
 
 ### Phase 2 — Cgroups v2 (skipped)
 
-### Phase 3 — Network Namespace & veth (not started)
+### Phase 3 — Network Namespace (lo only; veth requires CAP_NET_ADMIN)
 
 ### Phase 4 — OverlayFS (not started)
 

@@ -6,6 +6,7 @@ mod sys;
 use std::ffi::c_int;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +25,10 @@ enum Cli {
         /// Path to the root filesystem (optional; uses host rootfs if omitted)
         #[arg(long)]
         rootfs: Option<PathBuf>,
+
+        /// PID of a running container whose user+net namespace to join
+        #[arg(long)]
+        net_pid: Option<i32>,
 
         /// Allocate a PTY for interactive use
         #[arg(short)]
@@ -49,21 +54,30 @@ enum Cli {
 }
 
 fn main() -> ExitCode {
+    let ansi = unsafe { libc::isatty(libc::STDERR_FILENO) != 0 };
     tracing_subscriber::fmt()
+        .with_ansi(ansi)
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
                 .from_env()
                 .unwrap(),
         )
+        .with_writer(|| std::io::LineWriter::new(std::io::stderr()))
         .init();
 
     let cli = Cli::parse();
 
     match cli {
         Cli::Daemon => run_daemon(),
-        Cli::Run { rootfs, t, command } => run_container(RunArgs {
+        Cli::Run {
             rootfs,
+            net_pid,
+            t,
+            command,
+        } => run_container(RunArgs {
+            rootfs,
+            net_pid: net_pid.map(|p| p as libc::pid_t),
             tty: t,
             command,
         }),
@@ -80,6 +94,7 @@ fn run_daemon() -> ExitCode {
 
 struct RunArgs {
     rootfs: Option<PathBuf>,
+    net_pid: Option<libc::pid_t>,
     tty: bool,
     command: Vec<CString>,
 }
@@ -116,7 +131,47 @@ fn run_container(args: RunArgs) -> ExitCode {
         }
     };
 
-    match clone3_container() {
+    let (clone_flags, needs_userns_maps) = match args.net_pid {
+        Some(pid) => {
+            let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(%e, "cannot open pid {pid} user ns");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(%e, "cannot open pid {pid} net ns");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
+                tracing::error!(%e, "setns(CLONE_NEWUSER) into pid {pid} failed");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
+                tracing::error!(%e, "setns(CLONE_NEWNET) into pid {pid} failed");
+                return ExitCode::FAILURE;
+            }
+            (
+                libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC,
+                false,
+            )
+        }
+        None => (
+            libc::CLONE_NEWPID
+                | libc::CLONE_NEWNS
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNET,
+            true,
+        ),
+    };
+
+    match clone3_container(clone_flags) {
         Err(e) => {
             tracing::error!(%e, "clone3 failed");
             ExitCode::FAILURE
@@ -138,6 +193,10 @@ fn run_container(args: RunArgs) -> ExitCode {
             if let Err(e) = signal.wait() {
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
+            }
+
+            if let Err(e) = sys::bring_up_lo() {
+                tracing::warn!(%e, "bring_up_lo failed");
             }
 
             if let Err(e) = sys::sethostname("conrt") {
@@ -162,7 +221,11 @@ fn run_container(args: RunArgs) -> ExitCode {
             // Close slave — only the child needs it
             drop(slave);
 
-            let maps_result = setup_userns_maps(pid);
+            let maps_result = if needs_userns_maps {
+                setup_userns_maps(pid)
+            } else {
+                Ok(())
+            };
             signal.signal();
 
             if let Err(e) = maps_result {
@@ -199,15 +262,9 @@ fn run_container(args: RunArgs) -> ExitCode {
     }
 }
 
-fn clone3_container() -> io::Result<Option<libc::pid_t>> {
-    const CLONE_FLAGS: c_int = libc::CLONE_NEWPID
-        | libc::CLONE_NEWNS
-        | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWIPC
-        | libc::CLONE_NEWUSER;
-
+fn clone3_container(flags: c_int) -> io::Result<Option<libc::pid_t>> {
     let args = libc::clone_args {
-        flags: CLONE_FLAGS as u64,
+        flags: flags as u64,
         pidfd: 0,
         child_tid: 0,
         parent_tid: 0,
@@ -345,6 +402,7 @@ mod tests {
     fn rootfs_nonexistent_returns_failure() {
         let code = run_container(RunArgs {
             rootfs: Some("/definitely/not/a/real/path".into()),
+            net_pid: None,
             tty: false,
             command: vec![CString::from_str("/bin/true").unwrap()],
         });

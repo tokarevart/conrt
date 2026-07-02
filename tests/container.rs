@@ -165,6 +165,26 @@ fn echo_hello_world() {
 }
 
 #[test]
+fn lo_is_up() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let (ok, _, stderr) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "ip link show lo 2>&1 | grep -q 'LOOPBACK,UP'",
+    ]);
+    assert!(
+        ok,
+        "lo should be UP in the container netns, stderr: {stderr}"
+    );
+}
+
+#[test]
 fn sh_invocation_with_dash_c() {
     let Some(rootfs) = ensure_rootfs() else {
         return;
@@ -173,4 +193,57 @@ fn sh_invocation_with_dash_c() {
         run_conrt(&["run", "--rootfs", &rootfs, "--", "/bin/sh", "-c", "echo ok"]);
     assert!(ok, "/bin/sh -c 'echo ok' should succeed");
     assert!(stdout.contains("ok"), "stdout should contain ok");
+}
+
+#[test]
+fn net_pid_invalid_pid_fails() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    // PID 1 is init — we don't own its user ns, so setns fails
+    let (ok, _, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        "1",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!ok, "joining an unrelated PID should fail");
+}
+
+#[test]
+fn net_pid_joins_container_netns() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+
+    let script = format!(
+        // Start sandbox in background, redirect its stdout+stderr away so
+        // they don't hold open the $() pipe; capture its PID via $!.
+        // Then sleep for clone3 to complete, find the container child via
+        // ps --ppid, run the joiner with --net-pid, clean up.
+        "S=$({} run --rootfs {} -- /bin/sleep inf >/dev/null 2>&1 & echo $!;) && sleep 0.3 && \
+         C=$(ps -o pid= --ppid $S | head -1 | tr -d ' ') && {} run --rootfs {} --net-pid $C -- \
+         /bin/sh -c 'echo netns_joined' 2>&1; EC=$?; kill $C 2>/dev/null; kill $S 2>/dev/null; \
+         wait $S 2>/dev/null; exit $EC",
+        conrt_binary().to_str().unwrap(),
+        rootfs,
+        conrt_binary().to_str().unwrap(),
+        rootfs,
+    );
+
+    let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+
+    let ok = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stdout: {stdout:?}");
+    eprintln!("stderr: {stderr:?}");
+    assert!(ok, "join should succeed, stderr: {stderr}");
+    assert!(
+        stdout.contains("netns_joined"),
+        "stdout should contain netns_joined, got: {stdout:?}"
+    );
 }
