@@ -247,3 +247,39 @@ fn net_pid_joins_container_netns() {
         "stdout should contain netns_joined, got: {stdout:?}"
     );
 }
+
+#[test]
+fn net_pid_localhost_communication() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+
+    let script = format!(
+        // Start a server container that listens on 127.0.0.1:9999 and
+        // responds "pong" to every connection. Then start a client container
+        // that joins the server's netns (--net-pid) and connects to it.
+        "S=$({run} run --rootfs {rootfs} -- /bin/sh -c 'while true; do echo pong | /bin/busybox \
+         nc -lp 9999; done' >/dev/null 2>&1 & echo $!;) && sleep 0.5 && C=$(ps -o pid= --ppid $S \
+         | head -1 | tr -d ' ') && {run} run --rootfs {rootfs} --net-pid $C -- /bin/sh -c \
+         '/bin/busybox nc -w 3 127.0.0.1 9999' 2>&1; EC=$?; kill $C 2>/dev/null; kill $S \
+         2>/dev/null; wait $S 2>/dev/null; exit $EC",
+        run = conrt_binary().to_str().unwrap(),
+        rootfs = rootfs,
+    );
+
+    let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+
+    let ok = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("stdout: {stdout:?}");
+    eprintln!("stderr: {stderr:?}");
+    assert!(
+        ok,
+        "localhost communication should succeed, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("pong"),
+        "stdout should contain pong, got: {stdout:?}"
+    );
+}
