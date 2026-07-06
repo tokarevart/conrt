@@ -8,7 +8,6 @@
 
 use core::ffi::c_char;
 use core::ffi::c_int;
-use core::ptr::NonNull;
 use std::io;
 use std::os::fd::RawFd;
 
@@ -171,9 +170,9 @@ pub fn mount(
     target: CStr,
     fstype: Option<CStr>,
     flags: u64,
-    data: Option<NonNull<()>>,
+    data: Option<CStr>,
 ) -> io::Result<()> {
-    let data = data.map(|d| d.as_ptr()).unwrap_or(std::ptr::null_mut());
+    let data = data.map(|x| x.as_raw()).unwrap_or(std::ptr::null_mut());
 
     syscall!(
         libc::SYS_mount,

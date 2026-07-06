@@ -283,3 +283,81 @@ fn net_pid_localhost_communication() {
         "stdout should contain pong, got: {stdout:?}"
     );
 }
+
+#[test]
+fn overlay_write_file() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let (ok, stdout, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo 'hello overlay' > /tmp/overlay_write_test && cat /tmp/overlay_write_test",
+    ]);
+    assert!(ok, "write file in overlay should succeed");
+    assert!(
+        container_stdout(&stdout).contains("hello overlay"),
+        "should read back written content, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn overlay_default_rm_discards_changes() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+
+    // First run: write a file into the overlay
+    let (ok1, _, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo 'persistent data' > /tmp/overlay_rm_test",
+    ]);
+    assert!(ok1, "first run should succeed");
+
+    // Second run: the file should NOT exist (new overlay, --rm is default)
+    let (ok2, stdout2, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "cat /tmp/overlay_rm_test 2>&1 || echo 'FILE_NOT_FOUND'",
+    ]);
+    assert!(ok2, "second run should succeed");
+    assert!(
+        container_stdout(&stdout2).contains("FILE_NOT_FOUND"),
+        "file should not persist across --rm runs, got: {stdout2:?}"
+    );
+}
+
+#[test]
+fn overlay_save_does_not_break() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let (ok, stdout, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--save",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo 'save test ok' > /tmp/overlay_save_test && cat /tmp/overlay_save_test",
+    ]);
+    assert!(ok, "overlay with --save should succeed");
+    assert!(
+        container_stdout(&stdout).contains("save test ok"),
+        "should read back written content, got: {stdout:?}"
+    );
+}

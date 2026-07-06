@@ -22,6 +22,14 @@ unsafe impl Send for CString {}
 unsafe impl Sync for CString {}
 
 impl CString {
+    pub fn try_from_bytes(s: &[u8]) -> Result<Self, CStringError> {
+        if let Some(pos) = s.iter().position(|&b| b == 0) {
+            return Err(CStringError::ContainsNull(pos));
+        }
+        // SAFETY: we just verified there are no interior null bytes.
+        Ok(unsafe { from_bytes_unchecked(s) })
+    }
+
     pub fn as_ptr(&mut self) -> NonNull<c_char> {
         self.buf
     }
@@ -92,18 +100,6 @@ impl fmt::Display for CStringError {
 
 impl std::error::Error for CStringError {}
 
-impl TryFrom<&[u8]> for CString {
-    type Error = CStringError;
-
-    fn try_from(s: &[u8]) -> Result<Self, Self::Error> {
-        if let Some(pos) = s.iter().position(|&b| b == 0) {
-            return Err(CStringError::ContainsNull(pos));
-        }
-        // SAFETY: we just verified there are no interior null bytes.
-        Ok(unsafe { from_bytes_unchecked(s) })
-    }
-}
-
 /// # Safety
 ///
 /// `s` must not contain interior null bytes. Callers that cannot guarantee
@@ -124,15 +120,14 @@ impl FromStr for CString {
     type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Infallible> {
-        // SAFETY: &str is guaranteed to not contain interior null bytes.
-        Ok(unsafe { from_bytes_unchecked(s.as_bytes()) })
+        Ok(Self::from(s))
     }
 }
 
-impl From<&core::ffi::CStr> for CString {
-    fn from(s: &core::ffi::CStr) -> Self {
-        // SAFETY: &CStr is guaranteed null-terminated with no interior nulls.
-        unsafe { from_bytes_unchecked(s.to_bytes()) }
+impl<T: AsRef<str>> From<T> for CString {
+    fn from(s: T) -> Self {
+        // SAFETY: &str is guaranteed to not contain interior null bytes.
+        unsafe { from_bytes_unchecked(s.as_ref().as_bytes()) }
     }
 }
 
@@ -314,31 +309,31 @@ mod tests {
 
     #[test]
     fn try_from_valid() {
-        let c = CString::try_from(b"hello".as_slice()).unwrap();
+        let c = CString::try_from_bytes(b"hello".as_slice()).unwrap();
         assert_eq!(c.to_bytes(), b"hello");
     }
 
     #[test]
     fn try_from_empty() {
-        let c = CString::try_from(b"".as_slice()).unwrap();
+        let c = CString::try_from_bytes(b"".as_slice()).unwrap();
         assert_eq!(c.to_bytes(), b"");
     }
 
     #[test]
     fn try_from_interior_null() {
-        let err = CString::try_from(b"ab\0cd".as_slice()).unwrap_err();
+        let err = CString::try_from_bytes(b"ab\0cd".as_slice()).unwrap_err();
         assert_eq!(err, CStringError::ContainsNull(2));
     }
 
     #[test]
     fn try_from_leading_null() {
-        let err = CString::try_from(b"\0hello".as_slice()).unwrap_err();
+        let err = CString::try_from_bytes(b"\0hello".as_slice()).unwrap_err();
         assert_eq!(err, CStringError::ContainsNull(0));
     }
 
     #[test]
     fn try_from_trailing_null() {
-        let err = CString::try_from(b"hello\0".as_slice()).unwrap_err();
+        let err = CString::try_from_bytes(b"hello\0".as_slice()).unwrap_err();
         assert_eq!(err, CStringError::ContainsNull(5));
     }
 

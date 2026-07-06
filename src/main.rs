@@ -30,6 +30,10 @@ enum Cli {
         #[arg(long)]
         net_pid: Option<i32>,
 
+        /// Preserve overlay upperdir after container exits (default: clean up)
+        #[arg(long)]
+        save: bool,
+
         /// Allocate a PTY for interactive use
         #[arg(short)]
         t: bool,
@@ -73,11 +77,13 @@ fn main() -> ExitCode {
         Cli::Run {
             rootfs,
             net_pid,
+            save,
             t,
             command,
         } => run_container(RunArgs {
             rootfs,
             net_pid: net_pid.map(|p| p as libc::pid_t),
+            save,
             tty: t,
             command,
         }),
@@ -95,6 +101,7 @@ fn run_daemon() -> ExitCode {
 struct RunArgs {
     rootfs: Option<PathBuf>,
     net_pid: Option<libc::pid_t>,
+    save: bool,
     tty: bool,
     command: Vec<CString>,
 }
@@ -105,6 +112,17 @@ fn run_container(args: RunArgs) -> ExitCode {
             Ok(path) => Some(path),
             Err(e) => {
                 tracing::error!(%e, rootfs = %p.display(), "invalid rootfs path");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    let overlay_dir = match rootfs {
+        Some(_) => match create_overlay_tempdir() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                tracing::error!(%e, "cannot create overlay tempdir");
                 return ExitCode::FAILURE;
             }
         },
@@ -203,11 +221,22 @@ fn run_container(args: RunArgs) -> ExitCode {
                 tracing::error!(%e, "sethostname failed");
             }
 
-            if let Some(ref rootfs) = rootfs
-                && let Err(e) = setup_container_root(rootfs)
-            {
-                tracing::error!(%e, "container root setup failed");
-                std::process::exit(1);
+            if let Some(ref rootfs) = rootfs {
+                let overlay_dir =
+                    overlay_dir.expect("overlay_dir is always created when rootfs is provided");
+
+                let container_root = match setup_overlay_rootfs(rootfs, &overlay_dir) {
+                    Ok(merged) => merged,
+                    Err(e) => {
+                        tracing::error!(%e, "overlay setup failed");
+                        std::process::exit(1);
+                    }
+                };
+
+                if let Err(e) = setup_container_root(&container_root) {
+                    tracing::error!(%e, "container root setup failed");
+                    std::process::exit(1);
+                }
             }
 
             let argv = sys::Argv::new(args.command);
@@ -251,13 +280,21 @@ fn run_container(args: RunArgs) -> ExitCode {
             }
             // master dropped here if Some — closes the master fd
 
-            match wait_for_child(pid) {
+            let exit_code = match wait_for_child(pid) {
                 Ok(code) => code,
                 Err(e) => {
                     tracing::error!(%e, "wait failed");
                     ExitCode::FAILURE
                 }
+            };
+
+            if let Some(ref overlay) = overlay_dir
+                && !args.save
+            {
+                cleanup_overlay(overlay);
             }
+
+            exit_code
         }
     }
 }
@@ -296,7 +333,7 @@ fn clone3_container(flags: c_int) -> io::Result<Option<libc::pid_t>> {
 /// 5. `chdir("/")`.
 /// 6. Mount `/proc`, `/sys`, `/dev`.
 fn setup_container_root(rootfs: &Path) -> io::Result<()> {
-    let rootfs_c = CString::try_from(rootfs.as_os_str().as_bytes()).unwrap();
+    let rootfs_c = CString::try_from_bytes(rootfs.as_os_str().as_bytes()).unwrap();
     let root_c = CString::from_str("/").unwrap();
     let proc_c = CString::from_str("proc").unwrap();
     let proc_dir_c = CString::from_str("/proc").unwrap();
@@ -343,6 +380,55 @@ fn setup_container_root(rootfs: &Path) -> io::Result<()> {
     sys::mount(None, dev_c.borrow(), tmpfs_c.borrow().into(), 0, None)?;
 
     Ok(())
+}
+
+fn create_overlay_tempdir() -> io::Result<PathBuf> {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("conrt.{:x}", ts));
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+fn setup_overlay_rootfs(rootfs: &Path, overlay_dir: &Path) -> io::Result<PathBuf> {
+    let upper = overlay_dir.join("upper");
+    let work = overlay_dir.join("work");
+    let merged = overlay_dir.join("merged");
+
+    std::fs::create_dir(&upper)?;
+    std::fs::create_dir(&work)?;
+    std::fs::create_dir(&merged)?;
+
+    let opts_str = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        rootfs.display(),
+        upper.display(),
+        work.display(),
+    );
+    let opts = CString::from(opts_str.as_str());
+    let overlay_c = CString::from("overlay");
+
+    sys::mount(
+        overlay_c.borrow().into(),
+        CString::try_from_bytes(merged.as_os_str().as_bytes())
+            .unwrap()
+            .borrow(),
+        overlay_c.borrow().into(),
+        0,
+        opts.borrow().into(),
+    )?;
+
+    Ok(merged)
+}
+
+fn cleanup_overlay(dir: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        tracing::warn!(%e, path = %dir.display(), "overlay cleanup failed");
+    }
 }
 
 /// Replace the current process with the given command.
@@ -403,6 +489,7 @@ mod tests {
         let code = run_container(RunArgs {
             rootfs: Some("/definitely/not/a/real/path".into()),
             net_pid: None,
+            save: false,
             tty: false,
             command: vec![CString::from_str("/bin/true").unwrap()],
         });

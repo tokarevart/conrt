@@ -115,13 +115,14 @@ root intervention.
 - Veth pair + NAT (bridge, iptables) require `CAP_NET_ADMIN` in the init netns
   — not available rootlessly. External connectivity would need `slirp4netns`.
 
-### Phase 4 — OverlayFS
+### Phase 4 — OverlayFS ✅
 
-- `--rootfs <path>` flag for the unpacked base image (no OCI/manifest parsing)
-- Per-container upperdir + workdir created before mount
-- `mount -t overlay ... -o lowerdir=<rootfs>,upperdir=<upper>,workdir=<work>`
-  mounted before `pivot_root`
-- `--rm` (default): wipe upperdir on exit; `--save`: preserve it
+- When `--rootfs <path>` is given, an overlay mount is created with the rootfs
+  as lowerdir and a per-container upperdir + workdir
+- Overlay is mounted inside the child's mount namespace (auto-cleaned on exit)
+- `--rm` (default): wipe upperdir on exit via `remove_dir_all`
+- `--save`: preserve upperdir for debugging / inspection
+- Works rootlessly (OverlayFS is supported in user namespaces on kernel 5.11+)
 
 ### Phase 5 — Security (Capabilities + Seccomp)
 
@@ -179,6 +180,10 @@ setup may require additional capabilities.
 
 ### Phase 3 — Network Namespace (lo only; veth requires CAP_NET_ADMIN)
 
-### Phase 4 — OverlayFS (not started)
+### Phase 4 — OverlayFS ✅
+
+- Overlay mount with lowerdir=`<rootfs>`, per-container upperdir + workdir
+- `--save` flag to preserve the upperdir after container exit
+- Works rootlessly on kernel 5.11+
 
 ### Phase 5 — Security (Capabilities + Seccomp) (not started)
