@@ -534,6 +534,37 @@ fn setup_overlay_rootfs(rootfs: &Path, overlay_dir: &Path) -> io::Result<PathBuf
 }
 
 fn cleanup_overlay(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn chmod_r(path: &Path) {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+
+        if meta.is_dir() {
+            match std::fs::read_dir(path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        chmod_r(&entry.path());
+                    }
+                }
+                Err(_) => {
+                    let _ = std::fs::set_permissions(path, PermissionsExt::from_mode(0o700));
+                    if let Ok(entries) = std::fs::read_dir(path) {
+                        for entry in entries.flatten() {
+                            chmod_r(&entry.path());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mode = if meta.is_dir() { 0o700 } else { 0o600 };
+        let _ = std::fs::set_permissions(path, PermissionsExt::from_mode(mode));
+    }
+
+    chmod_r(dir);
+
     if let Err(e) = std::fs::remove_dir_all(dir) {
         tracing::warn!(%e, path = %dir.display(), "overlay cleanup failed");
     }
