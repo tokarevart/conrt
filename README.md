@@ -12,31 +12,24 @@ conrt uses a **single daemon** process model:
 ┌──────────────────────────────────────────────────────────┐
 │                    Daemon (host ns)                      │
 │                                                          │
-│  Single io_uring ring (no epoll, no tokio)               │
+│  poll-based event loop (io_uring planned)                │
 │                                                          │
-│  SQEs:                                                   │
-│  ├── IORING_OP_WAITID → child₁                           │
-│  ├── IORING_OP_WAITID → child₂                           │
-│  ├── IORING_OP_READ    → PTY master for container 1      │
-│  ├── IORING_OP_READ    → PTY master for container 2      │
-│  ├── IORING_OP_ACCEPT  → Unix socket                     │
-│  ├── IORING_OP_READ    → connected client socket         │
-│  ├── IORING_OP_WRITE   → connected client socket         │
-│  └── ...                                                 │
+│  poll fds:                                               │
+│  ├── listener socket (accept → handle client)            │
+│  └── signalfd (SIGCHLD → waitpid → reap + cleanup)      │
 │                                                          │
-│  loop: io_uring_wait_cqe() → match op → submit new SQEs  │
+│  loop: poll() → match revents                            │
 │                                                          │
-│  No separate threads. All I/O through one ring.          │
+│  No threads. Single-threaded event loop.                 │
 └──────────────────────────────────────────────────────────┘
 ```
 
 Key points:
 - **One daemon** manages N containers, not a parent process per container
-- All I/O goes through a single `io_uring` ring — PTY reads, socket accept/read/write, child reaping (`IORING_OP_WAITID`). No separate threads.
-- Daemon handles all host-side teardown (cgroup deletion, veth cleanup, overlay unmount)
-- PTY interception gives `conrt logs <id>` access to historical output
-- No container-level reaper in v1 (user command is PID 1; `--init` can be added later)
-- `io-uring` crate used directly — no wrapper abstractions on top
+- Single-threaded `poll`-based event loop; `io_uring` planned as an optimization
+- Daemon handles all host-side teardown (overlay cleanup, etc.)
+- Detached containers get `PR_SET_PDEATHSIG(SIGKILL)` — daemon crash kills all children
+- Foreground `conrt run` (without `--detach`) runs standalone, no daemon required
 
 ## RingBuffer Data Structure
 
@@ -141,28 +134,26 @@ root intervention.
 - `tracing` + `tracing-subscriber` — structured logging
 - `io-uring` — raw io_uring bindings for the daemon event loop (planned)
 
-## Building
+## Usage
 
 ```bash
-cargo build --release
-sudo ./target/release/conrt daemon &
-sudo ./target/release/conrt run --rootfs /tmp/alpine /bin/sh
-sudo ./target/release/conrt logs <container-id>
+cargo run -- daemon &
+cargo run -- run --rootfs /tmp/alpine /bin/sh
 ```
 
-No root required — user namespaces handle privilege escalation. Cgroups and network
-setup may require additional capabilities.
+No root required — user namespaces handle privilege escalation.
 
 ## Status
 
-### Phase 0 — Project Scaffolding ✅
+### Phase 0 — Daemon ✅
 
-- Rust project with `clap` for CLI, `libc` for syscalls, `tracing` for logging,
-  `anyhow` for errors
-- Daemon subcommand: `conrt daemon` (stub)
-- Client subcommands: `conrt run [OPTIONS] <COMMAND>...`, `conrt logs <id>`,
-  `conrt list`, `conrt kill <id>` (logs/list/kill are stubs)
-- Communication between client and daemon via Unix socket (planned)
+- JSON-over-Unix-socket daemon with `poll` event loop
+- `signalfd` for SIGCHLD → reap + overlay cleanup
+- Container state tracking (`HashMap<pid, ContainerInfo>`)
+- `conrt run --detach` hands off containers to the daemon
+- `conrt list` / `conrt kill <pid>` connect to daemon via `~/.conrt/conrt.sock`
+- `conrt run` (without `--detach`) stays standalone foreground
+- PID used as container ID (no UUID)
 
 ### Phase 1 — Process & Filesystem Isolation ✅
 
@@ -174,7 +165,8 @@ setup may require additional capabilities.
 - PTY allocation (`-t` flag): `openpty` + `setsid` + `TIOCSCTTY` + `dup2` to 0/1/2,
   then `poll`-based I/O relay between host terminal and PTY master, with raw mode
   for interactive use
-- Daemon child reaping (planned)
+- Daemon child reaping via `signalfd` + `waitpid(-1, WNOHANG)` loop ✅
+- Detached containers get `PR_SET_PDEATHSIG(SIGKILL)` — daemon crash kills children
 
 ### Phase 2 — Cgroups v2 (skipped)
 
@@ -186,4 +178,4 @@ setup may require additional capabilities.
 - `--save` flag to preserve the upperdir after container exit
 - Works rootlessly on kernel 5.11+
 
-### Phase 5 — Security (Capabilities + Seccomp) (not started)
+### Phase 5 — Security (Capabilities + Seccomp) (skipped — rootless user ns provides equivalent restrictions)

@@ -1,4 +1,5 @@
 mod cstring;
+mod daemon;
 mod interprocess;
 mod pty;
 mod sys;
@@ -16,6 +17,11 @@ use clap::Parser;
 use cstring::CString;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
+
+fn default_socket_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".conrt").join("conrt.sock")
+}
 
 #[derive(Parser)]
 #[command(name = "conrt")]
@@ -38,22 +44,42 @@ enum Cli {
         #[arg(short)]
         t: bool,
 
+        /// Detach and hand off to the daemon
+        #[arg(long)]
+        detach: bool,
+
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+
         /// Command to run inside the container
         command: Vec<CString>,
     },
     /// Start the daemon
-    Daemon,
+    Daemon {
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+    },
     /// Show container logs
     Logs {
         /// Container ID
         id: String,
     },
     /// List running containers
-    List,
+    List {
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+    },
     /// Kill a container
     Kill {
-        /// Container ID
-        id: String,
+        /// Container PID
+        pid: i32,
+
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
     },
 }
 
@@ -73,29 +99,110 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Daemon => run_daemon(),
+        Cli::Daemon { socket_path } => run_daemon(socket_path.unwrap_or_else(default_socket_path)),
         Cli::Run {
             rootfs,
             net_pid,
             save,
             t,
+            detach,
+            socket_path,
             command,
-        } => run_container(RunArgs {
-            rootfs,
-            net_pid: net_pid.map(|p| p as libc::pid_t),
-            save,
-            tty: t,
-            command,
-        }),
+        } => {
+            if detach {
+                if t {
+                    tracing::error!("--detach is incompatible with -t");
+                    return ExitCode::FAILURE;
+                }
+                run_detach(
+                    socket_path.unwrap_or_else(default_socket_path),
+                    rootfs,
+                    net_pid.map(|p| p as libc::pid_t),
+                    save,
+                    command,
+                )
+            } else {
+                run_container(RunArgs {
+                    rootfs,
+                    net_pid: net_pid.map(|p| p as libc::pid_t),
+                    save,
+                    tty: t,
+                    command,
+                })
+            }
+        }
         Cli::Logs { id } => show_logs(id),
-        Cli::List => list_containers(),
-        Cli::Kill { id } => kill_container(id),
+        Cli::List { socket_path } => {
+            list_containers(socket_path.unwrap_or_else(default_socket_path))
+        }
+        Cli::Kill { pid, socket_path } => {
+            kill_container(pid, socket_path.unwrap_or_else(default_socket_path))
+        }
     }
 }
 
-fn run_daemon() -> ExitCode {
-    tracing::info!("starting daemon");
-    todo!("daemon event loop")
+fn run_daemon(socket_path: PathBuf) -> ExitCode {
+    tracing::info!(path = %socket_path.display(), "starting daemon");
+    let mut daemon = daemon::Daemon::new(socket_path);
+    match daemon.run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(%e, "daemon exited with error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_detach(
+    socket_path: PathBuf,
+    rootfs: Option<PathBuf>,
+    net_pid: Option<libc::pid_t>,
+    save: bool,
+    command: Vec<CString>,
+) -> ExitCode {
+    let cmd_strs: Vec<String> = command
+        .iter()
+        .map(|c| String::from_utf8_lossy(c.to_bytes()).into_owned())
+        .collect();
+    let rootfs_str = rootfs.as_ref().map(|p| p.to_string_lossy().into_owned());
+
+    let request = daemon::Request::Run {
+        rootfs: rootfs_str,
+        net_pid,
+        save,
+        command: cmd_strs,
+    };
+
+    let resp = match daemon::send_request(&socket_path, &request) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "cannot connect to daemon");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct RunResp {
+        ok: bool,
+        pid: Option<i32>,
+        error: Option<String>,
+    }
+
+    let resp: RunResp = match serde_json::from_slice(&resp) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "invalid daemon response");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if resp.ok {
+        println!("{}", resp.pid.unwrap());
+        ExitCode::SUCCESS
+    } else {
+        tracing::error!(error = %resp.error.as_deref().unwrap_or("unknown"), "daemon rejected run");
+        ExitCode::FAILURE
+    }
 }
 
 struct RunArgs {
@@ -469,15 +576,83 @@ fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
 }
 
 fn show_logs(_id: String) -> ExitCode {
-    todo!("container logs")
+    tracing::error!("container logs not implemented yet");
+    ExitCode::FAILURE
 }
 
-fn list_containers() -> ExitCode {
-    todo!("list containers")
+fn list_containers(socket_path: PathBuf) -> ExitCode {
+    let request = daemon::Request::List;
+    let resp = match daemon::send_request(&socket_path, &request) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "cannot connect to daemon");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ListResp {
+        containers: Vec<ListContainer>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ListContainer {
+        pid: i32,
+        command: String,
+        start_time: String,
+    }
+
+    let resp: ListResp = match serde_json::from_slice(&resp) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "invalid daemon response");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if resp.containers.is_empty() {
+        println!("No running containers");
+    } else {
+        for c in &resp.containers {
+            println!("{:>6}  {:50} {}", c.pid, c.command, c.start_time);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
-fn kill_container(_id: String) -> ExitCode {
-    todo!("kill container")
+fn kill_container(pid: i32, socket_path: PathBuf) -> ExitCode {
+    let request = daemon::Request::Kill { pid };
+    let resp = match daemon::send_request(&socket_path, &request) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "cannot connect to daemon");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct KillResp {
+        ok: bool,
+        error: Option<String>,
+    }
+
+    let resp: KillResp = match serde_json::from_slice(&resp) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "invalid daemon response");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if resp.ok {
+        println!("killed {pid}");
+        ExitCode::SUCCESS
+    } else {
+        tracing::error!(
+            error = %resp.error.as_deref().unwrap_or("unknown"),
+            "kill failed"
+        );
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]

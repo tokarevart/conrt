@@ -296,3 +296,28 @@ pub fn dup2(oldfd: RawFd, newfd: RawFd) -> io::Result<()> {
         Ok(())
     }
 }
+
+/// `prctl(option, arg2, ...)` — raw syscall. Thin wrapper; caller manages
+/// argument semantics per `option`.
+#[inline]
+pub fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> io::Result<()> {
+    let ret = unsafe { libc::prctl(option, arg2, arg3, arg4, arg5) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `signalfd(fd, mask, flags)` — create a file descriptor for signal delivery.
+/// `fd` should be -1 to create a new signalfd. `mask` is a `sigset_t` of
+/// signals to accept.
+#[inline]
+pub fn signalfd(fd: RawFd, mask: &libc::sigset_t, flags: c_int) -> io::Result<RawFd> {
+    let ret = unsafe { libc::signalfd(fd, mask, flags) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
