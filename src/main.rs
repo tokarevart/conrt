@@ -3,6 +3,7 @@ mod daemon;
 mod interprocess;
 mod pty;
 mod sys;
+mod uring;
 
 use std::ffi::c_int;
 use std::io;

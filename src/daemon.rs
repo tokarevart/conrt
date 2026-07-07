@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::cstring::CString;
 use crate::interprocess;
 use crate::sys;
+use crate::uring::Ring;
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -103,50 +104,42 @@ impl Daemon {
 
         let sigchld = setup_sigchld_fd()?;
 
-        let mut poll_fds = Vec::with_capacity(64);
         let listener_fd = listener.as_raw_fd();
 
-        loop {
-            poll_fds.clear();
-            poll_fds.push(libc::pollfd {
-                fd: listener_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            poll_fds.push(libc::pollfd {
-                fd: sigchld,
-                events: libc::POLLIN,
-                revents: 0,
-            });
+        let mut ring = Ring::new(8)?;
+        ring.poll_add(listener_fd, libc::POLLIN as u32, 0);
+        ring.poll_add(sigchld, libc::POLLIN as u32, 1);
 
-            let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
+        loop {
+            ring.submit_and_wait(1)?;
+
+            let cq = ring.completion();
+            for cqe in cq {
+                let ret = cqe.result();
+                if ret < 0 {
                     continue;
                 }
-                return Err(err);
-            }
 
-            if poll_fds[0].revents & libc::POLLIN != 0 {
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if let Err(e) = self.handle_client(stream) {
-                                tracing::warn!(%e, "client handler error");
+                match cqe.user_data() {
+                    0 => loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                if let Err(e) = self.handle_client(stream) {
+                                    tracing::warn!(%e, "client handler error");
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                tracing::warn!(%e, "accept error");
+                                break;
                             }
                         }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            tracing::warn!(%e, "accept error");
-                            break;
-                        }
+                    },
+                    1 => {
+                        self.reap_children();
                     }
+                    _ => {}
                 }
-            }
-
-            if poll_fds[1].revents & libc::POLLIN != 0 {
-                self.reap_children();
             }
         }
     }
