@@ -8,6 +8,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use bbqueue::nicknames::Churrasco;
+use libc::pid_t;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -15,6 +17,8 @@ use crate::cstring::CString;
 use crate::interprocess;
 use crate::sys;
 use crate::uring::Ring;
+
+const LOG_CAPACITY: usize = 65536;
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -31,55 +35,68 @@ pub enum Request {
     Kill {
         pid: i32,
     },
+    Logs {
+        pid: i32,
+    },
 }
 
-#[derive(Serialize)]
-struct RunResponse {
-    ok: bool,
+#[derive(Serialize, Deserialize)]
+pub struct RunResponse {
+    pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pid: Option<i32>,
+    pub pid: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ListResponse {
-    containers: Vec<ContainerSummary>,
+#[derive(Serialize, Deserialize)]
+pub struct ListResponse {
+    pub containers: Vec<ContainerSummary>,
 }
 
-#[derive(Serialize)]
-struct ContainerSummary {
-    pid: i32,
-    command: String,
-    start_time: String,
+#[derive(Serialize, Deserialize)]
+pub struct ContainerSummary {
+    pub pid: i32,
+    pub command: String,
+    pub start_time: String,
 }
 
-#[derive(Serialize)]
-struct KillResponse {
-    ok: bool,
+#[derive(Serialize, Deserialize)]
+pub struct KillResponse {
+    pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    ok: bool,
-    error: String,
+#[derive(Serialize, Deserialize)]
+pub struct LogsResponse {
+    pub lines: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub ok: bool,
+    pub error: String,
 }
 
 // ── Container State ───────────────────────────────────────────────────────
 
 struct ContainerInfo {
-    pid: libc::pid_t,
+    pid: pid_t,
     command: String,
     overlay_dir: Option<PathBuf>,
     save: bool,
     start_time: SystemTime,
+    bbq: Churrasco<LOG_CAPACITY>,
 }
 
 pub struct Daemon {
     socket_path: PathBuf,
-    containers: HashMap<libc::pid_t, ContainerInfo>,
+    containers: HashMap<pid_t, ContainerInfo>,
+    output_fds: HashMap<u64, (RawFd, pid_t)>,
+    line_bufs: HashMap<u64, Vec<u8>>,
+    next_output_id: u64,
+    log_graveyard: HashMap<pid_t, Churrasco<LOG_CAPACITY>>,
 }
 
 impl Daemon {
@@ -87,6 +104,10 @@ impl Daemon {
         Self {
             socket_path,
             containers: HashMap::new(),
+            output_fds: HashMap::new(),
+            line_bufs: HashMap::new(),
+            next_output_id: 2,
+            log_graveyard: HashMap::new(),
         }
     }
 
@@ -102,9 +123,8 @@ impl Daemon {
         listener.set_nonblocking(true)?;
         tracing::info!(path = %self.socket_path.display(), "daemon listening");
 
-        let sigchld = setup_sigchld_fd()?;
-
         let listener_fd = listener.as_raw_fd();
+        let sigchld = setup_sigchld_fd()?;
 
         let mut ring = Ring::new(8)?;
         ring.poll_add(listener_fd, libc::POLLIN as u32, 0);
@@ -113,38 +133,53 @@ impl Daemon {
         loop {
             ring.submit_and_wait(1)?;
 
-            let cq = ring.completion();
-            for cqe in cq {
-                let ret = cqe.result();
-                if ret < 0 {
-                    continue;
-                }
-
-                match cqe.user_data() {
-                    0 => loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => {
-                                if let Err(e) = self.handle_client(stream) {
-                                    tracing::warn!(%e, "client handler error");
+            let entries: Vec<_> = ring
+                .completion()
+                .map(|cqe| (cqe.user_data(), cqe.result()))
+                .collect();
+            for (user_data, ret) in entries {
+                match user_data {
+                    0 => {
+                        if ret < 0 {
+                            continue;
+                        }
+                        loop {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    if let Err(e) = self.handle_client(stream, &mut ring) {
+                                        tracing::warn!(%e, "client handler error");
+                                    }
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(e) => {
+                                    tracing::warn!(%e, "accept error");
+                                    break;
                                 }
                             }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                tracing::warn!(%e, "accept error");
-                                break;
-                            }
                         }
-                    },
+                    }
                     1 => {
+                        if ret < 0 {
+                            continue;
+                        }
                         self.reap_children();
                     }
-                    _ => {}
+                    id => {
+                        if ret < 0 {
+                            self.cleanup_output(id);
+                            continue;
+                        }
+                        if let Err(e) = self.handle_container_output(id, ret as u32) {
+                            tracing::warn!(%e, "container output error");
+                            self.cleanup_output(id);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn handle_client(&mut self, stream: UnixStream) -> io::Result<()> {
+    fn handle_client(&mut self, stream: UnixStream, ring: &mut Ring) -> io::Result<()> {
         let raw_fd = stream.as_raw_fd();
 
         let mut len_buf = [0u8; 4];
@@ -171,15 +206,17 @@ impl Daemon {
                 net_pid,
                 save,
                 command,
-            } => self.handle_run(raw_fd, rootfs, net_pid, save, command),
+            } => self.handle_run(raw_fd, ring, rootfs, net_pid, save, command),
             Request::List => self.handle_list(raw_fd),
             Request::Kill { pid } => self.handle_kill(raw_fd, pid),
+            Request::Logs { pid } => self.handle_logs(raw_fd, pid),
         }
     }
 
     fn handle_run(
         &mut self,
         fd: RawFd,
+        ring: &mut Ring,
         rootfs: Option<String>,
         net_pid: Option<i32>,
         save: bool,
@@ -224,6 +261,19 @@ impl Daemon {
             }
         };
 
+        // Create pipe for capturing container stdout/stderr
+        let mut pipe_fds = sys::FdPair {
+            read: -1,
+            write: -1,
+        };
+        if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC | libc::O_NONBLOCK) {
+            let resp = ErrorResponse {
+                ok: false,
+                error: format!("log pipe creation failed: {e}"),
+            };
+            return write_response(fd, &resp);
+        }
+
         let command_c: Vec<CString> = match command
             .iter()
             .map(|s| CString::try_from_bytes(s.as_bytes()))
@@ -231,6 +281,8 @@ impl Daemon {
         {
             Ok(v) => v,
             Err(e) => {
+                sys::close(pipe_fds.read);
+                sys::close(pipe_fds.write);
                 let resp = ErrorResponse {
                     ok: false,
                     error: format!("invalid command (null byte): {e}"),
@@ -244,6 +296,8 @@ impl Daemon {
                 let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
                     Ok(f) => f,
                     Err(e) => {
+                        sys::close(pipe_fds.read);
+                        sys::close(pipe_fds.write);
                         let resp = ErrorResponse {
                             ok: false,
                             error: format!("cannot open pid {pid} user ns: {e}"),
@@ -254,6 +308,8 @@ impl Daemon {
                 let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
                     Ok(f) => f,
                     Err(e) => {
+                        sys::close(pipe_fds.read);
+                        sys::close(pipe_fds.write);
                         let resp = ErrorResponse {
                             ok: false,
                             error: format!("cannot open pid {pid} net ns: {e}"),
@@ -262,6 +318,8 @@ impl Daemon {
                     }
                 };
                 if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
+                    sys::close(pipe_fds.read);
+                    sys::close(pipe_fds.write);
                     let resp = ErrorResponse {
                         ok: false,
                         error: format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"),
@@ -269,6 +327,8 @@ impl Daemon {
                     return write_response(fd, &resp);
                 }
                 if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
+                    sys::close(pipe_fds.read);
+                    sys::close(pipe_fds.write);
                     let resp = ErrorResponse {
                         ok: false,
                         error: format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"),
@@ -297,6 +357,8 @@ impl Daemon {
         let clone_result = crate::clone3_container(clone_flags);
         match clone_result {
             Err(e) => {
+                sys::close(pipe_fds.read);
+                sys::close(pipe_fds.write);
                 let resp = ErrorResponse {
                     ok: false,
                     error: format!("clone3 failed: {e}"),
@@ -305,6 +367,13 @@ impl Daemon {
             }
             Ok(None) => {
                 // ── CHILD ──
+                sys::close(pipe_fds.read);
+                let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
+                let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
+                if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
+                    sys::close(pipe_fds.write);
+                }
+
                 if let Err(e) = signal.wait() {
                     tracing::error!(%e, "sync wait failed");
                     std::process::exit(1);
@@ -349,6 +418,14 @@ impl Daemon {
             }
             Ok(Some(pid)) => {
                 // ── PARENT ──
+                sys::close(pipe_fds.write);
+
+                let output_id = self.next_output_id;
+                self.next_output_id += 1;
+                ring.poll_add(pipe_fds.read, libc::POLLIN as u32, output_id);
+                self.output_fds.insert(output_id, (pipe_fds.read, pid));
+                self.line_bufs.insert(output_id, Vec::new());
+
                 let maps_result = if needs_userns_maps {
                     crate::setup_userns_maps(pid)
                 } else {
@@ -357,6 +434,7 @@ impl Daemon {
                 signal.signal();
 
                 if let Err(e) = maps_result {
+                    self.cleanup_output(output_id);
                     let resp = ErrorResponse {
                         ok: false,
                         error: format!("container aborted: {e}"),
@@ -371,6 +449,7 @@ impl Daemon {
                     overlay_dir,
                     save,
                     start_time: SystemTime::now(),
+                    bbq: Churrasco::new(),
                 });
 
                 tracing::info!(%pid, "detached container started");
@@ -405,7 +484,7 @@ impl Daemon {
     }
 
     fn handle_kill(&self, fd: RawFd, pid: i32) -> io::Result<()> {
-        if !self.containers.contains_key(&(pid as libc::pid_t)) {
+        if !self.containers.contains_key(&(pid as pid_t)) {
             let resp = KillResponse {
                 ok: false,
                 error: Some(format!("container {pid} not found")),
@@ -413,7 +492,7 @@ impl Daemon {
             return write_response(fd, &resp);
         }
 
-        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let ret = unsafe { libc::kill(pid as pid_t, libc::SIGKILL) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             let resp = KillResponse {
@@ -437,11 +516,14 @@ impl Daemon {
             match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
                 Ok(pid) if pid > 0 => {
                     tracing::info!(%pid, %status, "container exited");
-                    if let Some(info) = self.containers.remove(&pid)
-                        && let Some(ref overlay) = info.overlay_dir
-                        && !info.save
-                    {
-                        crate::cleanup_overlay(overlay);
+                    if let Some(mut info) = self.containers.remove(&pid) {
+                        self.log_graveyard
+                            .insert(pid, std::mem::replace(&mut info.bbq, Churrasco::new()));
+                        if let Some(ref overlay) = info.overlay_dir
+                            && !info.save
+                        {
+                            crate::cleanup_overlay(overlay);
+                        }
                     }
                 }
                 Ok(_) => break,
@@ -455,6 +537,84 @@ impl Daemon {
             }
         }
     }
+
+    fn handle_container_output(&mut self, id: u64, revents: u32) -> io::Result<()> {
+        let (fd, pid) = match self.output_fds.get(&id) {
+            Some(v) => *v,
+            None => return Ok(()),
+        };
+
+        if revents & libc::POLLIN as u32 != 0 {
+            let buf = self.line_bufs.get_mut(&id).unwrap();
+            let read_offset = buf.len();
+            buf.resize(read_offset + 4096, 0);
+            match sys::read(fd, &mut buf[read_offset..]) {
+                Ok(n) if n > 0 => {
+                    let total = read_offset + n as usize;
+                    buf.truncate(total);
+                    let mut start = 0usize;
+                    let mut i = 0;
+                    while i < total {
+                        if buf[i] == b'\n' {
+                            let line = std::str::from_utf8(&buf[start..i])
+                                .unwrap_or_default()
+                                .to_string();
+                            if let Some(info) = self.containers.get_mut(&pid) {
+                                let prod = info.bbq.stream_producer();
+                                if let Ok(mut wgr) = prod.grant_exact(line.len()) {
+                                    wgr.copy_from_slice(line.as_bytes());
+                                    wgr.commit(line.len());
+                                }
+                            }
+                            start = i + 1;
+                        }
+                        i += 1;
+                    }
+                    if start < total {
+                        let remaining = buf[start..total].to_vec();
+                        *buf = remaining;
+                    } else {
+                        buf.clear();
+                    }
+                }
+                Ok(_) => {
+                    buf.clear();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if revents & (libc::POLLHUP | libc::POLLERR) as u32 != 0 {
+            self.cleanup_output(id);
+        }
+
+        Ok(())
+    }
+
+    fn cleanup_output(&mut self, id: u64) {
+        if let Some((fd, ..)) = self.output_fds.remove(&id) {
+            sys::close(fd);
+        }
+        self.line_bufs.remove(&id);
+    }
+
+    fn handle_logs(&mut self, fd: RawFd, pid: i32) -> io::Result<()> {
+        let lines = if let Some(info) = self.containers.get_mut(&pid) {
+            drain_bbq(&info.bbq)
+        } else if let Some(bbq) = self.log_graveyard.get_mut(&pid) {
+            drain_bbq(bbq)
+        } else {
+            let resp = ErrorResponse {
+                ok: false,
+                error: format!("container {pid} not found"),
+            };
+            return write_response(fd, &resp);
+        };
+
+        let resp = LogsResponse { lines };
+        write_response(fd, &resp)
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -463,8 +623,8 @@ fn setup_sigchld_fd() -> io::Result<RawFd> {
     let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe { libc::sigemptyset(&mut mask) };
     unsafe { libc::sigaddset(&mut mask, libc::SIGCHLD) };
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) };
-    let fd = sys::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)?;
+    sys::sigprocmask(libc::SIG_BLOCK, Some(&mask), None)?;
+    let fd = sys::signalfd(-1, &mask, libc::SFD_CLOEXEC)?;
     Ok(fd)
 }
 
@@ -493,6 +653,18 @@ fn write_response<T: Serialize>(fd: RawFd, resp: &T) -> io::Result<()> {
 }
 
 // ── Client helpers ────────────────────────────────────────────────────────
+
+fn drain_bbq(bbq: &Churrasco<LOG_CAPACITY>) -> Vec<String> {
+    let cons = bbq.stream_consumer();
+    let mut lines = Vec::new();
+    while let Ok(grant) = cons.read() {
+        let s = std::str::from_utf8(&grant).unwrap_or_default().to_string();
+        let len = grant.len();
+        lines.push(s);
+        grant.release(len);
+    }
+    lines
+}
 
 pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>> {
     use std::os::unix::io::AsRawFd;

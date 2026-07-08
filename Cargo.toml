@@ -13,3 +13,4 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 io-uring = "0.7"
+bbqueue = "0.7.0"

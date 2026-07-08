@@ -22,6 +22,7 @@ unsafe impl Send for CString {}
 unsafe impl Sync for CString {}
 
 impl CString {
+    #[inline(always)]
     pub fn try_from_bytes(s: &[u8]) -> Result<Self, CStringError> {
         if let Some(pos) = s.iter().position(|&b| b == 0) {
             return Err(CStringError::ContainsNull(pos));
@@ -30,14 +31,17 @@ impl CString {
         Ok(unsafe { from_bytes_unchecked(s) })
     }
 
+    #[inline(always)]
     pub fn as_ptr(&mut self) -> NonNull<c_char> {
         self.buf
     }
 
+    #[inline(always)]
     pub fn as_raw(&self) -> *const c_char {
         self.buf.as_ptr()
     }
 
+    #[inline(always)]
     pub fn borrow(&self) -> CStr<'_> {
         CStr {
             buf: self.buf,
@@ -45,24 +49,29 @@ impl CString {
         }
     }
 
+    #[inline(always)]
     pub fn as_std_c_str(&self) -> &core::ffi::CStr {
         unsafe { core::ffi::CStr::from_ptr(self.as_raw()) }
     }
 
+    #[inline(always)]
     pub fn to_bytes(&self) -> &[u8] {
         self.as_std_c_str().to_bytes()
     }
 
+    #[inline(always)]
     pub fn into_ptr(self) -> NonNull<c_char> {
         let ptr = self.buf;
         mem::forget(self);
         ptr
     }
 
+    #[inline(always)]
     pub fn into_raw(self) -> *mut c_char {
         self.into_ptr().as_ptr()
     }
 
+    #[inline(always)]
     pub fn into_raw_option(this: Option<Self>) -> *mut c_char {
         match this {
             Some(s) => s.into_raw(),
@@ -74,11 +83,13 @@ impl CString {
     ///
     /// Each `CString` is leaked — `Drop` does not run. Use this when handing
     /// memory off to a C API like `execvp`.
+    #[inline(always)]
     pub fn into_raw_vec(v: Vec<CString>) -> Vec<NonNull<c_char>> {
         let (ptr, len, cap) = v.into_raw_parts();
         unsafe { Vec::from_raw_parts(ptr as *mut NonNull<c_char>, len, cap) }
     }
 
+    #[inline(always)]
     pub fn into_vec_of_options(v: Vec<CString>) -> Vec<Option<CString>> {
         unsafe { core::mem::transmute::<_, _>(v) }
     }
@@ -195,18 +206,22 @@ impl PartialEq for CStr<'_> {
 impl Eq for CStr<'_> {}
 
 impl<'a> CStr<'a> {
+    #[inline(always)]
     pub fn as_std(self) -> &'a core::ffi::CStr {
         unsafe { core::ffi::CStr::from_ptr(self.as_raw()) }
     }
 
+    #[inline(always)]
     pub fn to_bytes(self) -> &'a [u8] {
         self.as_std().to_bytes()
     }
 
+    #[inline(always)]
     pub fn as_raw(self) -> *const c_char {
         self.buf.as_ptr()
     }
 
+    #[inline(always)]
     pub fn as_raw_option(this: Option<Self>) -> *const c_char {
         match this {
             Some(s) => s.as_raw(),
@@ -216,6 +231,7 @@ impl<'a> CStr<'a> {
 }
 
 impl<'a> From<&'a CString> for CStr<'a> {
+    #[inline(always)]
     fn from(s: &'a CString) -> Self {
         s.borrow()
     }

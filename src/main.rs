@@ -66,6 +66,9 @@ enum Cli {
     Logs {
         /// Container ID
         id: String,
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
     },
     /// List running containers
     List {
@@ -132,7 +135,9 @@ fn main() -> ExitCode {
                 })
             }
         }
-        Cli::Logs { id } => show_logs(id),
+        Cli::Logs { id, socket_path } => {
+            show_logs(id, socket_path.unwrap_or_else(default_socket_path))
+        }
         Cli::List { socket_path } => {
             list_containers(socket_path.unwrap_or_else(default_socket_path))
         }
@@ -607,9 +612,35 @@ fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
     Ok(())
 }
 
-fn show_logs(_id: String) -> ExitCode {
-    tracing::error!("container logs not implemented yet");
-    ExitCode::FAILURE
+fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
+    let pid: i32 = match id.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(%e, "invalid container id (expected numeric PID)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let request = daemon::Request::Logs { pid };
+    let resp = match daemon::send_request(&socket_path, &request) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "cannot connect to daemon");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Ok(success) = serde_json::from_slice::<daemon::LogsResponse>(&resp) {
+        for line in &success.lines {
+            println!("{line}");
+        }
+        ExitCode::SUCCESS
+    } else if let Ok(err) = serde_json::from_slice::<daemon::ErrorResponse>(&resp) {
+        tracing::error!(error = %err.error, "logs failed");
+        ExitCode::FAILURE
+    } else {
+        tracing::error!("invalid daemon response");
+        ExitCode::FAILURE
+    }
 }
 
 fn list_containers(socket_path: PathBuf) -> ExitCode {
@@ -622,18 +653,7 @@ fn list_containers(socket_path: PathBuf) -> ExitCode {
         }
     };
 
-    #[derive(serde::Deserialize)]
-    struct ListResp {
-        containers: Vec<ListContainer>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ListContainer {
-        pid: i32,
-        command: String,
-        start_time: String,
-    }
-
-    let resp: ListResp = match serde_json::from_slice(&resp) {
+    let resp: daemon::ListResponse = match serde_json::from_slice(&resp) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(%e, "invalid daemon response");
@@ -661,13 +681,7 @@ fn kill_container(pid: i32, socket_path: PathBuf) -> ExitCode {
         }
     };
 
-    #[derive(serde::Deserialize)]
-    struct KillResp {
-        ok: bool,
-        error: Option<String>,
-    }
-
-    let resp: KillResp = match serde_json::from_slice(&resp) {
+    let resp: daemon::KillResponse = match serde_json::from_slice(&resp) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(%e, "invalid daemon response");

@@ -309,6 +309,32 @@ pub fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> io::R
     }
 }
 
+/// `sigprocmask(how, set, oldset)` — examine/change the calling thread's
+/// signal mask. `set` is the new mask (pass `None` to leave unchanged).
+/// `oldset` receives the previous mask (pass `None` to discard).
+///
+/// This is a thin wrapper around libc's `sigprocmask`, which lives in
+/// libc.so — no pthread dependency.
+#[inline]
+pub fn sigprocmask(
+    how: c_int,
+    set: Option<&libc::sigset_t>,
+    oldset: Option<&mut libc::sigset_t>,
+) -> io::Result<()> {
+    let ret = unsafe {
+        libc::sigprocmask(
+            how,
+            set.map_or(std::ptr::null(), |s| s as *const _),
+            oldset.map_or(std::ptr::null_mut(), |s| s as *mut _),
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// `signalfd(fd, mask, flags)` — create a file descriptor for signal delivery.
 /// `fd` should be -1 to create a new signalfd. `mask` is a `sigset_t` of
 /// signals to accept.
