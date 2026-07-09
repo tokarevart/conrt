@@ -309,18 +309,6 @@ pub fn dup(fd: RawFd) -> io::Result<RawFd> {
     }
 }
 
-/// `prctl(option, arg2, ...)` — raw syscall. Thin wrapper; caller manages
-/// argument semantics per `option`.
-#[inline]
-pub fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> io::Result<()> {
-    let ret = unsafe { libc::prctl(option, arg2, arg3, arg4, arg5) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 /// `sigprocmask(how, set, oldset)` — examine/change the calling thread's
 /// signal mask. `set` is the new mask (pass `None` to leave unchanged).
 /// `oldset` receives the previous mask (pass `None` to discard).

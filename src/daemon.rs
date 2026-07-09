@@ -387,12 +387,6 @@ impl Daemon {
                     std::process::exit(1);
                 }
 
-                if let Err(e) = sys::prctl(libc::PR_SET_PDEATHSIG as _, libc::SIGKILL as _, 0, 0, 0)
-                {
-                    tracing::error!(%e, "PR_SET_PDEATHSIG failed");
-                    std::process::exit(1);
-                }
-
                 if let Err(e) = sys::bring_up_lo() {
                     tracing::warn!(%e, "bring_up_lo failed");
                 }
