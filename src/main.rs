@@ -443,17 +443,16 @@ fn clone3_container(flags: c_int) -> io::Result<Option<libc::pid_t>> {
 ///
 /// 1. Remount the mount tree as private (prevent mount leaks to host).
 /// 2. Bind-mount the rootfs onto itself.
-/// 3. `chdir` into rootfs.
-/// 4. `chroot(".")` — change root to the bound rootfs.
-/// 5. `chdir("/")`.
-/// 6. Mount `/proc`, `/sys`, `/dev`.
+/// 3. Bind-mount essential device nodes from the host into `/dev`.
+/// 4. `chdir` into rootfs.
+/// 5. `chroot(".")` — change root to the bound rootfs.
+/// 6. `chdir("/")`.
+/// 7. Mount `/proc`.
 fn setup_container_root(rootfs: &Path) -> io::Result<()> {
     let rootfs_c = CString::try_from_bytes(rootfs.as_os_str().as_bytes()).unwrap();
     let root_c = CString::from_str("/").unwrap();
     let proc_c = CString::from_str("proc").unwrap();
     let proc_dir_c = CString::from_str("/proc").unwrap();
-    let tmpfs_c = CString::from_str("tmpfs").unwrap();
-    let dev_c = CString::from_str("/dev").unwrap();
 
     // 1. Remount entire tree as private
     sys::mount(
@@ -473,16 +472,35 @@ fn setup_container_root(rootfs: &Path) -> io::Result<()> {
         None,
     )?;
 
-    // 3. chdir into rootfs
+    // 3. Bind-mount essential device nodes from the host. `mknod` is not permitted
+    //    inside user namespaces, so we bind-mount the host's device nodes before
+    //    chroot hides them.
+    let dev = rootfs.join("dev");
+    std::fs::create_dir_all(&dev)?;
+    for name in ["null", "zero", "random", "urandom", "full", "tty"] {
+        let dst = dev.join(name);
+        std::fs::write(&dst, [])?; // create mount target
+        let src = CString::from(format!("/dev/{}", name));
+        let dst_c = CString::try_from_bytes(dst.as_os_str().as_encoded_bytes()).unwrap();
+        sys::mount(
+            Some(src.borrow()),
+            dst_c.borrow(),
+            None,
+            libc::MS_BIND,
+            None,
+        )?;
+    }
+
+    // 4. chdir into rootfs
     sys::chdir(rootfs_c.borrow())?;
 
-    // 4. chroot to current directory (".")
+    // 5. chroot to current directory (".")
     sys::chroot(rootfs_c.borrow())?;
 
-    // 5. chdir to new root
+    // 6. chdir to new root
     sys::chdir(root_c.borrow())?;
 
-    // 6. Mount proc
+    // 7. Mount proc
     sys::mount(
         proc_c.borrow().into(),
         proc_dir_c.borrow(),
@@ -490,9 +508,6 @@ fn setup_container_root(rootfs: &Path) -> io::Result<()> {
         0,
         None,
     )?;
-
-    // 7. Mount dev (tmpfs)
-    sys::mount(None, dev_c.borrow(), tmpfs_c.borrow().into(), 0, None)?;
 
     Ok(())
 }
