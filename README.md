@@ -1,8 +1,8 @@
 # conrt — A Minimal Container Runtime
 
 conrt is a from-scratch, Docker-like container runtime built in Rust. It's a course project
-for learning systems programming: Linux kernel interfaces (namespaces, cgroups, mounts,
-seccomp), process and memory management in Rust, and a few classic data structures.
+for learning systems programming: Linux kernel interfaces (namespaces, mounts,
+OverlayFS), process and memory management in Rust, and a few classic data structures.
 
 ## Architecture
 
@@ -12,13 +12,16 @@ conrt uses a **single daemon** process model:
 ┌──────────────────────────────────────────────────────────┐
 │                    Daemon (host ns)                      │
 │                                                          │
-│  poll-based event loop (io_uring planned)                │
+│  io_uring-based event loop                               │
 │                                                          │
-│  poll fds:                                               │
+│  CQE sources:                                            │
 │  ├── listener socket (accept → handle client)            │
+│  ├── client fds (read request / write response)          │
+│  ├── container PTY fds (read stdout → bbqueue)           │
+│  ├── stream client fds (write logs)                      │
 │  └── signalfd (SIGCHLD → waitpid → reap + cleanup)      │
 │                                                          │
-│  loop: poll() → match revents                            │
+│  loop: io_uring_submit_and_wait() → dispatch CQEs        │
 │                                                          │
 │  No threads. Single-threaded event loop.                 │
 └──────────────────────────────────────────────────────────┘
@@ -26,9 +29,9 @@ conrt uses a **single daemon** process model:
 
 Key points:
 - **One daemon** manages N containers, not a parent process per container
-- Single-threaded `poll`-based event loop; `io_uring` planned as an optimization
+- Single-threaded `io_uring`-based event loop
 - Daemon handles all host-side teardown (overlay cleanup, etc.)
-- Detached containers get `PR_SET_PDEATHSIG(SIGKILL)` — daemon crash kills all children
+- Container stdout/stderr is buffered in a bbqueue ring buffer and can be streamed live to `conrt logs` clients
 - Foreground `conrt run` (without `--detach`) runs standalone, no daemon required
 
 ## RingBuffer Data Structure
@@ -70,60 +73,30 @@ container process ──write()──► PTY slave
 
 ## Phases
 
-### Phase 0 — Project Scaffolding
-
-- Rust project with `clap` for CLI, `nix` for syscalls, `tracing` for logging,
-  `anyhow` for errors
-- Daemon subcommand: `conrt daemon`
-- Client subcommands: `conrt run [OPTIONS] <COMMAND>...`, `conrt logs <id>`,
-  `conrt list`, `conrt kill <id>`
-- Communication between client and daemon via Unix socket
-
-### Phase 1 — Process & Filesystem Isolation
+### Phase 1 — Container Runtime ✅
 
 - `clone3` with `CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC`
-- Parent writes UID/GID maps (`/proc/<pid>/uid_map`, `/proc/<pid>/gid_map`)
-  after clone so the child becomes UID 0 with full capabilities
-- Pipe-based synchronization: child blocks until parent finishes writing maps
-- `chroot` into prepared rootfs (bind-mount rootfs dir onto itself first)
-  — uses `chroot` instead of `pivot_root` because unprivileged user namespaces
-  cannot unmount the old root (requires init-namespace `CAP_SYS_ADMIN`)
-- Mount `/proc`, `/sys`, `/dev`
-- PTY allocation (`openpty`) for interactive `-t` containers
-- Daemon ensures child reaps correctly (SIGCHLD in event loop)
+- UID/GID maps via `/proc/<pid>/{uid,gid}_map`, child blocks on sync pipe until maps are written
+- `chroot` into rootfs (bind-mount onto itself first — `pivot_root` requires init-ns `CAP_SYS_ADMIN`)
+- Mount `/proc`, `/dev`
+- PTY allocation (`-t` flag): `openpty` + `setsid` + `TIOCSCTTY` + `dup2` to 0/1/2, `poll` I/O relay
+- `conrt run <cmd>` foreground, no daemon needed
 
-### Phase 2 — Cgroups v2 (skipped)
+### Phase 2 — Daemon & OverlayFS ✅
 
-Resource limits via cgroups v2 are not viable in rootless mode unless the kernel
-delegates `cpu` and `memory` controllers. On this system, `user.slice/` only has
-`pids` in `subtree_control` and the user's processes live in `/init.scope`
-(outside the delegated subtree). Both `CLONE_INTO_CGROUP` and post-clone
-`cgroup.procs` writes fail with EACCES/ENOENT. Only `pids.max` works without
-root intervention.
+- Unix-socket JSON daemon, `poll`/`signalfd` event loop → later `io_uring`
+- `--detach` hands off to daemon, `conrt list`, `conrt kill`
+- OverlayFS: lowerdir=`<rootfs>`, per-container upperdir+workdir, `--save`/`--rm`
 
-### Phase 3 — Network Namespace
+### Phase 3 — Logging & Streaming ✅
 
-- `CLONE_NEWNET` gives the container an isolated network stack
-- Child brings up `lo` via `SIOCSIFFLAGS` ioctl (works without `ip(8)` in rootfs)
-- Veth pair + NAT (bridge, iptables) require `CAP_NET_ADMIN` in the init netns
-  — not available rootlessly. External connectivity would need `slirp4netns`.
+- Fixed-capacity ring buffer (`Box<[u8]>`, length-prefixed entries, atomic head/tail)
+- `io_uring` daemon event loop (CQEs for PTY reads, client I/O, signalfd)
+- `conrt logs <pid>`: reads stored output; live streaming via bbqueue to concurrent clients
 
-### Phase 4 — OverlayFS ✅
+### Phase 4 — Network ✅
 
-- When `--rootfs <path>` is given, an overlay mount is created with the rootfs
-  as lowerdir and a per-container upperdir + workdir
-- Overlay is mounted inside the child's mount namespace (auto-cleaned on exit)
-- `--rm` (default): wipe upperdir on exit via `remove_dir_all`
-- `--save`: preserve upperdir for debugging / inspection
-- Works rootlessly (OverlayFS is supported in user namespaces on kernel 5.11+)
-
-### Phase 5 — Security (Capabilities + Seccomp)
-
-- Drop dangerous capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_NET_ADMIN`,
-  etc.) via `prctl(PR_CAPBSET_DROP, ...)` before exec
-- `--cap-add` / `--cap-drop` flags
-- Seccomp via `libseccomp` Rust FFI crate: block `reboot`, `swapon`, `kexec_load`
-  with an allow-default deny-list model
+- `CLONE_NEWNET` with `lo` brought up via `SIOCSIFFLAGS` ioctl
 
 ## Dependencies
 
@@ -132,7 +105,7 @@ root intervention.
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `io-uring` — raw io_uring bindings for the daemon event loop (planned)
+- `io-uring` — raw io_uring bindings for the daemon event loop
 
 ## Usage
 
@@ -145,37 +118,26 @@ No root required — user namespaces handle privilege escalation.
 
 ## Status
 
-### Phase 0 — Daemon ✅
+### Phase 1 — Container Runtime ✅
 
-- JSON-over-Unix-socket daemon with `poll` event loop
-- `signalfd` for SIGCHLD → reap + overlay cleanup
-- Container state tracking (`HashMap<pid, ContainerInfo>`)
-- `conrt run --detach` hands off containers to the daemon
-- `conrt list` / `conrt kill <pid>` connect to daemon via `~/.conrt/conrt.sock`
-- `conrt run` (without `--detach`) stays standalone foreground
-- PID used as container ID (no UUID)
+- `clone3` with `USER | PID | NS | UTS | IPC` namespaces
+- User namespace maps after clone, sync pipe blocking
+- `chroot` into rootfs, mount `/proc` and `/dev`
+- PTY allocation with raw-mode I/O relay (`-t` flag)
+- `conrt run <cmd>` foreground
 
-### Phase 1 — Process & Filesystem Isolation ✅
+### Phase 2 — Daemon & OverlayFS ✅
 
-- `clone3` with `CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC`
-- Parent writes UID/GID maps after clone so the child becomes UID 0 with full capabilities
-- Pipe-based synchronization: child blocks until parent finishes writing maps
-- `chroot` into prepared rootfs (bind-mount rootfs dir onto itself first)
-- Mount `/proc`, `/dev`, best-effort `/sys`
-- PTY allocation (`-t` flag): `openpty` + `setsid` + `TIOCSCTTY` + `dup2` to 0/1/2,
-  then `poll`-based I/O relay between host terminal and PTY master, with raw mode
-  for interactive use
-- Daemon child reaping via `signalfd` + `waitpid(-1, WNOHANG)` loop ✅
-- Detached containers get `PR_SET_PDEATHSIG(SIGKILL)` — daemon crash kills children
+- Unix-socket JSON daemon with `io_uring` event loop
+- Container state tracking, `--detach`, `list`, `kill`
+- OverlayFS: writable upperdir, `--save`/`--rm`
 
-### Phase 2 — Cgroups v2 (skipped)
+### Phase 3 — Logging & Streaming ✅
 
-### Phase 3 — Network Namespace (lo only; veth requires CAP_NET_ADMIN)
+- Ring buffer for container log storage
+- `conrt logs <pid>` reads stored output; live streaming via bbqueue
+- `io_uring` handles all daemon I/O (PTY reads, client requests, signalfd)
 
-### Phase 4 — OverlayFS ✅
+### Phase 4 — Network ✅
 
-- Overlay mount with lowerdir=`<rootfs>`, per-container upperdir + workdir
-- `--save` flag to preserve the upperdir after container exit
-- Works rootlessly on kernel 5.11+
-
-### Phase 5 — Security (Capabilities + Seccomp) (skipped — rootless user ns provides equivalent restrictions)
+- `CLONE_NEWNET` with `lo` up
