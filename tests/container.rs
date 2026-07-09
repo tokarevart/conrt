@@ -165,6 +165,40 @@ fn echo_hello_world() {
 }
 
 #[test]
+fn dev_null_is_writable() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let (ok, _, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo hello > /dev/null",
+    ]);
+    assert!(ok, "writing to /dev/null should succeed");
+}
+
+#[test]
+fn dev_zero_is_readable() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let (ok, _, _) = run_conrt(&[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "dd if=/dev/zero bs=1 count=4 2>/dev/null | wc -c",
+    ]);
+    assert!(ok, "reading from /dev/zero should succeed");
+}
+
+#[test]
 fn lo_is_up() {
     let Some(rootfs) = ensure_rootfs() else {
         return;
