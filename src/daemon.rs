@@ -97,6 +97,8 @@ pub struct Daemon {
     line_bufs: HashMap<u64, Vec<u8>>,
     next_output_id: u64,
     log_graveyard: HashMap<pid_t, Churrasco<LOG_CAPACITY>>,
+    stream_clients: HashMap<u64, (RawFd, pid_t)>,
+    next_stream_id: u64,
 }
 
 impl Daemon {
@@ -108,6 +110,8 @@ impl Daemon {
             line_bufs: HashMap::new(),
             next_output_id: 2,
             log_graveyard: HashMap::new(),
+            stream_clients: HashMap::new(),
+            next_stream_id: u64::MAX / 2,
         }
     }
 
@@ -165,13 +169,17 @@ impl Daemon {
                         self.reap_children();
                     }
                     id => {
-                        if ret < 0 {
-                            self.cleanup_output(id);
-                            continue;
-                        }
-                        if let Err(e) = self.handle_container_output(id, ret as u32) {
-                            tracing::warn!(%e, "container output error");
-                            self.cleanup_output(id);
+                        if self.output_fds.contains_key(&id) {
+                            if ret < 0 {
+                                self.cleanup_output(id);
+                                continue;
+                            }
+                            if let Err(e) = self.handle_container_output(id, ret as u32) {
+                                tracing::warn!(%e, "container output error");
+                                self.cleanup_output(id);
+                            }
+                        } else if self.stream_clients.contains_key(&id) {
+                            self.handle_stream_client_event(id, ret as u32);
                         }
                     }
                 }
@@ -209,7 +217,7 @@ impl Daemon {
             } => self.handle_run(raw_fd, ring, rootfs, net_pid, save, command),
             Request::List => self.handle_list(raw_fd),
             Request::Kill { pid } => self.handle_kill(raw_fd, pid),
-            Request::Logs { pid } => self.handle_logs(raw_fd, pid),
+            Request::Logs { pid } => self.handle_logs(raw_fd, pid, ring),
         }
     }
 
@@ -517,8 +525,43 @@ impl Daemon {
                 Ok(pid) if pid > 0 => {
                     tracing::info!(%pid, %status, "container exited");
                     if let Some(mut info) = self.containers.remove(&pid) {
-                        self.log_graveyard
-                            .insert(pid, std::mem::replace(&mut info.bbq, Churrasco::new()));
+                        let bbq = std::mem::replace(&mut info.bbq, Churrasco::new());
+                        // Flush remaining bbq data to any streaming log client, then close it
+                        if self.stream_clients.values().any(|(_, p)| *p == pid) {
+                            let lines = drain_bbq(&bbq);
+                            if !lines.is_empty() {
+                                let resp = LogsResponse { lines };
+                                let payload = serde_json::to_vec(&resp).unwrap();
+                                let len = payload.len() as u32;
+                                let header = len.to_le_bytes();
+                                let to_remove: Vec<u64> = self
+                                    .stream_clients
+                                    .iter()
+                                    .filter(|(_, (_, p))| *p == pid)
+                                    .map(|(&sid, _)| sid)
+                                    .collect();
+                                for sid in &to_remove {
+                                    if let Some((cfd, _)) = self.stream_clients.remove(sid) {
+                                        let _ = sys::write(cfd, &header);
+                                        let _ = sys::write(cfd, &payload);
+                                        sys::close(cfd);
+                                    }
+                                }
+                            } else {
+                                let to_remove: Vec<u64> = self
+                                    .stream_clients
+                                    .iter()
+                                    .filter(|(_, (_, p))| *p == pid)
+                                    .map(|(&sid, _)| sid)
+                                    .collect();
+                                for sid in &to_remove {
+                                    if let Some((cfd, _)) = self.stream_clients.remove(sid) {
+                                        sys::close(cfd);
+                                    }
+                                }
+                            }
+                        }
+                        self.log_graveyard.insert(pid, bbq);
                         if let Some(ref overlay) = info.overlay_dir
                             && !info.save
                         {
@@ -559,6 +602,7 @@ impl Daemon {
                             let line = std::str::from_utf8(&buf[start..i])
                                 .unwrap_or_default()
                                 .to_string();
+                            let line = line + "\n";
                             if let Some(info) = self.containers.get_mut(&pid) {
                                 let prod = info.bbq.stream_producer();
                                 if let Ok(mut wgr) = prod.grant_exact(line.len()) {
@@ -570,6 +614,26 @@ impl Daemon {
                         }
                         i += 1;
                     }
+
+                    // Forward to streaming log clients
+                    if self.stream_clients.values().any(|(_, p)| *p == pid)
+                        && let Some(info) = self.containers.get(&pid)
+                    {
+                        let lines = drain_bbq(&info.bbq);
+                        if !lines.is_empty() {
+                            let resp = LogsResponse { lines };
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let len = payload.len() as u32;
+                            let header = len.to_le_bytes();
+                            for (&_sid, (cfd, cp)) in &self.stream_clients {
+                                if *cp == pid {
+                                    let _ = sys::write(*cfd, &header);
+                                    let _ = sys::write(*cfd, &payload);
+                                }
+                            }
+                        }
+                    }
+
                     if start < total {
                         let remaining = buf[start..total].to_vec();
                         *buf = remaining;
@@ -599,8 +663,37 @@ impl Daemon {
         self.line_bufs.remove(&id);
     }
 
-    fn handle_logs(&mut self, fd: RawFd, pid: i32) -> io::Result<()> {
-        let lines = if let Some(info) = self.containers.get_mut(&pid) {
+    fn handle_stream_client_event(&mut self, id: u64, revents: u32) {
+        let cfd = match self.stream_clients.get(&id).map(|&(fd, _)| fd) {
+            Some(fd) => fd,
+            None => return,
+        };
+
+        if revents & (libc::POLLIN as u32) != 0 {
+            let mut buf = [0u8; 1];
+            match sys::read(cfd, &mut buf) {
+                Ok(0) => self.cleanup_stream_client(id),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => self.cleanup_stream_client(id),
+            }
+        }
+
+        if revents & (libc::POLLHUP | libc::POLLERR) as u32 != 0 {
+            self.cleanup_stream_client(id);
+        }
+    }
+
+    fn cleanup_stream_client(&mut self, id: u64) {
+        if let Some((cfd, _)) = self.stream_clients.remove(&id) {
+            sys::close(cfd);
+        }
+    }
+
+    fn handle_logs(&mut self, fd: RawFd, pid: i32, ring: &mut Ring) -> io::Result<()> {
+        let pid = pid as pid_t;
+        let in_containers = self.containers.contains_key(&pid);
+        let initial = if let Some(info) = self.containers.get_mut(&pid) {
             drain_bbq(&info.bbq)
         } else if let Some(bbq) = self.log_graveyard.get_mut(&pid) {
             drain_bbq(bbq)
@@ -612,8 +705,19 @@ impl Daemon {
             return write_response(fd, &resp);
         };
 
-        let resp = LogsResponse { lines };
-        write_response(fd, &resp)
+        let resp = LogsResponse { lines: initial };
+        write_response(fd, &resp)?;
+
+        if in_containers {
+            let client_fd = sys::dup(fd)?;
+            let stream_id = self.next_stream_id;
+            self.next_stream_id += 1;
+            ring.poll_add(client_fd, libc::POLLIN as u32, stream_id);
+            self.stream_clients
+                .insert(stream_id, (client_fd, pid as pid_t));
+        }
+
+        Ok(())
     }
 }
 
@@ -658,9 +762,13 @@ fn drain_bbq(bbq: &Churrasco<LOG_CAPACITY>) -> Vec<String> {
     let cons = bbq.stream_consumer();
     let mut lines = Vec::new();
     while let Ok(grant) = cons.read() {
-        let s = std::str::from_utf8(&grant).unwrap_or_default().to_string();
+        let s = std::str::from_utf8(&grant).unwrap_or_default();
         let len = grant.len();
-        lines.push(s);
+        for part in s.split('\n') {
+            if !part.is_empty() {
+                lines.push(part.to_string());
+            }
+        }
         grant.release(len);
     }
     lines

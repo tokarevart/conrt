@@ -297,6 +297,18 @@ pub fn dup2(oldfd: RawFd, newfd: RawFd) -> io::Result<()> {
     }
 }
 
+/// `dup(fd)` — duplicate a file descriptor, returning the new fd. The
+/// duplicate shares the same open file description.
+#[inline]
+pub fn dup(fd: RawFd) -> io::Result<RawFd> {
+    let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
 /// `prctl(option, arg2, ...)` — raw syscall. Thin wrapper; caller manages
 /// argument semantics per `option`.
 #[inline]
