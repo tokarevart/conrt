@@ -13,6 +13,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use clap::Parser;
 use cstring::CString;
@@ -496,13 +498,9 @@ fn setup_container_root(rootfs: &Path) -> io::Result<()> {
 }
 
 fn create_overlay_tempdir() -> io::Result<PathBuf> {
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("conrt.{:x}", ts));
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("conrt.{}.{}", std::process::id(), seq));
     std::fs::create_dir(&path)?;
     Ok(path)
 }
