@@ -16,6 +16,15 @@ use libc::pid_t;
 use crate::cstring::CStr;
 use crate::cstring::CString;
 
+#[inline]
+fn sys_ensure(ret: i32) -> io::Result<i32> {
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
 macro_rules! syscall_unchecked {
     ($nr:expr $(, $a:expr)*) => {{
         unsafe { libc::syscall($nr as i64, $($a as i64),*) as isize }
@@ -226,12 +235,7 @@ pub fn chroot(path: CStr) -> io::Result<()> {
 /// leader.
 #[inline]
 pub fn setsid() -> io::Result<pid_t> {
-    let ret = unsafe { libc::setsid() };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
+    sys_ensure(unsafe { libc::setsid() })
 }
 
 /// Bring up the loopback interface (`lo`) inside the current network namespace.
@@ -277,36 +281,21 @@ pub fn bring_up_lo() -> io::Result<()> {
 /// `CLONE_NEWNET`, `CLONE_NEWUSER`) and must match or be zero.
 #[inline]
 pub fn setns(fd: RawFd, nstype: c_int) -> io::Result<()> {
-    let ret = unsafe { libc::setns(fd, nstype) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    sys_ensure(unsafe { libc::setns(fd, nstype) }).map(|_| ())
 }
 
 /// `dup2(oldfd, newfd)` — duplicate a file descriptor. If `newfd` is already
 /// open, it is atomically closed before the duplication.
 #[inline]
 pub fn dup2(oldfd: RawFd, newfd: RawFd) -> io::Result<()> {
-    let ret = unsafe { libc::dup2(oldfd, newfd) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    sys_ensure(unsafe { libc::dup2(oldfd, newfd) }).map(|_| ())
 }
 
 /// `dup(fd)` — duplicate a file descriptor, returning the new fd. The
 /// duplicate shares the same open file description.
 #[inline]
 pub fn dup(fd: RawFd) -> io::Result<RawFd> {
-    let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
+    sys_ensure(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) })
 }
 
 /// `sigprocmask(how, set, oldset)` — examine/change the calling thread's
@@ -321,18 +310,14 @@ pub fn sigprocmask(
     set: Option<&libc::sigset_t>,
     oldset: Option<&mut libc::sigset_t>,
 ) -> io::Result<()> {
-    let ret = unsafe {
+    sys_ensure(unsafe {
         libc::sigprocmask(
             how,
             set.map_or(std::ptr::null(), |s| s as *const _),
             oldset.map_or(std::ptr::null_mut(), |s| s as *mut _),
         )
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    })
+    .map(|_| ())
 }
 
 /// `signalfd(fd, mask, flags)` — create a file descriptor for signal delivery.
@@ -340,10 +325,5 @@ pub fn sigprocmask(
 /// signals to accept.
 #[inline]
 pub fn signalfd(fd: RawFd, mask: &libc::sigset_t, flags: c_int) -> io::Result<RawFd> {
-    let ret = unsafe { libc::signalfd(fd, mask, flags) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
+    sys_ensure(unsafe { libc::signalfd(fd, mask, flags) })
 }
