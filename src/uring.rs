@@ -1,42 +1,32 @@
-use std::io;
 use std::os::fd::RawFd;
+use std::ptr;
 
-use io_uring::IoUring;
-use io_uring::cqueue;
 use io_uring::opcode;
 use io_uring::types;
 
-pub struct Ring {
-    ring: IoUring,
+pub fn accept(sq: &mut io_uring::squeue::SubmissionQueue, fd: RawFd, user_data: u64) {
+    let entry = opcode::Accept::new(types::Fd(fd), ptr::null_mut(), ptr::null_mut())
+        .build()
+        .user_data(user_data);
+    unsafe {
+        sq.push(&entry).expect("submission queue full");
+    }
 }
 
-impl Ring {
-    pub fn new(entries: u32) -> io::Result<Self> {
-        let ring = IoUring::new(entries)?;
-        Ok(Self { ring })
+pub fn read(sq: &mut io_uring::squeue::SubmissionQueue, fd: RawFd, buf: &mut [u8], user_data: u64) {
+    let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+        .build()
+        .user_data(user_data);
+    unsafe {
+        sq.push(&entry).expect("submission queue full");
     }
+}
 
-    /// Submit a multi-shot poll for the given fd. Multi-shot means the poll
-    /// stays armed after firing — no re-arm needed.
-    pub fn poll_add(&mut self, fd: RawFd, events: u32, user_data: u64) {
-        let entry = opcode::PollAdd::new(types::Fd(fd), events)
-            .multi(true)
-            .build()
-            .user_data(user_data);
-
-        let mut sq = self.ring.submission();
-        unsafe {
-            sq.push(&entry).expect("submission queue full");
-        }
-    }
-
-    /// Submit all queued SQEs and wait for at least `want` completions.
-    pub fn submit_and_wait(&self, want: usize) -> io::Result<usize> {
-        self.ring.submit_and_wait(want)
-    }
-
-    /// Get the completion queue to drain ready events.
-    pub fn completion(&mut self) -> cqueue::CompletionQueue<'_, io_uring::cqueue::Entry> {
-        self.ring.completion()
+pub fn write(sq: &mut io_uring::squeue::SubmissionQueue, fd: RawFd, buf: &[u8], user_data: u64) {
+    let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+        .build()
+        .user_data(user_data);
+    unsafe {
+        sq.push(&entry).expect("submission queue full");
     }
 }
