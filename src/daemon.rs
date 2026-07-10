@@ -185,8 +185,8 @@ impl Daemon {
 
         {
             let mut sq = self.ring.submission();
-            uring::accept(&mut sq, listener_fd, 0);
-            uring::read(&mut sq, sigchld, &mut self.sigchld_buf, 1);
+            uring::push_accept(&mut sq, listener_fd, 0);
+            uring::push_read(&mut sq, sigchld, &mut self.sigchld_buf, 1);
         }
 
         loop {
@@ -220,7 +220,7 @@ impl Daemon {
         }
         let listener_fd = self.listener.as_ref().unwrap().as_raw_fd();
         let mut sq = self.ring.submission();
-        uring::accept(&mut sq, listener_fd, 0);
+        uring::push_accept(&mut sq, listener_fd, 0);
     }
 
     fn handle_signal(&mut self, ret: i32) {
@@ -229,7 +229,7 @@ impl Daemon {
         }
         {
             let mut sq = self.ring.submission();
-            uring::read(&mut sq, self.sigchld_fd, &mut self.sigchld_buf, 1);
+            uring::push_read(&mut sq, self.sigchld_fd, &mut self.sigchld_buf, 1);
         }
     }
 
@@ -253,7 +253,7 @@ impl Daemon {
         {
             let mut sq = self.ring.submission();
             let client = self.clients.get_mut(&user_data).unwrap();
-            uring::read(&mut sq, fd, &mut client.len_buf, user_data);
+            uring::push_read(&mut sq, fd, &mut client.len_buf, user_data);
         }
     }
 
@@ -304,7 +304,7 @@ impl Daemon {
         {
             let mut sq = self.ring.submission();
             let client = self.clients.get_mut(&user_data).unwrap();
-            uring::read(&mut sq, fd, &mut client.payload, user_data);
+            uring::push_read(&mut sq, fd, &mut client.payload, user_data);
         }
     }
 
@@ -329,7 +329,7 @@ impl Daemon {
             {
                 let mut sq = self.ring.submission();
                 let client = self.clients.get_mut(&user_data).unwrap();
-                uring::read(&mut sq, fd, &mut client.payload[offset..], user_data);
+                uring::push_read(&mut sq, fd, &mut client.payload[offset..], user_data);
             }
             return;
         }
@@ -390,7 +390,7 @@ impl Daemon {
             let mut sq = self.ring.submission();
             let client = self.clients.get_mut(&user_data).unwrap();
             if let ClientState::WritingResponse { ref buf, offset } = client.state {
-                uring::write(&mut sq, fd, &buf[offset..], user_data);
+                uring::push_write(&mut sq, fd, &buf[offset..], user_data);
             }
         }
     }
@@ -404,7 +404,7 @@ impl Daemon {
         if let Some(client) = self.clients.get_mut(&user_data)
             && let ClientState::WritingResponse { ref buf, offset } = client.state
         {
-            uring::write(&mut sq, fd, &buf[offset..], user_data);
+            uring::push_write(&mut sq, fd, &buf[offset..], user_data);
         }
     }
 
@@ -471,7 +471,7 @@ impl Daemon {
         {
             let mut sq = self.ring.submission();
             let output = self.outputs.get_mut(&id).unwrap();
-            uring::read(&mut sq, fd, &mut output.read_buf, id);
+            uring::push_read(&mut sq, fd, &mut output.read_buf, id);
         }
     }
 
@@ -503,7 +503,7 @@ impl Daemon {
             {
                 let mut sq = self.ring.submission();
                 let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                uring::write(&mut sq, fd, &sw.buf[offset..], user_data);
+                uring::push_write(&mut sq, fd, &sw.buf[offset..], user_data);
             }
         }
     }
@@ -557,7 +557,7 @@ impl Daemon {
             {
                 let mut sq = self.ring.submission();
                 let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                uring::write(&mut sq, cfd, &sw.buf, user_data);
+                uring::push_write(&mut sq, cfd, &sw.buf, user_data);
             }
         }
     }
@@ -782,7 +782,7 @@ impl Daemon {
                 {
                     let mut sq = self.ring.submission();
                     let output = self.outputs.get_mut(&output_id).unwrap();
-                    uring::read(&mut sq, pipe_fds.read, &mut output.read_buf, output_id);
+                    uring::push_read(&mut sq, pipe_fds.read, &mut output.read_buf, output_id);
                 }
 
                 let maps_result = if needs_userns_maps {
@@ -931,7 +931,7 @@ impl Daemon {
                                     {
                                         let mut sq = self.ring.submission();
                                         let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                                        uring::write(&mut sq, cfd, &sw.buf, user_data);
+                                        uring::push_write(&mut sq, cfd, &sw.buf, user_data);
                                     }
                                 }
                                 sys::close(cfd);
