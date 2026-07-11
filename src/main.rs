@@ -174,17 +174,13 @@ fn run_detach(
     interactive: bool,
     command: Vec<CString>,
 ) -> ExitCode {
-    let cmd_strs: Vec<String> = command
-        .iter()
-        .map(|c| String::from_utf8_lossy(c.to_bytes()).into_owned())
-        .collect();
     let rootfs_str = rootfs.as_ref().map(|p| p.to_string_lossy().into_owned());
 
     let request = daemon::Request::Run {
         rootfs: rootfs_str,
         net_pid,
         save,
-        command: cmd_strs,
+        command: daemon::CStringSerde::from_inner_vec(command),
         interactive: Some(interactive),
         tty: Some(tty),
     };

@@ -30,7 +30,7 @@ pub enum Request {
         rootfs: Option<String>,
         net_pid: Option<i32>,
         save: bool,
-        command: Vec<String>,
+        command: Vec<CStringSerde>,
         interactive: Option<bool>,
         tty: Option<bool>,
     },
@@ -82,11 +82,46 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[repr(transparent)]
+pub struct CStringSerde(pub CString);
+
+impl CStringSerde {
+    pub fn into_inner_vec(v: Vec<CStringSerde>) -> Vec<CString> {
+        unsafe { std::mem::transmute(v) }
+    }
+
+    pub fn from_inner_vec(v: Vec<CString>) -> Vec<CStringSerde> {
+        unsafe { std::mem::transmute(v) }
+    }
+}
+
+impl serde::Serialize for CStringSerde {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(unsafe { std::str::from_utf8_unchecked(self.0.to_bytes()) })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CStringSerde {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl serde::de::Visitor<'_> for Vis {
+            type Value = CStringSerde;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CStringSerde, E> {
+                Ok(CStringSerde(CString::from(v)))
+            }
+        }
+        deserializer.deserialize_str(Vis)
+    }
+}
+
 struct RunArgs {
     rootfs: Option<String>,
     net_pid: Option<i32>,
     save: bool,
-    command: Vec<String>,
+    command: Vec<CString>,
 }
 
 // ── Datagram receive phases ─────────────────────────────────────────────
@@ -309,7 +344,7 @@ impl Daemon {
                     rootfs,
                     net_pid,
                     save,
-                    command,
+                    command: CStringSerde::into_inner_vec(command),
                 }),
                 Request::List => self.handle_list(sender),
                 Request::Kill { pid } => self.handle_kill(sender, pid),
@@ -358,21 +393,21 @@ impl Daemon {
             let total = output.line_buf.len();
             for i in 0..total {
                 if output.line_buf[i] == b'\n' {
-                    let line = std::str::from_utf8(&output.line_buf[start..i])
-                        .unwrap_or_default()
-                        .to_string();
-                    let line = line + "\n";
+                    let line = &output.line_buf[start..i];
+                    let line_len = line.len() + 1;
                     if let Some(info) = self.containers.get_mut(&output.pid) {
                         let prod = info.bbq.stream_producer();
-                        if let Ok(mut wgr) = prod.grant_exact(line.len()) {
-                            wgr.copy_from_slice(line.as_bytes());
-                            wgr.commit(line.len());
+                        if let Ok(mut wgr) = prod.grant_exact(line_len) {
+                            wgr[..line.len()].copy_from_slice(line);
+                            wgr[line.len()] = b'\n';
+                            wgr.commit(line_len);
                         }
                     } else if let Some(bbq) = self.log_graveyard.get_mut(&output.pid) {
                         let prod = bbq.stream_producer();
-                        if let Ok(mut wgr) = prod.grant_exact(line.len()) {
-                            wgr.copy_from_slice(line.as_bytes());
-                            wgr.commit(line.len());
+                        if let Ok(mut wgr) = prod.grant_exact(line_len) {
+                            wgr[..line.len()].copy_from_slice(line);
+                            wgr[line.len()] = b'\n';
+                            wgr.commit(line_len);
                         }
                     }
                     start = i + 1;
@@ -380,8 +415,7 @@ impl Daemon {
             }
 
             if start < total {
-                let remaining = output.line_buf[start..].to_vec();
-                output.line_buf = remaining;
+                output.line_buf.drain(..start);
             } else {
                 output.line_buf.clear();
             }
@@ -467,20 +501,7 @@ impl Daemon {
             return;
         }
 
-        let command_c: Vec<CString> = match args
-            .command
-            .iter()
-            .map(|s| CString::try_from_bytes(s.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(e) => {
-                sys::close(pipe_fds.read);
-                sys::close(pipe_fds.write);
-                err(&format!("invalid command (null byte): {e}"));
-                return;
-            }
-        };
+        let command_c = args.command;
 
         let (clone_flags, needs_userns_maps) = match args.net_pid {
             Some(pid) => {
@@ -616,7 +637,11 @@ impl Daemon {
                     return;
                 }
 
-                let cmd_str = args.command.join(" ");
+                let cmd_str = command_c
+                    .iter()
+                    .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 self.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
