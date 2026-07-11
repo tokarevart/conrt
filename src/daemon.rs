@@ -248,13 +248,12 @@ impl Daemon {
         loop {
             self.ring.submit_and_wait(1)?;
 
-            let entries: Vec<_> = self
-                .ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result()))
-                .collect();
-
-            for (user_data, ret) in entries {
+            while let Some(cqe) = {
+                let mut cq = self.ring.completion();
+                cq.next()
+            } {
+                let user_data = cqe.user_data();
+                let ret = cqe.result();
                 tracing::trace!(%ret, ?user_data, "cqe completion");
                 match user_data {
                     0 => self.handle_datagram_cqe(ret),
