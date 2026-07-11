@@ -1,6 +1,5 @@
-use std::io::Read;
-use std::io::Write;
-use std::os::unix::net::UnixStream;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -48,22 +47,68 @@ fn start_daemon(socket: &Path) -> Child {
     child
 }
 
+fn bind_abstract(sock: &UnixDatagram, name: &[u8]) {
+    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len().min(107);
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    addr.sun_path[0] = 0;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            addr.sun_path.as_mut_ptr().add(1) as *mut u8,
+            name.len().min(107),
+        );
+    }
+    let ret = unsafe {
+        libc::bind(
+            sock.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            len as _,
+        )
+    };
+    assert_eq!(
+        ret,
+        0,
+        "bind_abstract failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn send_request(socket: &PathBuf, payload: &[u8]) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket).unwrap();
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let datagram = UnixDatagram::unbound().unwrap();
+    let abstract_name = format!("conrt-test-client.{:x}", id);
+    bind_abstract(&datagram, abstract_name.as_bytes());
+    // Retry connect with backoff to handle transient ECONNREFUSED.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match datagram.connect(socket) {
+            Ok(()) => break,
+            Err(e)
+                if e.raw_os_error() == Some(libc::ECONNREFUSED)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("connect to {:?} failed: {}", socket, e),
+        }
+    }
+    datagram.send(payload).unwrap();
 
-    let len = payload.len() as u32;
-    stream.write_all(&len.to_le_bytes()).unwrap();
-    stream.write_all(payload).unwrap();
-    stream.flush().unwrap();
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).unwrap();
-    let resp_len = u32::from_le_bytes(len_buf) as usize;
-
-    let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).unwrap();
-
-    resp
+    // Peek to learn the exact response size.
+    let fd = datagram.as_raw_fd();
+    let n = unsafe {
+        libc::recv(
+            fd,
+            std::ptr::null_mut(),
+            0,
+            libc::MSG_PEEK | libc::MSG_TRUNC,
+        )
+    };
+    assert!(n >= 0, "peek failed: {}", std::io::Error::last_os_error());
+    let mut buf = vec![0u8; n as usize];
+    datagram.recv(&mut buf).unwrap();
+    buf
 }
 
 fn stop_daemon(mut daemon: Child) {

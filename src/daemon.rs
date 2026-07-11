@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
-use std::os::unix::net::UnixListener;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -21,10 +20,6 @@ use crate::uring;
 
 const LOG_CAPACITY: usize = 65536;
 const RING_SIZE: u32 = 1024;
-
-// user_data namespaces
-const CLIENT_BASE: u64 = 0x0001_0000_0000_0000;
-const STREAM_W_BASE: u64 = 0x0002_0000_0000_0000;
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -87,6 +82,21 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+struct RunArgs {
+    rootfs: Option<String>,
+    net_pid: Option<i32>,
+    save: bool,
+    command: Vec<String>,
+}
+
+// ── Datagram receive phases ─────────────────────────────────────────────
+
+#[derive(PartialEq)]
+enum RecvPhase {
+    Peek,
+    Consume,
+}
+
 // ── Container State ───────────────────────────────────────────────────────
 
 struct ContainerInfo {
@@ -102,18 +112,20 @@ pub struct Daemon {
     ring: IoUring,
     sigchld_fd: RawFd,
     sigchld_buf: Vec<u8>,
-    listener: Option<UnixListener>,
+    datagram_fd: RawFd,
     socket_path: PathBuf,
     containers: HashMap<pid_t, ContainerInfo>,
     outputs: HashMap<u64, Output>,
-    clients: HashMap<u64, Client>,
-    stream_clients: HashMap<u64, (RawFd, pid_t)>,
-    pending_writes: HashMap<u64, StreamWrite>,
     next_output_id: u64,
-    next_client_id: u64,
-    next_write_id: u64,
-    next_stream_id_counter: u64,
     log_graveyard: HashMap<pid_t, Churrasco<LOG_CAPACITY>>,
+
+    // Datagram receive state
+    recv_buf: Vec<u8>,
+    recv_addr: libc::sockaddr_un,
+    recv_addr_len: libc::socklen_t,
+    recv_iov: libc::iovec,
+    recv_msghdr: libc::msghdr,
+    recv_phase: RecvPhase,
 }
 
 /// One container stdout/stderr pipe being drained asynchronously.
@@ -124,28 +136,6 @@ struct Output {
     line_buf: Vec<u8>,
 }
 
-/// One connected client mid-request, driven entirely by completions.
-struct Client {
-    fd: RawFd,
-    len_buf: Vec<u8>,
-    payload: Vec<u8>,
-    state: ClientState,
-}
-
-enum ClientState {
-    ReadingLen,
-    ReadingPayload { total: usize, offset: usize },
-    WritingResponse { buf: Vec<u8>, offset: usize },
-}
-
-/// An in-flight async write to a streaming log client.
-struct StreamWrite {
-    fd: RawFd,
-    stream_id: u64,
-    buf: Vec<u8>,
-    offset: usize,
-}
-
 impl Daemon {
     pub fn new(socket_path: PathBuf) -> Self {
         let ring = IoUring::new(RING_SIZE).expect("failed to create io_uring");
@@ -153,22 +143,46 @@ impl Daemon {
             ring,
             sigchld_fd: -1,
             sigchld_buf: Vec::new(),
-            listener: None,
+            datagram_fd: -1,
             socket_path,
             containers: HashMap::new(),
             outputs: HashMap::new(),
-            clients: HashMap::new(),
-            stream_clients: HashMap::new(),
-            pending_writes: HashMap::new(),
             next_output_id: 2,
-            next_client_id: 0,
-            next_write_id: 0,
-            next_stream_id_counter: 1,
             log_graveyard: HashMap::new(),
+            recv_buf: vec![0u8; 65536],
+            recv_addr: unsafe { std::mem::zeroed() },
+            recv_addr_len: 0,
+            recv_iov: unsafe { std::mem::zeroed() },
+            recv_msghdr: libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: std::ptr::null_mut(),
+                msg_iovlen: 0,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            recv_phase: RecvPhase::Peek,
         }
     }
 
     pub fn run(&mut self) -> io::Result<()> {
+        // Self-referential pointers: init AFTER self is at its final location.
+        self.recv_addr = unsafe { std::mem::zeroed() };
+        self.recv_iov = libc::iovec {
+            iov_base: self.recv_buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: self.recv_buf.len(),
+        };
+        self.recv_msghdr = libc::msghdr {
+            msg_name: &mut self.recv_addr as *mut _ as *mut _,
+            msg_namelen: size_of::<libc::sockaddr_un>() as _,
+            msg_iov: &self.recv_iov as *const _ as *mut _,
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+
         let dir = self.socket_path.parent().unwrap();
         std::fs::create_dir_all(dir)?;
 
@@ -176,18 +190,23 @@ impl Daemon {
             std::fs::remove_file(&self.socket_path)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let datagram = UnixDatagram::bind(&self.socket_path)?;
+        self.datagram_fd = datagram.as_raw_fd();
         tracing::info!(path = %self.socket_path.display(), "daemon listening");
 
-        let listener_fd = listener.as_raw_fd();
         let sigchld = setup_sigchld_fd()?;
         self.sigchld_fd = sigchld;
         self.sigchld_buf = vec![0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-        self.listener = Some(listener);
 
         {
             let mut sq = self.ring.submission();
-            uring::push_accept(&mut sq, listener_fd, 0);
+            uring::push_recvmsg(
+                &mut sq,
+                self.datagram_fd,
+                &mut self.recv_msghdr as *mut _,
+                (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
+                0,
+            );
             uring::push_read(&mut sq, sigchld, &mut self.sigchld_buf, 1);
         }
 
@@ -201,28 +220,107 @@ impl Daemon {
                 .collect();
 
             for (user_data, ret) in entries {
+                tracing::trace!(%ret, ?user_data, "cqe completion");
                 match user_data {
-                    0 => self.handle_listener(ret),
+                    0 => self.handle_datagram_cqe(ret),
                     1 => self.handle_signal(ret),
-                    id if id < CLIENT_BASE => self.handle_output(id, ret),
-                    id if id < STREAM_W_BASE => {
-                        self.handle_client_completion(id - CLIENT_BASE, ret)
-                    }
-                    id => self.handle_write_completion(id - STREAM_W_BASE, ret),
+                    id => self.handle_output(id, ret),
                 }
             }
         }
     }
 
-    // ── Listener (POLL multi-shot, re-armed by the kernel) ────────────────
+    // ── Datagram handling (two-phase: peek → consume) ────────────────────
 
-    fn handle_listener(&mut self, ret: i32) {
-        if ret >= 0 {
-            self.accept_client(ret);
-        }
-        let listener_fd = self.listener.as_ref().unwrap().as_raw_fd();
+    fn submit_datagram_peek(&mut self) {
+        self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
         let mut sq = self.ring.submission();
-        uring::push_accept(&mut sq, listener_fd, 0);
+        uring::push_recvmsg(
+            &mut sq,
+            self.datagram_fd,
+            &mut self.recv_msghdr as *mut _,
+            (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
+            0,
+        );
+    }
+
+    fn submit_datagram_consume(&mut self) {
+        self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
+        let mut sq = self.ring.submission();
+        uring::push_recvmsg(
+            &mut sq,
+            self.datagram_fd,
+            &mut self.recv_msghdr as *mut _,
+            0,
+            0,
+        );
+    }
+
+    fn handle_datagram_cqe(&mut self, ret: i32) {
+        match self.recv_phase {
+            RecvPhase::Peek => self.handle_datagram_peek(ret),
+            RecvPhase::Consume => self.handle_datagram_consume(ret),
+        }
+    }
+
+    fn handle_datagram_peek(&mut self, ret: i32) {
+        tracing::trace!(%ret, "datagram peek");
+        let size = ret as usize;
+        if size > self.recv_buf.len() {
+            // Resize the receive buffer and update the iovec to match.
+            self.recv_buf.resize(size, 0);
+            self.recv_iov.iov_base = self.recv_buf.as_mut_ptr() as *mut libc::c_void;
+            self.recv_iov.iov_len = size;
+        }
+        self.recv_phase = RecvPhase::Consume;
+        self.submit_datagram_consume();
+    }
+
+    fn handle_datagram_consume(&mut self, ret: i32) {
+        tracing::trace!(%ret, "datagram consume");
+        self.recv_phase = RecvPhase::Peek;
+        if ret >= 0 {
+            let sender = self.recv_addr;
+            self.recv_addr_len = self.recv_msghdr.msg_namelen;
+            let data = &self.recv_buf[..ret as usize];
+            let request: Request = match serde_json::from_slice(data) {
+                Ok(r) => r,
+                Err(e) => {
+                    let resp = serde_json::to_vec(&ErrorResponse {
+                        ok: false,
+                        error: format!("invalid request: {e}"),
+                    })
+                    .unwrap();
+                    let _ = self.send_datagram(&sender, &resp);
+                    self.submit_datagram_peek();
+                    return;
+                }
+            };
+
+            match request {
+                Request::Run {
+                    rootfs,
+                    net_pid,
+                    save,
+                    command,
+                    interactive: _,
+                    tty: _,
+                } => self.handle_run(sender, RunArgs {
+                    rootfs,
+                    net_pid,
+                    save,
+                    command,
+                }),
+                Request::List => self.handle_list(sender),
+                Request::Kill { pid } => self.handle_kill(sender, pid),
+                Request::Logs { pid } => self.handle_logs(sender, pid),
+            }
+        }
+        self.submit_datagram_peek();
+    }
+
+    fn send_datagram(&self, addr: &libc::sockaddr_un, data: &[u8]) -> io::Result<usize> {
+        send_datagram_raw(self.datagram_fd, addr, self.recv_addr_len, data)
     }
 
     fn handle_signal(&mut self, ret: i32) {
@@ -235,182 +333,6 @@ impl Daemon {
         }
     }
 
-    // ── Client lifecycle ──────────────────────────────────────────────────
-
-    fn accept_client(&mut self, fd: RawFd) {
-        let client_id = self.next_client_id;
-        self.next_client_id += 1;
-        let user_data = CLIENT_BASE + client_id;
-
-        let len_buf = vec![0u8; 4];
-
-        let client = Client {
-            fd,
-            len_buf,
-            payload: Vec::new(),
-            state: ClientState::ReadingLen,
-        };
-        self.clients.insert(user_data, client);
-
-        {
-            let mut sq = self.ring.submission();
-            let client = self.clients.get_mut(&user_data).unwrap();
-            uring::push_read(&mut sq, fd, &mut client.len_buf, user_data);
-        }
-    }
-
-    fn handle_client_completion(&mut self, client_id: u64, result: i32) {
-        let user_data = CLIENT_BASE + client_id;
-        let client = match self.clients.remove(&user_data) {
-            Some(c) => c,
-            None => return,
-        };
-
-        if result < 0 {
-            sys::close(client.fd);
-            return;
-        }
-
-        match client.state {
-            ClientState::ReadingLen => self.client_read_len(client, user_data, result),
-            ClientState::ReadingPayload { total, offset } => {
-                self.client_read_payload(client, user_data, result, total, offset)
-            }
-            ClientState::WritingResponse { offset, .. } => {
-                self.client_write(client, user_data, result, offset)
-            }
-        }
-    }
-
-    fn client_read_len(&mut self, mut client: Client, user_data: u64, result: i32) {
-        if result as usize != 4 {
-            sys::close(client.fd);
-            return;
-        }
-        let payload_len = u32::from_le_bytes([
-            client.len_buf[0],
-            client.len_buf[1],
-            client.len_buf[2],
-            client.len_buf[3],
-        ]) as usize;
-
-        let payload = vec![0u8; payload_len];
-        client.payload = payload;
-        client.state = ClientState::ReadingPayload {
-            total: payload_len,
-            offset: 0,
-        };
-        let fd = client.fd;
-        self.clients.insert(user_data, client);
-
-        {
-            let mut sq = self.ring.submission();
-            let client = self.clients.get_mut(&user_data).unwrap();
-            uring::push_read(&mut sq, fd, &mut client.payload, user_data);
-        }
-    }
-
-    fn client_read_payload(
-        &mut self,
-        mut client: Client,
-        user_data: u64,
-        result: i32,
-        total: usize,
-        offset: usize,
-    ) {
-        let n = result as usize;
-        let new_offset = offset + n;
-        if new_offset < total {
-            let fd = client.fd;
-            let offset = new_offset;
-            client.state = ClientState::ReadingPayload {
-                total,
-                offset: new_offset,
-            };
-            self.clients.insert(user_data, client);
-            {
-                let mut sq = self.ring.submission();
-                let client = self.clients.get_mut(&user_data).unwrap();
-                uring::push_read(&mut sq, fd, &mut client.payload[offset..], user_data);
-            }
-            return;
-        }
-
-        // full payload arrived — parse and dispatch
-        let request: Request = match serde_json::from_slice(&client.payload) {
-            Ok(r) => r,
-            Err(e) => {
-                client.send_response(&ErrorResponse {
-                    ok: false,
-                    error: format!("invalid request: {e}"),
-                });
-                self.clients.insert(user_data, client);
-                self.submit_client_write(user_data);
-                return;
-            }
-        };
-
-        match request {
-            Request::Run {
-                rootfs,
-                net_pid,
-                save,
-                command,
-                ..
-            } => self.handle_run(&mut client, rootfs, net_pid, save, command),
-            Request::List => self.handle_list(&mut client),
-            Request::Kill { pid } => self.handle_kill(&mut client, pid),
-            Request::Logs { pid } => self.handle_logs(&mut client, pid),
-        }
-
-        self.clients.insert(user_data, client);
-        self.submit_client_write(user_data);
-    }
-
-    fn client_write(&mut self, mut client: Client, user_data: u64, result: i32, offset: usize) {
-        if result < 0 {
-            sys::close(client.fd);
-            return;
-        }
-        let new_offset = offset + result as usize;
-
-        let done = match client.state {
-            ClientState::WritingResponse { ref buf, .. } => new_offset >= buf.len(),
-            _ => true,
-        };
-
-        if done {
-            sys::close(client.fd);
-            return;
-        }
-
-        if let ClientState::WritingResponse { ref mut offset, .. } = client.state {
-            *offset = new_offset;
-        }
-        let fd = client.fd;
-        self.clients.insert(user_data, client);
-        {
-            let mut sq = self.ring.submission();
-            let client = self.clients.get_mut(&user_data).unwrap();
-            if let ClientState::WritingResponse { ref buf, offset } = client.state {
-                uring::push_write(&mut sq, fd, &buf[offset..], user_data);
-            }
-        }
-    }
-
-    fn submit_client_write(&mut self, user_data: u64) {
-        let fd = match self.clients.get(&user_data) {
-            Some(c) => c.fd,
-            None => return,
-        };
-        let mut sq = self.ring.submission();
-        if let Some(client) = self.clients.get_mut(&user_data)
-            && let ClientState::WritingResponse { ref buf, offset } = client.state
-        {
-            uring::push_write(&mut sq, fd, &buf[offset..], user_data);
-        }
-    }
-
     // ── Container output (async read that stays in flight) ─────────────────
 
     fn handle_output(&mut self, id: u64, result: i32) {
@@ -419,7 +341,7 @@ impl Daemon {
             return;
         }
         let n = result as usize;
-        let pid = match self.outputs.get(&id) {
+        let _pid = match self.outputs.get(&id) {
             Some(o) => o.pid,
             None => return,
         };
@@ -465,8 +387,6 @@ impl Daemon {
             }
         }
 
-        self.forward_to_stream_clients(pid);
-
         let fd = match self.outputs.get(&id) {
             Some(o) => o.fd,
             None => return,
@@ -484,111 +404,35 @@ impl Daemon {
         }
     }
 
-    // ── Stream-client async writes ─────────────────────────────────────────
+    // ── Request handlers ──────────────────────────────────────────────────
 
-    fn handle_write_completion(&mut self, write_id: u64, result: i32) {
-        let user_data = STREAM_W_BASE + write_id;
-        let mut sw = match self.pending_writes.remove(&user_data) {
-            Some(sw) => sw,
-            None => return,
+    fn reply(&self, addr: &libc::sockaddr_un, data: impl serde::Serialize) {
+        let resp = serde_json::to_vec(&data).unwrap();
+        if let Err(e) = self.send_datagram(addr, &resp) {
+            tracing::error!(%e, "reply sendto failed");
+        }
+    }
+
+    fn handle_run(&mut self, sender: libc::sockaddr_un, args: RunArgs) {
+        let output_id = self.next_output_id;
+        self.next_output_id += 1;
+        let datagram_fd = self.datagram_fd;
+        let sender_len = self.recv_addr_len;
+
+        let err = |msg: &str| {
+            let resp = serde_json::to_vec(&ErrorResponse {
+                ok: false,
+                error: msg.to_string(),
+            })
+            .unwrap();
+            let _ = send_datagram_raw(datagram_fd, &sender, sender_len, &resp);
         };
 
-        if result < 0 {
-            self.cleanup_stream_client(sw.stream_id);
-            return;
-        }
-
-        sw.offset += result as usize;
-        if sw.offset < sw.buf.len() {
-            let fd = sw.fd;
-            let offset = sw.offset;
-            self.pending_writes.insert(user_data, sw);
-            {
-                let mut sq = self.ring.submission();
-                let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                uring::push_write(&mut sq, fd, &sw.buf[offset..], user_data);
-            }
-        }
-    }
-
-    fn forward_to_stream_clients(&mut self, pid: pid_t) {
-        let has_clients = self.stream_clients.values().any(|(_, p)| *p == pid);
-        if !has_clients {
-            return;
-        }
-
-        let lines = if let Some(info) = self.containers.get(&pid) {
-            drain_bbq(&info.bbq)
-        } else if let Some(bbq) = self.log_graveyard.get(&pid) {
-            drain_bbq(bbq)
-        } else {
-            return;
-        };
-
-        if lines.is_empty() {
-            return;
-        }
-
-        let resp = LogsResponse { lines };
-        let payload = serde_json::to_vec(&resp).unwrap();
-        let len = payload.len() as u32;
-        let header = len.to_le_bytes();
-
-        let matching: Vec<(u64, RawFd)> = self
-            .stream_clients
-            .iter()
-            .filter(|(_, (_, p))| *p == pid)
-            .map(|(&sid, &(cfd, _))| (sid, cfd))
-            .collect();
-
-        for (sid, cfd) in matching {
-            let mut buf = Vec::with_capacity(4 + payload.len());
-            buf.extend_from_slice(&header);
-            buf.extend_from_slice(&payload);
-
-            let write_id = self.next_write_id;
-            self.next_write_id += 1;
-            let user_data = STREAM_W_BASE + write_id;
-
-            let sw = StreamWrite {
-                fd: cfd,
-                stream_id: sid,
-                buf,
-                offset: 0,
-            };
-            self.pending_writes.insert(user_data, sw);
-            {
-                let mut sq = self.ring.submission();
-                let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                uring::push_write(&mut sq, cfd, &sw.buf, user_data);
-            }
-        }
-    }
-
-    fn cleanup_stream_client(&mut self, id: u64) {
-        if let Some((cfd, _)) = self.stream_clients.remove(&id) {
-            sys::close(cfd);
-        }
-    }
-
-    // ── Request handlers (set client response asynchronously) ──────────────
-
-    fn handle_run(
-        &mut self,
-        client: &mut Client,
-        rootfs: Option<String>,
-        net_pid: Option<i32>,
-        save: bool,
-        command: Vec<String>,
-    ) {
-        let rootfs = match rootfs {
+        let rootfs = match args.rootfs {
             Some(p) => match Path::new(&p).canonicalize() {
                 Ok(path) => Some(path),
                 Err(e) => {
-                    client.send_response(&ErrorResponse {
-                        ok: false,
-                        error: format!("invalid rootfs path: {e}"),
-                    });
+                    err(&format!("invalid rootfs path: {e}"));
                     return;
                 }
             },
@@ -599,10 +443,7 @@ impl Daemon {
             Some(_) => match crate::create_overlay_tempdir() {
                 Ok(dir) => Some(dir),
                 Err(e) => {
-                    client.send_response(&ErrorResponse {
-                        ok: false,
-                        error: format!("cannot create overlay tempdir: {e}"),
-                    });
+                    err(&format!("cannot create overlay tempdir: {e}"));
                     return;
                 }
             },
@@ -612,10 +453,7 @@ impl Daemon {
         let signal = match interprocess::OneshotSignal::new() {
             Ok(s) => s,
             Err(e) => {
-                client.send_response(&ErrorResponse {
-                    ok: false,
-                    error: format!("sync pipe creation failed: {e}"),
-                });
+                err(&format!("sync pipe creation failed: {e}"));
                 return;
             }
         };
@@ -625,14 +463,12 @@ impl Daemon {
             write: -1,
         };
         if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            client.send_response(&ErrorResponse {
-                ok: false,
-                error: format!("log pipe creation failed: {e}"),
-            });
+            err(&format!("log pipe creation failed: {e}"));
             return;
         }
 
-        let command_c: Vec<CString> = match command
+        let command_c: Vec<CString> = match args
+            .command
             .iter()
             .map(|s| CString::try_from_bytes(s.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
@@ -641,25 +477,19 @@ impl Daemon {
             Err(e) => {
                 sys::close(pipe_fds.read);
                 sys::close(pipe_fds.write);
-                client.send_response(&ErrorResponse {
-                    ok: false,
-                    error: format!("invalid command (null byte): {e}"),
-                });
+                err(&format!("invalid command (null byte): {e}"));
                 return;
             }
         };
 
-        let (clone_flags, needs_userns_maps) = match net_pid {
+        let (clone_flags, needs_userns_maps) = match args.net_pid {
             Some(pid) => {
                 let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
                     Ok(f) => f,
                     Err(e) => {
                         sys::close(pipe_fds.read);
                         sys::close(pipe_fds.write);
-                        client.send_response(&ErrorResponse {
-                            ok: false,
-                            error: format!("cannot open pid {pid} user ns: {e}"),
-                        });
+                        err(&format!("cannot open pid {pid} user ns: {e}"));
                         return;
                     }
                 };
@@ -668,29 +498,20 @@ impl Daemon {
                     Err(e) => {
                         sys::close(pipe_fds.read);
                         sys::close(pipe_fds.write);
-                        client.send_response(&ErrorResponse {
-                            ok: false,
-                            error: format!("cannot open pid {pid} net ns: {e}"),
-                        });
+                        err(&format!("cannot open pid {pid} net ns: {e}"));
                         return;
                     }
                 };
                 if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
                     sys::close(pipe_fds.read);
                     sys::close(pipe_fds.write);
-                    client.send_response(&ErrorResponse {
-                        ok: false,
-                        error: format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"),
-                    });
+                    err(&format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"));
                     return;
                 }
                 if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
                     sys::close(pipe_fds.read);
                     sys::close(pipe_fds.write);
-                    client.send_response(&ErrorResponse {
-                        ok: false,
-                        error: format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"),
-                    });
+                    err(&format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"));
                     return;
                 }
                 (
@@ -717,10 +538,7 @@ impl Daemon {
             Err(e) => {
                 sys::close(pipe_fds.read);
                 sys::close(pipe_fds.write);
-                client.send_response(&ErrorResponse {
-                    ok: false,
-                    error: format!("clone3 failed: {e}"),
-                });
+                err(&format!("clone3 failed: {e}"));
             }
             Ok(None) => {
                 // ── CHILD ──
@@ -771,9 +589,6 @@ impl Daemon {
                 // ── PARENT ──
                 sys::close(pipe_fds.write);
 
-                let output_id = self.next_output_id;
-                self.next_output_id += 1;
-
                 let output = Output {
                     fd: pipe_fds.read,
                     pid,
@@ -797,26 +612,23 @@ impl Daemon {
 
                 if let Err(e) = maps_result {
                     self.cleanup_output(output_id);
-                    client.send_response(&ErrorResponse {
-                        ok: false,
-                        error: format!("container aborted: {e}"),
-                    });
+                    err(&format!("container aborted: {e}"));
                     return;
                 }
 
-                let cmd_str = command.join(" ");
+                let cmd_str = args.command.join(" ");
                 self.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
                     overlay_dir,
-                    save,
+                    save: args.save,
                     start_time: SystemTime::now(),
                     bbq: Churrasco::new(),
                 });
 
-                tracing::info!(%pid, "detached container started");
+                tracing::info!(%pid, "container started");
 
-                client.send_response(&RunResponse {
+                self.reply(&sender, &RunResponse {
                     ok: true,
                     pid: Some(pid),
                     error: None,
@@ -825,7 +637,7 @@ impl Daemon {
         }
     }
 
-    fn handle_list(&self, client: &mut Client) {
+    fn handle_list(&mut self, sender: libc::sockaddr_un) {
         let now = SystemTime::now();
         let containers: Vec<ContainerSummary> = self
             .containers
@@ -840,12 +652,12 @@ impl Daemon {
             })
             .collect();
 
-        client.send_response(&ListResponse { containers });
+        self.reply(&sender, &ListResponse { containers });
     }
 
-    fn handle_kill(&self, client: &mut Client, pid: i32) {
+    fn handle_kill(&mut self, sender: libc::sockaddr_un, pid: i32) {
         if !self.containers.contains_key(&(pid as pid_t)) {
-            client.send_response(&KillResponse {
+            self.reply(&sender, &KillResponse {
                 ok: false,
                 error: Some(format!("container {pid} not found")),
             });
@@ -855,7 +667,7 @@ impl Daemon {
         let ret = unsafe { libc::kill(pid as pid_t, libc::SIGKILL) };
         if ret < 0 {
             let err = io::Error::last_os_error();
-            client.send_response(&KillResponse {
+            self.reply(&sender, &KillResponse {
                 ok: false,
                 error: Some(format!("kill failed: {err}")),
             });
@@ -863,37 +675,28 @@ impl Daemon {
         }
 
         tracing::info!(%pid, "sent SIGKILL");
-        client.send_response(&KillResponse {
+        self.reply(&sender, &KillResponse {
             ok: true,
             error: None,
         });
     }
 
-    fn handle_logs(&mut self, client: &mut Client, pid: i32) {
+    fn handle_logs(&mut self, sender: libc::sockaddr_un, pid: i32) {
         let pid = pid as pid_t;
-        let in_containers = self.containers.contains_key(&pid);
+        let _in_containers = self.containers.contains_key(&pid);
         let initial = if let Some(info) = self.containers.get_mut(&pid) {
             drain_bbq(&info.bbq)
         } else if let Some(bbq) = self.log_graveyard.get_mut(&pid) {
             drain_bbq(bbq)
         } else {
-            client.send_response(&ErrorResponse {
+            self.reply(&sender, &ErrorResponse {
                 ok: false,
                 error: format!("container {pid} not found"),
             });
             return;
         };
 
-        client.send_response(&LogsResponse { lines: initial });
-
-        if in_containers {
-            let client_fd = match sys::dup(client.fd) {
-                Ok(fd) => fd,
-                Err(_) => return,
-            };
-            let stream_id = self.next_stream_id();
-            self.stream_clients.insert(stream_id, (client_fd, pid));
-        }
+        self.reply(&sender, &LogsResponse { lines: initial });
     }
 
     fn reap_children(&mut self) {
@@ -904,42 +707,6 @@ impl Daemon {
                     tracing::info!(%pid, %status, "container exited");
                     if let Some(mut info) = self.containers.remove(&pid) {
                         let bbq = std::mem::replace(&mut info.bbq, Churrasco::new());
-                        let to_remove: Vec<u64> = self
-                            .stream_clients
-                            .iter()
-                            .filter(|(_, (_, p))| *p == pid)
-                            .map(|(&sid, _)| sid)
-                            .collect();
-                        for sid in &to_remove {
-                            if let Some((cfd, _)) = self.stream_clients.remove(sid) {
-                                let lines = drain_bbq(&bbq);
-                                if !lines.is_empty() {
-                                    let resp = LogsResponse { lines };
-                                    let payload = serde_json::to_vec(&resp).unwrap();
-                                    let len = payload.len() as u32;
-                                    let header = len.to_le_bytes();
-                                    let mut buf = Vec::with_capacity(4 + payload.len());
-                                    buf.extend_from_slice(&header);
-                                    buf.extend_from_slice(&payload);
-                                    let write_id = self.next_write_id;
-                                    self.next_write_id += 1;
-                                    let user_data = STREAM_W_BASE + write_id;
-                                    let sw = StreamWrite {
-                                        fd: cfd,
-                                        stream_id: *sid,
-                                        buf,
-                                        offset: 0,
-                                    };
-                                    self.pending_writes.insert(user_data, sw);
-                                    {
-                                        let mut sq = self.ring.submission();
-                                        let sw = self.pending_writes.get_mut(&user_data).unwrap();
-                                        uring::push_write(&mut sq, cfd, &sw.buf, user_data);
-                                    }
-                                }
-                                sys::close(cfd);
-                            }
-                        }
                         self.log_graveyard.insert(pid, bbq);
                         if let Some(ref overlay) = info.overlay_dir
                             && !info.save
@@ -959,27 +726,57 @@ impl Daemon {
             }
         }
     }
-
-    fn next_stream_id(&mut self) -> u64 {
-        let id = self.next_stream_id_counter;
-        self.next_stream_id_counter += 1;
-        id
-    }
-}
-
-impl Client {
-    fn send_response<T: Serialize>(&mut self, resp: &T) {
-        let payload = serde_json::to_vec(resp).unwrap();
-        let len = payload.len() as u32;
-        let header = len.to_le_bytes();
-        let mut buf = Vec::with_capacity(4 + payload.len());
-        buf.extend_from_slice(&header);
-        buf.extend_from_slice(&payload);
-        self.state = ClientState::WritingResponse { buf, offset: 0 };
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+fn send_datagram_raw(
+    fd: RawFd,
+    addr: &libc::sockaddr_un,
+    addrlen: libc::socklen_t,
+    data: &[u8],
+) -> io::Result<usize> {
+    let ret = unsafe {
+        libc::sendto(
+            fd,
+            data.as_ptr() as *const _,
+            data.len(),
+            0,
+            addr as *const _ as *const libc::sockaddr,
+            addrlen as _,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn bind_abstract(sock: &UnixDatagram, name: &[u8]) -> io::Result<()> {
+    let len = size_of::<libc::sa_family_t>() + 1 + name.len().min(107);
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    addr.sun_path[0] = 0;
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            addr.sun_path.as_mut_ptr().add(1) as *mut u8,
+            name.len().min(107),
+        );
+    }
+    unsafe {
+        let r = libc::bind(
+            sock.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            len as _,
+        );
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 fn setup_sigchld_fd() -> io::Result<RawFd> {
     let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -1007,37 +804,41 @@ fn drain_bbq(bbq: &Churrasco<LOG_CAPACITY>) -> Vec<String> {
 }
 
 pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
-    let stream = UnixStream::connect(socket_path)?;
-    let fd = stream.as_raw_fd();
+    let datagram = UnixDatagram::unbound()?;
+    let abstract_name = format!("conrt-client.{}", std::process::id());
+    bind_abstract(&datagram, abstract_name.as_bytes())?;
+    // Retry connect with backoff for transient ECONNREFUSED.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match datagram.connect(socket_path) {
+            Ok(()) => break,
+            Err(ref e)
+                if e.raw_os_error() == Some(libc::ECONNREFUSED)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     let payload = serde_json::to_vec(request).unwrap();
-    let len = payload.len() as u32;
-    let header = len.to_le_bytes();
+    datagram.send(&payload)?;
 
-    sys::write(fd, &header)?;
-    sys::write(fd, &payload)?;
-
-    let mut len_buf = [0u8; 4];
-    read_exact(fd, &mut len_buf)?;
-    let resp_len = u32::from_le_bytes(len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    read_exact(fd, &mut resp_buf)?;
-
-    Ok(resp_buf)
-}
-
-fn read_exact(fd: RawFd, buf: &mut [u8]) -> io::Result<()> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        let n = sys::read(fd, &mut buf[offset..])?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed",
-            ));
-        }
-        offset += n as usize;
+    // Peek to learn the exact response size.
+    let fd = datagram.as_raw_fd();
+    let n = unsafe {
+        libc::recv(
+            fd,
+            std::ptr::null_mut(),
+            0,
+            libc::MSG_PEEK | libc::MSG_TRUNC,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let mut buf = vec![0u8; n as usize];
+    datagram.recv(&mut buf)?;
+    Ok(buf)
 }

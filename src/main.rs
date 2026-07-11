@@ -660,9 +660,6 @@ fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
 }
 
 fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
-    use std::io::Read;
-    use std::io::Write;
-
     let pid: i32 = match id.parse() {
         Ok(p) => p,
         Err(e) => {
@@ -671,45 +668,27 @@ fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
         }
     };
 
-    let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
-        Ok(s) => s,
+    let request = daemon::Request::Logs { pid };
+    let resp = match daemon::send_request(&socket_path, &request) {
+        Ok(r) => r,
         Err(e) => {
             tracing::error!(%e, "cannot connect to daemon");
             return ExitCode::FAILURE;
         }
     };
 
-    let request = daemon::Request::Logs { pid };
-    let payload = serde_json::to_vec(&request).unwrap();
-    let len = payload.len() as u32;
-    if stream.write_all(&len.to_le_bytes()).is_err() || stream.write_all(&payload).is_err() {
-        return ExitCode::FAILURE;
+    if let Ok(success) = serde_json::from_slice::<daemon::LogsResponse>(&resp) {
+        for line in &success.lines {
+            println!("{line}");
+        }
+        ExitCode::SUCCESS
+    } else if let Ok(err) = serde_json::from_slice::<daemon::ErrorResponse>(&resp) {
+        tracing::error!(error = %err.error, "logs failed");
+        ExitCode::FAILURE
+    } else {
+        tracing::error!("invalid daemon response");
+        ExitCode::FAILURE
     }
-
-    let mut len_buf = [0u8; 4];
-    loop {
-        if stream.read_exact(&mut len_buf).is_err() {
-            break;
-        }
-        let resp_len = u32::from_le_bytes(len_buf) as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        if stream.read_exact(&mut resp_buf).is_err() {
-            break;
-        }
-
-        if let Ok(success) = serde_json::from_slice::<daemon::LogsResponse>(&resp_buf) {
-            for line in &success.lines {
-                println!("{line}");
-            }
-        } else if resp_len > 0
-            && let Ok(err) = serde_json::from_slice::<daemon::ErrorResponse>(&resp_buf)
-        {
-            tracing::error!(error = %err.error, "logs failed");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    ExitCode::SUCCESS
 }
 
 fn list_containers(socket_path: PathBuf) -> ExitCode {
