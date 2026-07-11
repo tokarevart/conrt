@@ -64,20 +64,7 @@ fn send_request(socket: &PathBuf, payload: &[u8]) -> Vec<u8> {
         "empty bind failed: {}",
         std::io::Error::last_os_error()
     );
-    // Retry connect with backoff to handle transient ECONNREFUSED.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        match datagram.connect(socket) {
-            Ok(()) => break,
-            Err(e)
-                if e.raw_os_error() == Some(libc::ECONNREFUSED)
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("connect to {:?} failed: {}", socket, e),
-        }
-    }
+    datagram.connect(socket).unwrap();
     datagram.send(payload).unwrap();
 
     // Peek to learn the exact response size.

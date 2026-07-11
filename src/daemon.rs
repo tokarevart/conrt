@@ -792,20 +792,7 @@ pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>
             return Err(io::Error::last_os_error());
         }
     }
-    // Retry connect with backoff for transient ECONNREFUSED.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        match datagram.connect(socket_path) {
-            Ok(()) => break,
-            Err(ref e)
-                if e.raw_os_error() == Some(libc::ECONNREFUSED)
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    datagram.connect(socket_path)?;
 
     let payload = serde_json::to_vec(request).unwrap();
     datagram.send(&payload)?;
