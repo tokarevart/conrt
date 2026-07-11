@@ -43,7 +43,6 @@ struct Slab<T> {
 
 ```rust
 struct Task<F: Future> {
-    index: u32,                  // own slab index (written on insertion)
     in_flight: InFlightIOs,
     results: [i32; 64],          // completion results, indexed by bit position
     results_ready: u64,          // bitmap of which result slots are fresh
@@ -51,7 +50,7 @@ struct Task<F: Future> {
 }
 ```
 
-**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. Write `index` into the task.
+**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. The slot position *is* the task index — no need to store it in the task.
 
 **Removal**: clear the bit in `occupied`, push index to `free`. If the task has in-flight IOs, submit `IORING_OP_ASYNC_CANCEL` for each outstanding IO slot before freeing any buffers. Do the same on drop.
 
