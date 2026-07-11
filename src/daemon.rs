@@ -36,6 +36,8 @@ pub enum Request {
         net_pid: Option<i32>,
         save: bool,
         command: Vec<String>,
+        interactive: Option<bool>,
+        tty: Option<bool>,
     },
     List,
     Kill {
@@ -354,6 +356,7 @@ impl Daemon {
                 net_pid,
                 save,
                 command,
+                ..
             } => self.handle_run(&mut client, rootfs, net_pid, save, command),
             Request::List => self.handle_list(&mut client),
             Request::Kill { pid } => self.handle_kill(&mut client, pid),

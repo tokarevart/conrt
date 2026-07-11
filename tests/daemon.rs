@@ -228,16 +228,6 @@ fn detach_cli_output_is_pid() {
 }
 
 #[test]
-fn detach_with_tty_rejected() {
-    let (ok, _, stderr) = run_conrt(&["run", "--detach", "-t", "--", "/bin/true"]);
-    assert!(!ok, "--detach with -t should fail");
-    assert!(
-        stderr.contains("incompatible"),
-        "stderr should mention incompatibility"
-    );
-}
-
-#[test]
 fn cli_list_without_daemon_errors() {
     let (ok, _, stderr) = run_conrt(&["list", "--socket-path", "/tmp/conrt-test-nonexistent.sock"]);
     assert!(!ok, "list without daemon should fail");

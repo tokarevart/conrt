@@ -44,11 +44,15 @@ enum Cli {
         save: bool,
 
         /// Allocate a PTY for interactive use
-        #[arg(short)]
-        t: bool,
+        #[arg(short, long)]
+        tty: bool,
+
+        /// Keep stdin open
+        #[arg(short, long)]
+        interactive: bool,
 
         /// Detach and hand off to the daemon
-        #[arg(long)]
+        #[arg(short, long)]
         detach: bool,
 
         /// Daemon socket path
@@ -110,21 +114,20 @@ fn main() -> ExitCode {
             rootfs,
             net_pid,
             save,
-            t,
+            tty,
+            interactive,
             detach,
             socket_path,
             command,
         } => {
             if detach {
-                if t {
-                    tracing::error!("--detach is incompatible with -t");
-                    return ExitCode::FAILURE;
-                }
                 run_detach(
                     socket_path.unwrap_or_else(default_socket_path),
                     rootfs,
                     net_pid.map(|p| p as libc::pid_t),
                     save,
+                    tty,
+                    interactive,
                     command,
                 )
             } else {
@@ -132,7 +135,8 @@ fn main() -> ExitCode {
                     rootfs,
                     net_pid: net_pid.map(|p| p as libc::pid_t),
                     save,
-                    tty: t,
+                    tty,
+                    interactive,
                     command,
                 })
             }
@@ -166,6 +170,8 @@ fn run_detach(
     rootfs: Option<PathBuf>,
     net_pid: Option<libc::pid_t>,
     save: bool,
+    tty: bool,
+    interactive: bool,
     command: Vec<CString>,
 ) -> ExitCode {
     let cmd_strs: Vec<String> = command
@@ -179,6 +185,8 @@ fn run_detach(
         net_pid,
         save,
         command: cmd_strs,
+        interactive: Some(interactive),
+        tty: Some(tty),
     };
 
     let resp = match daemon::send_request(&socket_path, &request) {
@@ -218,6 +226,7 @@ struct RunArgs {
     net_pid: Option<libc::pid_t>,
     save: bool,
     tty: bool,
+    interactive: bool,
     command: Vec<CString>,
 }
 
@@ -323,6 +332,21 @@ fn run_container(args: RunArgs) -> ExitCode {
                 std::process::exit(1);
             }
 
+            // Close stdin if neither -t nor -i was given
+            if !args.tty && !args.interactive {
+                let devnull = CString::from("/dev/null");
+                let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
+                if fd < 0 {
+                    tracing::error!("cannot open /dev/null");
+                    std::process::exit(1);
+                }
+                if let Err(e) = sys::dup2(fd, libc::STDIN_FILENO) {
+                    tracing::error!(%e, "dup2 /dev/null failed");
+                    std::process::exit(1);
+                }
+                sys::close(fd);
+            }
+
             if let Err(e) = signal.wait() {
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
@@ -382,12 +406,22 @@ fn run_container(args: RunArgs) -> ExitCode {
             // PTY I/O relay — blocks until the child closes the slave
             if let Some(ref master) = master {
                 let raw = if unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
-                    pty::set_raw_terminal().ok()
+                    if args.interactive {
+                        pty::set_raw_terminal().ok()
+                    } else {
+                        pty::disable_echo_output().ok()
+                    }
                 } else {
                     None
                 };
-                if let Err(e) = pty::relay_pty(master.raw_fd()) {
-                    tracing::error!(%e, "pty relay failed");
+                if args.interactive {
+                    if let Err(e) = pty::relay_pty(master.raw_fd()) {
+                        tracing::error!(%e, "pty relay failed");
+                    }
+                } else {
+                    if let Err(e) = pty::relay_pty_output(master.raw_fd()) {
+                        tracing::error!(%e, "pty relay failed");
+                    }
                 }
                 if let Some(termios) = raw {
                     pty::restore_terminal(&termios).ok();
@@ -747,6 +781,7 @@ mod tests {
             net_pid: None,
             save: false,
             tty: false,
+            interactive: false,
             command: vec![CString::from_str("/bin/true").unwrap()],
         });
         assert_eq!(code, ExitCode::FAILURE);

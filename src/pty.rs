@@ -74,6 +74,25 @@ pub fn open_pty() -> io::Result<(PtyMaster, PtySlave)> {
     Ok((PtyMaster(master), PtySlave(slave)))
 }
 
+/// Disable echo and output processing on the terminal, but keep signal keys
+/// (Ctrl+C etc.) working. Used for PTY output relay where we don't read stdin.
+/// Returns the original `termios` so it can be restored later.
+pub fn disable_echo_output() -> io::Result<libc::termios> {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let original = termios;
+    termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    termios.c_oflag &= !libc::OPOST;
+    let ret = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(original)
+}
+
 /// Put the terminal attached to stdin into raw mode.
 /// Returns the original `termios` so it can be restored later.
 pub fn set_raw_terminal() -> io::Result<libc::termios> {
@@ -98,6 +117,45 @@ pub fn restore_terminal(termios: &libc::termios) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Relay data from PTY master to stdout only (unidirectional).
+///
+/// Reads from `master` → writes to stdout.
+/// Returns when the PTY slave is closed (child exited).
+pub fn relay_pty_output(master: RawFd) -> io::Result<()> {
+    let mut buf = [0u8; 4096];
+
+    let mut poll_fds = [libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+
+    loop {
+        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, -1) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+
+        if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(());
+        }
+        if poll_fds[0].revents & libc::POLLIN != 0 {
+            match sys::read(master, &mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    sys::write(libc::STDOUT_FILENO, &buf[..n as usize])?;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 /// Relay data between the PTY master and the real terminal.
