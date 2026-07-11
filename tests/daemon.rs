@@ -47,38 +47,23 @@ fn start_daemon(socket: &Path) -> Child {
     child
 }
 
-fn bind_abstract(sock: &UnixDatagram, name: &[u8]) {
-    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len().min(107);
+fn send_request(socket: &PathBuf, payload: &[u8]) -> Vec<u8> {
+    let datagram = UnixDatagram::unbound().unwrap();
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as _;
-    addr.sun_path[0] = 0;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            addr.sun_path.as_mut_ptr().add(1) as *mut u8,
-            name.len().min(107),
-        );
-    }
     let ret = unsafe {
         libc::bind(
-            sock.as_raw_fd(),
+            datagram.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
-            len as _,
+            std::mem::size_of::<libc::sa_family_t>() as _,
         )
     };
     assert_eq!(
         ret,
         0,
-        "bind_abstract failed: {}",
+        "empty bind failed: {}",
         std::io::Error::last_os_error()
     );
-}
-
-fn send_request(socket: &PathBuf, payload: &[u8]) -> Vec<u8> {
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let datagram = UnixDatagram::unbound().unwrap();
-    let abstract_name = format!("conrt-test-client.{:x}", id);
-    bind_abstract(&datagram, abstract_name.as_bytes());
     // Retry connect with backoff to handle transient ECONNREFUSED.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {

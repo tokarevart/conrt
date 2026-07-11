@@ -753,31 +753,6 @@ fn send_datagram_raw(
     }
 }
 
-fn bind_abstract(sock: &UnixDatagram, name: &[u8]) -> io::Result<()> {
-    let len = size_of::<libc::sa_family_t>() + 1 + name.len().min(107);
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    addr.sun_family = libc::AF_UNIX as _;
-    addr.sun_path[0] = 0;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            addr.sun_path.as_mut_ptr().add(1) as *mut u8,
-            name.len().min(107),
-        );
-    }
-    unsafe {
-        let r = libc::bind(
-            sock.as_raw_fd(),
-            &addr as *const _ as *const libc::sockaddr,
-            len as _,
-        );
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 fn setup_sigchld_fd() -> io::Result<RawFd> {
     let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe { libc::sigemptyset(&mut mask) };
@@ -805,8 +780,18 @@ fn drain_bbq(bbq: &Churrasco<LOG_CAPACITY>) -> Vec<String> {
 
 pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>> {
     let datagram = UnixDatagram::unbound()?;
-    let abstract_name = format!("conrt-client.{}", std::process::id());
-    bind_abstract(&datagram, abstract_name.as_bytes())?;
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    unsafe {
+        let r = libc::bind(
+            datagram.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            size_of::<libc::sa_family_t>() as _,
+        );
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     // Retry connect with backoff for transient ECONNREFUSED.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
