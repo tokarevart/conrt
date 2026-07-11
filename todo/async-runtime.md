@@ -3,7 +3,7 @@
 ## Goals
 
 - Spawn `Future`s directly (no per-future `Box` allocation)
-- Hardcode future types as statically-known generics, each in its own fixed-capacity slab
+- Runtime has a single task future type; different behaviors are composed into one future (e.g. an enum dispatch)
 - Zero extra allocation for in-flight IO tracking (u64 bitmap + `[i32; 64]` results embedded in Task)
 - Fast completion dispatch via `user_data` encoding
 
@@ -21,26 +21,16 @@ Waker reads `RUNTIME` directly (unsafe, single-threaded, no data race). Caller `
 
 ---
 
-## Multiple Slabs (one per task type)
+## Fixed-Capacity Slab
 
-Each compile-time known future type gets its own slab. The runtime holds all slabs
-as named fields. Slab ID is a small integer literal (`0`, `1`, `2`, ...) chosen at
-compile time for each type.
+Pre-allocated at runtime, **never reallocated**. Guarantees pinning soundness (task addresses never move). The slab *is* the index allocator — slot position = task index.
 
 ```rust
 struct Runtime {
-    slab_a: Slab<TaskA>,   // slab_id = 0
-    slab_b: Slab<TaskB>,   // slab_id = 1
-    slab_c: Slab<TaskC>,   // slab_id = 2
+    slab: Slab<Task>,
     ring: IoUring,
 }
-```
 
-## Fixed-Capacity Slab
-
-Pre-allocated at runtime, **never reallocated**. Guarantees pinning soundness (task addresses never move). The slab *is* the index allocator — slot position = task index within that slab.
-
-```rust
 struct Slab<T> {
     slots: Box<[MaybeUninit<T>]>,
     occupied: Box<[u64]>,   // one bit per slot
@@ -48,13 +38,12 @@ struct Slab<T> {
 }
 ```
 
-- Capacity chosen at construction (e.g. 256 per slab). Insertion when full = spawn error / backpressure.
-- All slots pinned in memory: `Box<[T]>` never grows or shrinks.
+- Capacity chosen at construction (e.g. 256). Insertion when full = spawn error / backpressure.
+- All slots pinned in memory — `Box<[T]>` never grows or shrinks.
 
 ```rust
 struct Task<F: Future> {
-    index: u32,                  // own slab index
-    slab_id: u8,                 // which slab (compile-time constant)
+    index: u32,                  // own slab index (written on insertion)
     in_flight: InFlightIOs,
     results: [i32; 64],          // completion results, indexed by bit position
     results_ready: u64,          // bitmap of which result slots are fresh
@@ -62,7 +51,7 @@ struct Task<F: Future> {
 }
 ```
 
-**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. Write `index` and `slab_id` into the task.
+**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. Write `index` into the task.
 
 **Removal**: clear the bit in `occupied`, push index to `free`. If the task has in-flight IOs, submit `IORING_OP_ASYNC_CANCEL` for each outstanding IO slot before freeing any buffers. Do the same on drop.
 
@@ -89,97 +78,74 @@ On completion: write `cqe.result()` to `results[io_slot]`, set bit in `results_r
 
 ## `user_data` Encoding
 
-The 64-bit `user_data` encodes three fields:
-
-```
-| 63       56 | 55       24 | 23        0 |
-|   slab_id   | task_index  |   io_slot   |
-```
-
-- **slab_id** (8 bits): which slab (up to 256 generic task types).
-- **task_index** (32 bits): index within that slab's slot array.
-- **io_slot** (24 bits): bit position within the task's `InFlightIOs`. The InFlightIOs overflow handling will assert `io_slot < 2^24` before heap-allocating (should never fire in practice).
+A `#[repr(C)]` struct with two `u32` fields, transmuted to/from `u64`:
 
 ```rust
-const fn encode_user_data(slab_id: u8, task_index: u32, io_slot: u32) -> u64 {
-    (slab_id as u64) << 56
-        | (task_index as u64) << 24
-        | io_slot as u64
+#[repr(C)]
+struct IoUserData {
+    task_index: u32,   // slab slot position
+    io_slot: u32,      // bit position in InFlightIOs
+}
+
+impl From<IoUserData> for u64 {
+    fn from(ud: IoUserData) -> u64 {
+        unsafe { std::mem::transmute(ud) }
+    }
+}
+
+impl From<u64> for IoUserData {
+    fn from(raw: u64) -> Self {
+        unsafe { std::mem::transmute(raw) }
+    }
 }
 ```
 
-On completion: extract all three, write `cqe.result()` into
-`slabs[slab_id][task_index].results[io_slot]`, set `results_ready` bit, push
-`(slab_id << 32 | task_index)` to the ready queue.
+On completion: decode via `IoUserData::from(cqe.user_data())`, write `cqe.result()` into `slab[ud.task_index].results[ud.io_slot as usize]`, set `results_ready` bit, poll the task.
 
 ---
 
-## Waker / Context
+## Context
 
-The waker encodes both slab_id and task_index in `RawWaker::data`:
+Tasks are never externally woken — they are polled only when an IO completion
+fires for them. The waker uses the **noop vtable** but still encodes the task
+index in its `data` pointer:
 
 ```rust
-fn waker(slab_id: u32, task_index: u32) -> Waker {
-    let encoded = ((slab_id as usize) << 32) | task_index as usize;
-    let ptr = core::ptr::without_provenance(encoded);
-    let raw = RawWaker::new(ptr, &WAKER_VTABLE);
+fn waker(task_index: u32) -> Waker {
+    let ptr = core::ptr::without_provenance(task_index as usize);
+    let raw = RawWaker::new(ptr, Waker::noop().vtable());
     unsafe { Waker::from_raw(raw) }
 }
+
+let w = waker(task_index);
+let mut cx = Context::from_waker(&w);
 ```
 
-Vtable:
-
-- **`wake` / `wake_by_ref`**: read `data`, extract `slab_id` and `task_index`, push `(slab_id << 32 | task_index)` to `deferred` (the local vec in the event loop that the waker has access to via a static pointer or thread-local).
-- **`clone`**: new `RawWaker` with same `data`.
-- **`drop`**: no-op.
+---
 
 ## Event Loop
 
 ```rust
 loop {
-    if let Some(packed) = deferred.pop() {
-        let slab_id = (packed >> 32) as u8;
-        let task_index = packed as u32;
-        dispatch_poll(slab_id, task_index);
-    }
-
     ring.submit_and_wait(1)?;
 
     for cqe in ring.completion() {
-        let ud = cqe.user_data();
-        let slab_id    = (ud >> 56) as u8;
-        let task_index = (ud >> 24) as u32;
-        let io_slot    =  ud        as u32;
+        let ud = IoUserData::from(cqe.user_data());
+        let task = &mut slab[ud.task_index];
+        task.results[ud.io_slot as usize] = cqe.result();
+        task.results_ready |= 1 << ud.io_slot;
 
-        let task = match slab_id {
-            0 => &mut slab_a[task_index],
-            1 => &mut slab_b[task_index],
-            2 => &mut slab_c[task_index],
-            _ => unreachable!(),
-        };
-        task.results[io_slot as usize] = cqe.result();
-        task.results_ready |= 1 << io_slot;
-
-        dispatch_poll(slab_id, task_index);
+        poll_one(ud.task_index);
     }
 }
 ```
 
-No separate ready queue — each completion triggers the task poll immediately. The
-only deferred wakeups come from waker calls during a poll; those push to a small
-local `Vec<u64>` (`deferred`) that's drained before the next `submit_and_wait`.
+Each completion triggers the task poll immediately. No ready queue, no deferred
+vec — the waker vtable is all noop, so tasks are only polled when their IO
+completes.
 
 ```rust
-fn dispatch_poll(slab_id: u8, task_index: u32) {
-    match slab_id {
-        0 => poll_one::<TaskA>(&mut slab_a, task_index),
-        1 => poll_one::<TaskB>(&mut slab_b, task_index),
-        2 => poll_one::<TaskC>(&mut slab_c, task_index),
-        _ => unreachable!(),
-    }
-}
-
-fn poll_one<T>(slab: &mut Slab<T>, index: u32) {
+fn poll_one(index: u32) {
     let task = &mut slab[index];
     let poll = task.future.poll(cx);
     match poll {
