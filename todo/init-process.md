@@ -146,7 +146,7 @@ setup:
 
 ## Foreground path
 
-The foreground paths (`conrt run` without `--detach`, both PTY and
-non-PTY) run in the calling terminal process — no daemon involved.
-The init flags are ignored in this path (adding support later is
-straightforward if needed).
+Foreground `conrt run` (without `--detach`) goes through the daemon
+via the stream-attach protocol. Init flags in the `RunRequest` apply
+the same way as in the detach path — the daemon handles init setup
+after `clone3`.

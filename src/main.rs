@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -131,7 +132,10 @@ fn main() -> ExitCode {
                     command,
                 )
             } else {
-                run_container(RunArgs {
+                let socket = socket_path.unwrap_or_else(default_socket_path);
+                let mut sock = socket.into_os_string();
+                sock.push(".stream");
+                run_attach(PathBuf::from(sock), RunArgs {
                     rootfs,
                     net_pid: net_pid.map(|p| p as libc::pid_t),
                     save,
@@ -226,222 +230,252 @@ struct RunArgs {
     command: Vec<CString>,
 }
 
-fn run_container(args: RunArgs) -> ExitCode {
-    let rootfs = match args.rootfs {
-        Some(p) => match p.canonicalize() {
-            Ok(path) => Some(path),
-            Err(e) => {
-                tracing::error!(%e, rootfs = %p.display(), "invalid rootfs path");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
+// ── Attach protocol helpers (framed Unix stream) ─────────────────────────
 
-    let overlay_dir = match rootfs {
-        Some(_) => match create_overlay_tempdir() {
-            Ok(dir) => Some(dir),
-            Err(e) => {
-                tracing::error!(%e, "cannot create overlay tempdir");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
+fn build_frame(ty: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    frame.push(ty);
+    frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
 
-    let (master, slave) = if args.tty {
-        match pty::open_pty() {
-            Ok((m, s)) => (Some(m), Some(s)),
-            Err(e) => {
-                tracing::error!(%e, "pty allocation failed");
-                return ExitCode::FAILURE;
-            }
+fn send_frame(fd: std::os::raw::c_int, ty: u8, payload: &[u8]) -> io::Result<()> {
+    let frame = build_frame(ty, payload);
+    let written = crate::sys::write(fd, &frame)? as usize;
+    if written != frame.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "partial frame write",
+        ));
+    }
+    Ok(())
+}
+
+fn read_frame(fd: std::os::raw::c_int) -> io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 3];
+    let mut off = 0usize;
+    while off < header.len() {
+        let n = crate::sys::read(fd, &mut header[off..])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stream closed",
+            ));
         }
-    } else {
-        (None, None)
-    };
+        off += n as usize;
+    }
+    let ty = header[0];
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len == 0 {
+        return Ok((ty, Vec::new()));
+    }
+    let mut buf = vec![0u8; len];
+    let mut off = 0usize;
+    while off < len {
+        let n = crate::sys::read(fd, &mut buf[off..])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stream closed",
+            ));
+        }
+        off += n as usize;
+    }
+    Ok((ty, buf))
+}
 
-    let signal = match interprocess::OneshotSignal::new() {
+fn get_window_size() -> (u16, u16) {
+    let ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &ws) } == 0 {
+        (ws.ws_row, ws.ws_col)
+    } else {
+        (24, 80)
+    }
+}
+
+static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigwinch_handler(_sig: c_int) {
+    WINCH_PENDING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Run a container attached to the daemon via Unix stream.
+fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
+    let stream = match std::os::unix::net::UnixStream::connect(&stream_path) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(%e, "sync pipe creation failed");
+            tracing::error!(%e, path = %stream_path.display(), "cannot connect to daemon stream");
             return ExitCode::FAILURE;
         }
     };
+    let raw_fd = stream.as_raw_fd();
 
-    let (clone_flags, needs_userns_maps) = match args.net_pid {
-        Some(pid) => {
-            let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(%e, "cannot open pid {pid} user ns");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(%e, "cannot open pid {pid} net ns");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
-                tracing::error!(%e, "setns(CLONE_NEWUSER) into pid {pid} failed");
-                return ExitCode::FAILURE;
-            }
-            if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
-                tracing::error!(%e, "setns(CLONE_NEWNET) into pid {pid} failed");
-                return ExitCode::FAILURE;
-            }
-            (
-                libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC,
-                false,
-            )
+    let request = daemon::Request::Run {
+        rootfs: args
+            .rootfs
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        net_pid: args.net_pid,
+        save: args.save,
+        command: daemon::CStringSerde::from_inner_vec(args.command),
+        interactive: Some(args.interactive),
+        tty: Some(args.tty),
+    };
+    let payload = serde_json::to_vec(&request).unwrap();
+    if let Err(e) = send_frame(raw_fd, 0x00, &payload) {
+        tracing::error!(%e, "failed to send run request");
+        return ExitCode::FAILURE;
+    }
+
+    let (ty, resp_data) = match read_frame(raw_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "failed to read run response");
+            return ExitCode::FAILURE;
         }
-        None => (
-            libc::CLONE_NEWPID
-                | libc::CLONE_NEWNS
-                | libc::CLONE_NEWUTS
-                | libc::CLONE_NEWIPC
-                | libc::CLONE_NEWUSER
-                | libc::CLONE_NEWNET,
-            true,
-        ),
+    };
+    if ty != 0x01 {
+        tracing::error!(%ty, "expected RunResponse frame");
+        return ExitCode::FAILURE;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RunResp {
+        ok: bool,
+        #[allow(dead_code)]
+        pid: Option<i32>,
+        error: Option<String>,
+    }
+    let resp: RunResp = match serde_json::from_slice(&resp_data) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "invalid RunResponse JSON");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !resp.ok {
+        tracing::error!(error = %resp.error.as_deref().unwrap_or("unknown"), "daemon rejected run");
+        return ExitCode::FAILURE;
+    }
+
+    // Terminal setup.
+    let original_termios = if args.tty && unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
+        match pty::set_raw_terminal() {
+            Ok(termios) => {
+                let (rows, cols) = get_window_size();
+                let ws_payload = serde_json::json!({"rows": rows, "cols": cols});
+                let _ = send_frame(raw_fd, 0x20, &serde_json::to_vec(&ws_payload).unwrap());
+                WINCH_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = unsafe {
+                    libc::signal(
+                        libc::SIGWINCH,
+                        sigwinch_handler as *const () as usize as libc::sighandler_t,
+                    )
+                };
+                Some(termios)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "raw terminal setup failed");
+                None
+            }
+        }
+    } else if args.interactive && unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
+        pty::disable_echo_output().ok()
+    } else {
+        None
     };
 
-    match clone3_container(clone_flags) {
-        Err(e) => {
-            tracing::error!(%e, "clone3 failed");
-            ExitCode::FAILURE
-        }
-        Ok(None) => {
-            // ---- CHILD ----
+    // Reader thread: stream → stdout
+    let reader_stream = stream.try_clone().unwrap();
+    let reader_fd = reader_stream.as_raw_fd();
+    // Prevent stream from being dropped while raw_fd is in use.
+    std::mem::forget(reader_stream);
 
-            // Close master — only the parent needs it
-            drop(master);
-
-            // Set up PTY slave as the controlling terminal
-            if let Some(slave) = slave
-                && let Err(e) = slave.make_controlling()
-            {
-                tracing::error!(%e, "pty setup failed");
-                std::process::exit(1);
-            }
-
-            // Close stdin if neither -t nor -i was given
-            if !args.tty && !args.interactive {
-                let devnull = CString::from("/dev/null");
-                let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
-                if fd < 0 {
-                    tracing::error!("cannot open /dev/null");
-                    std::process::exit(1);
-                }
-                if let Err(e) = sys::dup2(fd, libc::STDIN_FILENO) {
-                    tracing::error!(%e, "dup2 /dev/null failed");
-                    std::process::exit(1);
-                }
-                sys::close(fd);
-            }
-
-            if let Err(e) = signal.wait() {
-                tracing::error!(%e, "sync wait failed");
-                std::process::exit(1);
-            }
-
-            if let Err(e) = sys::bring_up_lo() {
-                tracing::warn!(%e, "bring_up_lo failed");
-            }
-
-            if let Err(e) = sys::sethostname("conrt") {
-                tracing::error!(%e, "sethostname failed");
-            }
-
-            if let Some(ref rootfs) = rootfs {
-                let overlay_dir =
-                    overlay_dir.expect("overlay_dir is always created when rootfs is provided");
-
-                let container_root = match setup_overlay_rootfs(rootfs, &overlay_dir) {
-                    Ok(merged) => merged,
-                    Err(e) => {
-                        tracing::error!(%e, "overlay setup failed");
-                        std::process::exit(1);
-                    }
-                };
-
-                if let Err(e) = setup_container_root(&container_root) {
-                    tracing::error!(%e, "container root setup failed");
-                    std::process::exit(1);
-                }
-            }
-
-            let argv = sys::Argv::new(args.command);
-            let errno = execvp(argv.as_slice());
-            tracing::error!(%errno, "execvp failed");
-            std::process::exit(1)
-        }
-        Ok(Some(pid)) => {
-            // ---- PARENT ----
-
-            // Close slave — only the child needs it
-            drop(slave);
-
-            let maps_result = if needs_userns_maps {
-                setup_userns_maps(pid)
-            } else {
-                Ok(())
-            };
-            signal.signal();
-
-            if let Err(e) = maps_result {
-                tracing::error!(%e, "container aborted");
-                return ExitCode::FAILURE;
-            }
-
-            tracing::info!(child = pid, "container started");
-
-            // PTY I/O relay — blocks until the child closes the slave
-            if let Some(ref master) = master {
-                let raw = if unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
-                    if args.interactive {
-                        pty::set_raw_terminal().ok()
-                    } else {
-                        pty::disable_echo_output().ok()
-                    }
-                } else {
-                    None
-                };
-                if args.interactive {
-                    if let Err(e) = pty::relay_pty(master.raw_fd()) {
-                        tracing::error!(%e, "pty relay failed");
-                    }
-                } else {
-                    if let Err(e) = pty::relay_pty_output(master.raw_fd()) {
-                        tracing::error!(%e, "pty relay failed");
+    let reader_handle = std::thread::spawn(move || {
+        loop {
+            match read_frame(reader_fd) {
+                Ok((0x10, data)) => {
+                    let mut written = 0usize;
+                    while written < data.len() {
+                        match crate::sys::write(libc::STDOUT_FILENO, &data[written..]) {
+                            Ok(n) => written += n as usize,
+                            Err(e) => {
+                                tracing::error!(%e, "stdout write failed");
+                                return 1i32;
+                            }
+                        }
                     }
                 }
-                if let Some(termios) = raw {
-                    pty::restore_terminal(&termios).ok();
+                Ok((0x02, payload)) => {
+                    #[derive(serde::Deserialize)]
+                    struct ExitPayload {
+                        exit_code: i32,
+                    }
+                    if let Ok(ep) = serde_json::from_slice::<ExitPayload>(&payload) {
+                        return ep.exit_code;
+                    }
+                    return 1;
                 }
-            }
-            // master dropped here if Some — closes the master fd
-
-            let exit_code = match wait_for_child(pid) {
-                Ok(code) => code,
+                Ok((ty, _)) => {
+                    tracing::warn!(%ty, "unexpected frame from daemon");
+                    return 1;
+                }
                 Err(e) => {
-                    tracing::error!(%e, "wait failed");
-                    ExitCode::FAILURE
+                    tracing::error!(%e, "reader: stream read error");
+                    return 1;
                 }
-            };
-
-            if let Some(ref overlay) = overlay_dir
-                && !args.save
-            {
-                cleanup_overlay(overlay);
             }
+        }
+    });
 
-            exit_code
+    // Main thread: stdin → stream (0x10 frames)
+    let mut stdin_buf = [0u8; 4096];
+    let stdin_fd = libc::STDIN_FILENO;
+    loop {
+        // Check SIGWINCH before each read.
+        if WINCH_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+            WINCH_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (rows, cols) = get_window_size();
+            let ws_payload = serde_json::json!({"rows": rows, "cols": cols});
+            let _ = send_frame(raw_fd, 0x20, &serde_json::to_vec(&ws_payload).unwrap());
+        }
+
+        match crate::sys::read(stdin_fd, &mut stdin_buf) {
+            Ok(0) => {
+                // EOF
+                let _ = send_frame(raw_fd, 0x11, &[]);
+                break;
+            }
+            Ok(n) => {
+                if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
+                    tracing::error!(%e, "stdin → stream write failed");
+                    break;
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => {
+                // stdin error (e.g. EOF on a non-TTY)
+                if e.kind() == io::ErrorKind::UnexpectedEof || e.raw_os_error() == Some(libc::EIO) {
+                    let _ = send_frame(raw_fd, 0x11, &[]);
+                }
+                break;
+            }
         }
     }
+
+    // Restore terminal before joining thread.
+    if let Some(termios) = original_termios {
+        pty::restore_terminal(&termios).ok();
+        unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
+    }
+
+    let exit_code = match reader_handle.join() {
+        Ok(code) => code as u8,
+        Err(_) => 1,
+    };
+
+    ExitCode::from(exit_code)
 }
 
 fn clone3_container(flags: c_int) -> io::Result<Option<libc::pid_t>> {
@@ -623,20 +657,6 @@ fn execvp(argv: &sys::ArgvSlice) -> io::Error {
     sys::execvp(argv)
 }
 
-/// Wait for a child process and return its exit code.
-fn wait_for_child(pid: libc::pid_t) -> io::Result<ExitCode> {
-    let mut status: i32 = 0;
-    let _ = sys::wait4(pid, &mut status, 0, None)?;
-    tracing::info!(%status, "container exited");
-    if libc::WIFEXITED(status) {
-        Ok(ExitCode::from(libc::WEXITSTATUS(status) as u8))
-    } else if libc::WIFSIGNALED(status) {
-        Ok(ExitCode::from(128 + libc::WTERMSIG(status) as u8))
-    } else {
-        Ok(ExitCode::FAILURE)
-    }
-}
-
 fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -742,23 +762,5 @@ fn kill_container(pid: i32, socket_path: PathBuf) -> ExitCode {
             "kill failed"
         );
         ExitCode::FAILURE
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rootfs_nonexistent_returns_failure() {
-        let code = run_container(RunArgs {
-            rootfs: Some("/definitely/not/a/real/path".into()),
-            net_pid: None,
-            save: false,
-            tty: false,
-            interactive: false,
-            command: vec![CString::from_str("/bin/true").unwrap()],
-        });
-        assert_eq!(code, ExitCode::FAILURE);
     }
 }

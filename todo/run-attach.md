@@ -1,5 +1,20 @@
 # Run Attach — daemon-managed interactive/live containers
 
+## Status: **IMPLEMENTED** (Jul 2026)
+
+See `src/daemon.rs` (`AttachSession`, `handle_run_attach`,
+`handle_accept`, `handle_stream_read`, `handle_stream_write`,
+`handle_pty_read`, `handle_pty_write`, `dispatch_frame`,
+`send_attach_frame`, `close_attach_session`, `reap_children` exit-code
+path) and `src/main.rs` (`run_attach`, `build_frame`, `send_frame`,
+`read_frame`, `sigwinch_handler`).
+
+Non-detach `run` always goes through the daemon — `<socket>.stream`
+must exist. The old inline `run_container`, `wait_for_child`, and
+`relay_pty`/`relay_pty_output` have been removed.
+
+---
+
 ## Problem
 
 `conrt run` without `--detach` forks the container directly as a child of the
@@ -44,15 +59,19 @@ Daemon {
 
 ```rust
 struct AttachSession {
-    stream_fd: RawFd,          // connected client stream
+    stream_fd: RawFd,
     ptm_fd: RawFd,             // PTY master, -1 if !tty && !interactive
-    log_read_fd: RawFd,        // stdout/stderr pipe read, used if no PTY
+    log_read_fd: RawFd,        // stdout/stderr pipe read end (non-PTY)
     child_pid: pid_t,
     child_exited: bool,
-    stream_rbuf: Vec<u8>,      // buffer for reading from stream
-    stream_wbuf: Vec<u8>,      // buffer for writing to stream
-    pty_rbuf: Vec<u8>,         // buffer for reading from PTY / log pipe
-    pty_wbuf: Vec<u8>,         // buffer for writing to PTY master
+    reading_header: bool,       // two-phase frame read
+    frame_buf: Vec<u8>,
+    frame_type: u8,
+    frame_len: u16,
+    output_rbuf: Vec<u8>,      // buffer for PTY/pipe reads
+    stream_wbuf: Vec<u8>,      // buffer for stream writes (data + exit frames)
+    pty_write_pending: bool,   // PTY_WRITE in-flight
+    stream_write_pending: bool, // STREAM_WRITE in-flight
 }
 ```
 
@@ -86,14 +105,14 @@ CLI (stream)                         daemon
   │◀─── 0x01 RunResponse ─────────────│  PID sent back
   │                                    │
   │  ╔══ bidirectional relay ══════╗   │
-  │  ║   stdin → 0x10 frames      ║   │  stream_read → PTY_write
-  │  ║   0x10 frames → stdout     ║   │  PTY_read → stream_write
-  │  ║   SIGWINCH → 0x20 frames   ║   │  ioctl(TIOCSWINSZ)
-  │  ╚════════════════════════════╝   │
+  │  ║   stdin → 0x10 frames       ║   │  stream_read → PTY_write
+  │  ║   0x10 frames → stdout      ║   │  PTY_read → stream_write
+  │  ║   SIGWINCH → 0x20 frames    ║   │  ioctl(TIOCSWINSZ)
+  │  ╚═════════════════════════════╝   │
   │                                    │
-  │  (child exits → wait4)            │
+  │  (child exits → wait4)             │
   │◀─── 0x02 ExitCode ────────────────│
-  │  (daemon closes stream)           │
+  │  (daemon closes stream)            │
 ```
 
 ---
@@ -121,117 +140,93 @@ Dispatch:
 
 ### Accept
 
-```rust
-fn handle_accept(&mut self, ret: i32) {
-    // ret = connected fd
-    let session_id = self.next_session_id;
-    self.next_session_id += 1;
-    self.attach_sessions.insert(session_id, AttachSession {
-        stream_fd: ret,
-        ptm_fd: -1,
-        log_read_fd: -1,
-        child_pid: 0,
-        child_exited: false,
-        stream_rbuf: vec![0u8; 4],        // read type + len first
-        stream_wbuf: Vec::with_capacity(4096),
-        pty_rbuf: vec![0u8; 4096],
-        pty_wbuf: vec![0u8; 4096],
-    });
-    // Submit first read: read the 3-byte header (type + len)
-    push_read(sq, stream_fd, &mut stream_rbuf, STREAM_READ | session_id);
-}
-```
+  `push_accept` on `attach_listener_fd` with `ACCEPT` user_data.
+  On completion the connected fd is inserted as a new `AttachSession`
+  with all fields initialised, and `submit_stream_read_header` is called
+  to start reading the first frame.
+
+  The accept is then resubmitted for the next client.
 
 ### Frame reading (two-phase: header → payload)
 
-1. Read 3 bytes (`type:u8`, `len:u16 LE`)
-2. If `len > 0`: read `len` bytes into payload buffer
-3. Dispatch by type:
-   - `0x00` → parse JSON as `Request::Run`, call `handle_run_attach(session_id, args)`
-   - `0x10` → submit `STREAM_WRITE | session_id` to PTY master
-   - `0x11` → close stdin side of PTY (send EOF)
-   - `0x20` → `ioctl(ptm_fd, TIOCSWINSZ, &ws)`
+`handle_stream_read` implements a state machine via `reading_header`:
+1. `reading_header = true` → read 3 bytes (`type:u8`, `len:u16 LE`) into `frame_buf`
+2. `reading_header = false` → read `frame_len` bytes of payload into `frame_buf`
+3. On payload complete → `dispatch_frame`:
+   - `0x00` → parse JSON as `Request::Run`, call `handle_run_attach`,
+     which does NOT resubmit the stream read (rejected if sent again)
+   - `0x10` → `push_write` to PTY master (`pty_write_pending = true`),
+     stream read header resubmitted eagerly
+   - `0x11` → close PTY master (EOF to child), stream read resubmitted
+   - `0x20` → `ioctl(ptm_fd, TIOCSWINSZ, &ws)`, stream read resubmitted
+   - other → error, session closed
 
 ### handle_run_attach
 
-Same as `handle_run` but:
-- Creates PTY if `tty` or `interactive` (instead of just a pipe)
-- Child: uses PTY slave fd for stdio instead of pipe
-- Parent: stores `AttachSession` with `ptm_fd`, kicks off `PTY_READ` and `STREAM_READ` cycles
+Standalone handler (not shared with `handle_run`):
+- If `tty` or `interactive`: open PTY (`open_pty`), child uses slave,
+  parent stores master as `ptm_fd`
+- Otherwise: create `pipe2(O_CLOEXEC)`, child dup2 write end to
+  `STDOUT_FILENO`/`STDERR_FILENO`, /dev/null for stdin, parent stores
+  read end as `log_read_fd`
+- `clone3_container` in child namespace; parent sets up user ns maps,
+  signals child to proceed, sends `0x01 RunResponse`, then submits
+  both `submit_output_read` and `submit_stream_read_header`
 
-### Data relay (io_uring ping-pong)
+### Data relay (io_uring asymmetric flow)
 
-Two independent async loops per session:
+Two directions with different flow-control strategies:
 
+**Output (PTY/pipe → stream):** ping-pong backpressure.
 ```
-STREAM_READ ret > 0  →  copy to pty_wbuf → STREAM_WRITE to PTY
-PTY_READ ret > 0     →  copy to stream_wbuf → PTY_WRITE to stream
+PTY_READ > 0  →  send 0x10 frame via STREAM_WRITE
+                  ↓ (NOT resubmitted here)
+STREAM_WRITE completes  →  resubmit PTY_READ
+```
+This naturally stops reading PTY output when the client isn't reading.
+
+**Input (stream → PTY):** eager (resubmit stream read immediately).
+```
+STREAM_READ frame = 0x10  →  submit PTY_WRITE to PTY master
+                              ↓
+                              resubmit STREAM_READ header
+                              (no backpressure — small frames only)
 ```
 
-Each side resubmits its read after the write CQE completes (flow control).
-
-When one side hits EOF (ret ≤ 0), it shuts down that direction but keeps the
-other direction alive until the pipe drains.
+When output hits EOF (ret ≤ 0): close `ptm_fd`/`log_read_fd`, and if
+`child_exited` is already true, close the session.
 
 ### Child exit (SIGCHLD)
 
 When `reap_children` picks up an attached pid:
-1. If the child hasn't already exited: mark `child_exited = true`
-2. If there's a PTY: close `ptm_fd` (gives EOF on the output side)
-3. Wait for pending writes to drain
-4. Encode and send `0x02` exit frame
-5. Close stream fd, remove session
+1. Mark `child_exited = true` (do NOT close output fds — let the
+   PTY_READ handler drain remaining data and close on natural EOF)
+2. If no `stream_write_pending`: send `0x02 ExitCode` frame immediately
+3. If `stream_write_pending`: defer — store payload in `stream_wbuf`,
+   it will be flushed when `handle_stream_write` completes
+4. When both `child_exited` and output fds are closed (by the PTY_READ
+   EOF handler) and no PTY_WRITE is in-flight: `close_attach_session`
 
 ---
 
 ## CLI changes
 
-`run_container()` in `main.rs` is replaced with `run_attach()`:
+`run_attach()` in `main.rs` replaces the inline `run_container` path
+for non-detach `run`:
 
-```
-fn run_attach(args: RunArgs) -> ExitCode {
-    let stream = connect_to_daemon_stream(socket_path)?;
-
-    // 1. Send RunRequest frame
-    send_frame(stream, 0x00, json_request)?;
-
-    // 2. Read RunResponse frame
-    let resp = read_frame(stream);
-    // expect 0x01, parse JSON, get pid
-
-    // 3. If --tty: enter raw mode, install SIGWINCH handler
-    if tty {
-        enter_raw_mode()?;
-        signal_hook(SIGWINCH, || send_winsz(stream));
-    }
-
-    // 4. Reader thread: stream → stdout
-    let reader = thread::spawn(move || {
-        loop {
-            match read_frame(stream) {
-                (0x10, data) => stdout.write(data),
-                (0x02, exit_json) => break parse_exit(exit_json),
-                _ => break,
-            }
-        }
-    });
-
-    // 5. Main thread: stdin → stream
-    for line in stdin.bytes() {
-        send_frame(stream, 0x10, &[line]);
-    }
-    send_frame(stream, 0x11, &[]);  // stdin EOF
-
-    // 6. Wait for reader to get exit code, then exit with it
-    let code = reader.join();
-    process::exit(code);
-}
-```
-
-Window resize is sent as:
-```
-send_frame(stream, 0x20, json_winsz);
-```
+1. Connect to `<socket-path>.stream` via `UnixStream`
+2. Send `0x00 RunRequest` frame (JSON `Request::Run`)
+3. Read `0x01 RunResponse` (check `ok` field)
+4. If `--tty` and stdin is a TTY: set raw mode, send initial `0x20`
+   WinSize frame, install `SIGWINCH` handler (atomic bool flag)
+5. If `--interactive` (but not `--tty`) and stdin is a TTY: disable
+   echo only
+6. Spawn reader thread: reads frames from stream, writes `0x10` Data
+   to stdout, exits on `0x02` ExitCode
+7. Main thread loops reading stdin, sending `0x10` Data frames;
+   checks `WINCH_PENDING` atomic before each read; on stdin EOF
+   sends `0x11` StdinEof
+8. Restore terminal, join reader thread, exit with reader's code
 
 ---
 
@@ -239,14 +234,7 @@ send_frame(stream, 0x20, json_winsz);
 
 | File | Changes |
 |------|---------|
-| `src/main.rs` | Replace `run_container()` with `run_attach()`; add stream connect, frame read/write, raw mode, SIGWINCH |
-| `src/daemon.rs` | Add `attach_listener_fd`, `attach_sessions`, `next_session_id`; add `AttachSession` struct; add accept handler; add stream/PTY frame read/write CQE handlers; modify `handle_run` to support PTY attach variant; modify `reap_children` to emit exit frames for attached pids |
-| `src/uring.rs` | May need `push_accept`, `push_connect` if not already present |
-
----
-
-## Open questions
-
-- Does `io-uring` crate expose `Accept` opcode? If not, `libc::accept` + `push_read` can work.
-- Should `SIGWINCH` be delivered via a side channel (separate datagram socket) or inline on the stream? Inline with `0x20` frame is simplest.
-- Flow control: if writes to the stream back up (client not reading), should we stop reading from the PTY? The ping-pong design naturally enforces this by resubmitting `PTY_READ` only after `STREAM_WRITE` completes.
+| `src/main.rs` | Add `run_attach()`, frame helpers (`build_frame`, `send_frame`, `read_frame`), SIGWINCH handler (atomic bool); `RunArgs` gains `tty`/`interactive` fields; remove `run_container`, `wait_for_child`, test `rootfs_nonexistent_returns_failure` |
+| `src/daemon.rs` | `attach_listener_fd`, `attach_sessions`, `next_session_id`, `AttachSession` struct; user_data flags (`ACCEPT`, `STREAM_READ`, `STREAM_WRITE`, `PTY_READ`, `PTY_WRITE`, `SESSION_MASK`); accept + CQE dispatch for stream/PTY ops; frame dispatch (0x00–0x20); `handle_run_attach` with PTY/pipe/clone3; `send_attach_frame`, `submit_output_read`; relay handlers (`handle_pty_read/write`, `handle_stream_read/write`, `close_attach_session`); `reap_children` emits `0x02` for attached pids with deferred send |
+| `src/pty.rs` | Remove `relay_pty` and `relay_pty_output` (superseded by daemon-side relay) |
+| `tests/container.rs` | `Daemon` helper (per-test daemon in temp dir, SIGKILL on drop); `run_conrt` injects `--socket-path` after subcommand; `container_stdout` filters tracing lines; net_pid tests use `--detach` for PID |

@@ -15,10 +15,12 @@ conrt uses a **single daemon** process model:
 │  io_uring-based event loop                               │
 │                                                          │
 │  CQE sources:                                            │
-│  ├── listener socket (accept → handle client)            │
-│  ├── client fds (read request / write response)          │
-│  ├── container PTY fds (read stdout → bbqueue)           │
-│  ├── stream client fds (write logs)                      │
+│  ├── datagram listener (accept → handle client)          │
+│  ├── stream listener (accept → AttachSession)            │
+│  ├── client datagram fds (request / response)            │
+│  ├── attach stream fds (frame protocol: 0x00–0x20)      │
+│  ├── container PTY/pipe fds (read output)                │
+│  ├── subscribe stream fds (write logs)                   │
 │  └── signalfd (SIGCHLD → waitpid → reap + cleanup)      │
 │                                                          │
 │  loop: io_uring_submit_and_wait() → dispatch CQEs        │
@@ -32,7 +34,7 @@ Key points:
 - Single-threaded `io_uring`-based event loop
 - Daemon handles all host-side teardown (overlay cleanup, etc.)
 - Container stdout/stderr is buffered in a bbqueue ring buffer and can be streamed live to `conrt logs` clients
-- Foreground `conrt run` (without `--detach`) runs standalone, no daemon required
+- Foreground `conrt run` (without `--detach`) now goes through the daemon via Unix stream attach (frame protocol)
 
 ## RingBuffer Data Structure
 
@@ -80,7 +82,7 @@ container process ──write()──► PTY slave
 - `chroot` into rootfs (bind-mount onto itself first — `pivot_root` requires init-ns `CAP_SYS_ADMIN`)
 - Mount `/proc`, `/dev`
 - PTY allocation (`-t` flag): `openpty` + `setsid` + `TIOCSCTTY` + `dup2` to 0/1/2, `poll` I/O relay
-- `conrt run <cmd>` foreground, no daemon needed
+- `conrt run <cmd>` foreground (goes through daemon via stream-attach)
 
 ### Phase 2 — Daemon & OverlayFS ✅
 
@@ -110,8 +112,18 @@ container process ──write()──► PTY slave
 ## Usage
 
 ```bash
+# Daemon must be running for any command (run, list, kill, logs)
 cargo run -- daemon &
+
+# Non-detach run goes through daemon
 cargo run -- run --rootfs /tmp/alpine /bin/sh
+cargo run -- run --rootfs /tmp/alpine --tty /bin/sh  # interactive PTY
+
+# Detach (daemon spawns and forgets)
+cargo run -- run --detach --rootfs /tmp/alpine /bin/sleep 60
+cargo run list
+cargo run kill <pid>
+cargo run logs <pid>
 ```
 
 No root required — user namespaces handle privilege escalation.
@@ -141,3 +153,11 @@ No root required — user namespaces handle privilege escalation.
 ### Phase 4 — Network ✅
 
 - `CLONE_NEWNET` with `lo` up
+
+### Phase 5 — Daemon-managed run-attach ✅
+
+- Stream listener at `<socket>.stream` for non-detach `run`
+- Frame protocol: `0x00 RunRequest`, `0x01 RunResponse`, `0x10 Data`, `0x11 StdinEof`, `0x20 WinSize`, `0x02 ExitCode`
+- Daemon-side PTY/pipe I/O relay via io_uring ping-pong (backpressure on output)
+- Client: raw terminal, SIGWINCH handler, reader thread, stdin relay
+- Exit-code propagation with deferred send on pending writes

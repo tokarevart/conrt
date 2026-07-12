@@ -27,6 +27,19 @@ const RING_SIZE: u32 = 1024;
 const BACKLOG_WRITE: u64 = 1 << 63;
 const PIPE_WRITE: u64 = 1 << 62;
 const SUBSCRIBE_FD: u64 = 1 << 61;
+const ACCEPT: u64 = 1 << 60;
+const STREAM_READ: u64 = 1 << 59;
+const STREAM_WRITE: u64 = 1 << 58;
+const PTY_READ: u64 = 1 << 57;
+const PTY_WRITE: u64 = 1 << 56;
+const SESSION_MASK: u64 = !(BACKLOG_WRITE
+    | PIPE_WRITE
+    | SUBSCRIBE_FD
+    | ACCEPT
+    | STREAM_READ
+    | STREAM_WRITE
+    | PTY_READ
+    | PTY_WRITE);
 const PIPE_ID_MASK: u64 = !(BACKLOG_WRITE | PIPE_WRITE | SUBSCRIBE_FD);
 
 // ── Protocol ──────────────────────────────────────────────────────────────
@@ -132,6 +145,8 @@ struct RunArgs {
     net_pid: Option<i32>,
     save: bool,
     command: Vec<CString>,
+    tty: bool,
+    interactive: bool,
 }
 
 // ── Datagram receive phases ─────────────────────────────────────────────
@@ -447,11 +462,51 @@ struct ContainerInfo {
     gateway: LogGateway,
 }
 
+// ── Attach Session (interactive/PTY run over Unix stream) ──────────────────
+
+struct AttachSession {
+    stream_fd: RawFd,
+    ptm_fd: RawFd,
+    /// Read end of stdout/stderr pipe (used when no PTY).
+    log_read_fd: RawFd,
+    child_pid: pid_t,
+    child_exited: bool,
+    reading_header: bool,
+    frame_buf: Vec<u8>,
+    frame_type: u8,
+    frame_len: u16,
+    output_rbuf: Vec<u8>,
+    stream_wbuf: Vec<u8>,
+    pty_write_pending: bool,
+    stream_write_pending: bool,
+}
+
+impl AttachSession {
+    fn new(stream_fd: RawFd) -> Self {
+        Self {
+            stream_fd,
+            ptm_fd: -1,
+            log_read_fd: -1,
+            child_pid: 0,
+            child_exited: false,
+            reading_header: true,
+            frame_buf: vec![0u8; 3],
+            frame_type: 0,
+            frame_len: 0,
+            output_rbuf: vec![0u8; 4096],
+            stream_wbuf: Vec::with_capacity(4096 + 3),
+            pty_write_pending: false,
+            stream_write_pending: false,
+        }
+    }
+}
+
 pub struct Daemon {
     ring: IoUring,
     sigchld_fd: RawFd,
     sigchld_buf: Vec<u8>,
     datagram_fd: RawFd,
+    attach_listener_fd: RawFd,
     socket_path: PathBuf,
     containers: HashMap<pid_t, ContainerInfo>,
     outputs: HashMap<u64, Output>,
@@ -461,6 +516,8 @@ pub struct Daemon {
     pipe_map: HashMap<u64, pid_t>,
     next_sub_id: u64,
     next_pipe_id: u64,
+    attach_sessions: HashMap<u64, AttachSession>,
+    next_session_id: u64,
 
     // Datagram receive state
     recv_buf: Vec<u8>,
@@ -487,6 +544,7 @@ impl Daemon {
             sigchld_fd: -1,
             sigchld_buf: Vec::new(),
             datagram_fd: -1,
+            attach_listener_fd: -1,
             socket_path,
             containers: HashMap::new(),
             outputs: HashMap::new(),
@@ -496,6 +554,8 @@ impl Daemon {
             pipe_map: HashMap::new(),
             next_sub_id: 0,
             next_pipe_id: 0,
+            attach_sessions: HashMap::new(),
+            next_session_id: 0,
             recv_buf: vec![0u8; 65536],
             recv_addr: unsafe { std::mem::zeroed() },
             recv_addr_len: 0,
@@ -539,11 +599,27 @@ impl Daemon {
 
         let datagram = UnixDatagram::bind(&self.socket_path)?;
         self.datagram_fd = datagram.as_raw_fd();
-        tracing::info!(path = %self.socket_path.display(), "daemon listening");
+        tracing::info!(path = %self.socket_path.display(), "daemon listening (datagram)");
+
+        // Stream listener for attach/interactive sessions.
+        let mut stream_path = self.socket_path.clone().into_os_string();
+        stream_path.push(".stream");
+        let stream_path = PathBuf::from(stream_path);
+        if stream_path.exists() {
+            std::fs::remove_file(&stream_path)?;
+        }
+        let listener = std::os::unix::net::UnixListener::bind(&stream_path)?;
+        listener.set_nonblocking(true)?;
+        self.attach_listener_fd = listener.as_raw_fd();
+        tracing::info!(path = %stream_path.display(), "daemon listening (stream)");
 
         let sigchld = setup_sigchld_fd()?;
         self.sigchld_fd = sigchld;
         self.sigchld_buf = vec![0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+
+        // Prevent listener from being dropped — socket stays bound for the
+        // daemon's lifetime.
+        std::mem::forget(listener);
 
         {
             let mut sq = self.ring.submission();
@@ -555,6 +631,7 @@ impl Daemon {
                 0,
             );
             uring::push_read(&mut sq, sigchld, &mut self.sigchld_buf, 1);
+            uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
         }
 
         loop {
@@ -577,6 +654,13 @@ impl Daemon {
                         self.complete_backlog_write(id & PIPE_ID_MASK, ret)
                     }
                     id if id & PIPE_WRITE != 0 => self.complete_pipe_write(id & PIPE_ID_MASK, ret),
+                    id if id == (ACCEPT) => self.handle_accept(ret),
+                    id if id & STREAM_READ != 0 => self.handle_stream_read(id & SESSION_MASK, ret),
+                    id if id & STREAM_WRITE != 0 => {
+                        self.handle_stream_write(id & SESSION_MASK, ret)
+                    }
+                    id if id & PTY_READ != 0 => self.handle_pty_read(id & SESSION_MASK, ret),
+                    id if id & PTY_WRITE != 0 => self.handle_pty_write(id & SESSION_MASK, ret),
                     id => self.handle_output(id, ret),
                 }
             }
@@ -653,13 +737,15 @@ impl Daemon {
                     net_pid,
                     save,
                     command,
-                    interactive: _,
-                    tty: _,
+                    interactive,
+                    tty,
                 } => self.handle_run(sender, RunArgs {
                     rootfs,
                     net_pid,
                     save,
                     command: CStringSerde::into_inner_vec(command),
+                    tty: tty.unwrap_or(false),
+                    interactive: interactive.unwrap_or(false),
                 }),
                 Request::List => self.handle_list(sender),
                 Request::Kill { pid } => self.handle_kill(sender, pid),
@@ -1177,30 +1263,666 @@ impl Daemon {
         }
     }
 
+    // ── Stream attach session handlers ────────────────────────────────────
+
+    fn handle_accept(&mut self, ret: i32) {
+        if ret < 0 {
+            // Accept failed (e.g. EAGAIN with non-blocking). Resubmit.
+            tracing::warn!(%ret, "accept failed");
+            let mut sq = self.ring.submission();
+            uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
+            return;
+        }
+        let stream_fd = ret;
+        let session_id = self.next_session_id;
+        self.next_session_id += 1;
+        tracing::info!(%session_id, %stream_fd, "attach session accepted");
+        self.attach_sessions
+            .insert(session_id, AttachSession::new(stream_fd));
+        // Read first header.
+        self.submit_stream_read_header(session_id);
+        // Re-submit accept.
+        let mut sq = self.ring.submission();
+        uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
+    }
+
+    fn submit_stream_read_header(&mut self, session_id: u64) {
+        let session = self.attach_sessions.get_mut(&session_id).unwrap();
+        session.reading_header = true;
+        session.frame_buf.resize(3, 0);
+        let mut sq = self.ring.submission();
+        uring::push_read(
+            &mut sq,
+            session.stream_fd,
+            &mut session.frame_buf,
+            STREAM_READ | session_id,
+        );
+    }
+
+    fn handle_stream_read(&mut self, session_id: u64, ret: i32) {
+        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+            return;
+        };
+
+        if ret <= 0 {
+            // Client disconnected or error.
+            tracing::info!(%session_id, %ret, "stream read EOF/error, closing session");
+            self.close_attach_session(session_id);
+            return;
+        }
+
+        if session.reading_header {
+            // Read 3-byte header.
+            session.frame_type = session.frame_buf[0];
+            session.frame_len = u16::from_le_bytes([session.frame_buf[1], session.frame_buf[2]]);
+            let len = session.frame_len as usize;
+            if len == 0 {
+                // No payload: dispatch immediately.
+                let frame_type = session.frame_type;
+                self.dispatch_frame(session_id, frame_type, &[]);
+            } else {
+                session.reading_header = false;
+                session.frame_buf.resize(len, 0);
+                let mut sq = self.ring.submission();
+                let s = self.attach_sessions.get_mut(&session_id).unwrap();
+                uring::push_read(
+                    &mut sq,
+                    s.stream_fd,
+                    &mut s.frame_buf,
+                    STREAM_READ | session_id,
+                );
+            }
+        } else {
+            // Payload complete.
+            let frame_type = session.frame_type;
+            let data = session.frame_buf[..session.frame_len as usize].to_vec();
+            self.dispatch_frame(session_id, frame_type, &data);
+        }
+    }
+
+    fn dispatch_frame(&mut self, session_id: u64, frame_type: u8, data: &[u8]) {
+        match frame_type {
+            0x00 => {
+                // RunRequest: parse JSON Request::Run
+                let request: Request = match serde_json::from_slice(data) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(%session_id, %e, "invalid RunRequest JSON");
+                        self.close_attach_session(session_id);
+                        return;
+                    }
+                };
+                let (rootfs, net_pid, save, command, interactive, tty) = match request {
+                    Request::Run {
+                        rootfs,
+                        net_pid,
+                        save,
+                        command,
+                        interactive,
+                        tty,
+                    } => (rootfs, net_pid, save, command, interactive, tty),
+                    _ => {
+                        tracing::error!(%session_id, "expected RunRequest inside frame");
+                        self.close_attach_session(session_id);
+                        return;
+                    }
+                };
+                self.handle_run_attach(session_id, RunArgs {
+                    rootfs,
+                    net_pid,
+                    save,
+                    command: CStringSerde::into_inner_vec(command),
+                    tty: tty.unwrap_or(false),
+                    interactive: interactive.unwrap_or(false),
+                });
+            }
+            0x10 => {
+                // Data from stdin → PTY
+                if !data.is_empty() {
+                    let mut sq = self.ring.submission();
+                    if let Some(session) = self.attach_sessions.get_mut(&session_id) {
+                        session.pty_write_pending = true;
+                        uring::push_write(&mut sq, session.ptm_fd, data, PTY_WRITE | session_id);
+                    }
+                }
+                // Read next frame header.
+                self.submit_stream_read_header(session_id);
+            }
+            0x11 => {
+                // StdinEof: close write side of PTY (send EOF).
+                if let Some(session) = self.attach_sessions.get_mut(&session_id)
+                    && session.ptm_fd >= 0
+                {
+                    sys::close(session.ptm_fd);
+                    session.ptm_fd = -1;
+                }
+                self.submit_stream_read_header(session_id);
+            }
+            0x20 => {
+                // WinSize: parse JSON { rows: u16, cols: u16 }
+                #[derive(serde::Deserialize)]
+                struct WinSize {
+                    rows: u16,
+                    cols: u16,
+                }
+                let ws: WinSize = match serde_json::from_slice(data) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::error!(%session_id, %e, "invalid WinSize JSON");
+                        self.submit_stream_read_header(session_id);
+                        return;
+                    }
+                };
+                if let Some(session) = self.attach_sessions.get_mut(&session_id)
+                    && session.ptm_fd >= 0
+                {
+                    let mut w: libc::winsize = unsafe { std::mem::zeroed() };
+                    w.ws_row = ws.rows;
+                    w.ws_col = ws.cols;
+                    let _ = unsafe { libc::ioctl(session.ptm_fd, libc::TIOCSWINSZ, &w) };
+                }
+                self.submit_stream_read_header(session_id);
+            }
+            _ => {
+                tracing::warn!(%session_id, %frame_type, "unknown frame type, closing");
+                self.close_attach_session(session_id);
+            }
+        }
+    }
+
+    fn handle_run_attach(&mut self, session_id: u64, args: RunArgs) {
+        let Some(session) = self.attach_sessions.get(&session_id) else {
+            return;
+        };
+        let stream_fd = session.stream_fd;
+
+        let mut err = |msg: &str| {
+            // Send error RunResponse frame, then close.
+            let payload = serde_json::to_vec(&ErrorResponse {
+                ok: false,
+                error: msg.to_string(),
+            })
+            .unwrap();
+            let mut frame = Vec::with_capacity(3 + payload.len());
+            frame.push(0x01); // RunResponse type
+            frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            frame.extend_from_slice(&payload);
+            let _ = sys::write(stream_fd, &frame);
+            self.close_attach_session(session_id);
+        };
+
+        let rootfs = match args.rootfs {
+            Some(p) => match Path::new(&p).canonicalize() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    err(&format!("invalid rootfs path: {e}"));
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let overlay_dir = match rootfs {
+            Some(_) => match crate::create_overlay_tempdir() {
+                Ok(dir) => Some(dir),
+                Err(e) => {
+                    err(&format!("cannot create overlay tempdir: {e}"));
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        let use_pty = args.tty || args.interactive;
+
+        let signal = match interprocess::OneshotSignal::new() {
+            Ok(s) => s,
+            Err(e) => {
+                err(&format!("sync pipe creation failed: {e}"));
+                return;
+            }
+        };
+
+        let (master, mut slave) = if use_pty {
+            match crate::pty::open_pty() {
+                Ok((m, s)) => (Some(m), Some(s)),
+                Err(e) => {
+                    err(&format!("pty allocation failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let (clone_flags, needs_userns_maps) = match args.net_pid {
+            Some(pid) => {
+                let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        err(&format!("cannot open pid {pid} user ns: {e}"));
+                        return;
+                    }
+                };
+                let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        err(&format!("cannot open pid {pid} net ns: {e}"));
+                        return;
+                    }
+                };
+                if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
+                    err(&format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"));
+                    return;
+                }
+                if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
+                    err(&format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"));
+                    return;
+                }
+                (
+                    libc::CLONE_NEWPID
+                        | libc::CLONE_NEWNS
+                        | libc::CLONE_NEWUTS
+                        | libc::CLONE_NEWIPC,
+                    false,
+                )
+            }
+            None => (
+                libc::CLONE_NEWPID
+                    | libc::CLONE_NEWNS
+                    | libc::CLONE_NEWUTS
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUSER
+                    | libc::CLONE_NEWNET,
+                true,
+            ),
+        };
+
+        // Create a pipe for stdout/stderr when not using PTY.
+        let mut pipe_fds = sys::FdPair {
+            read: -1,
+            write: -1,
+        };
+        if !use_pty && let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+            err(&format!("log pipe creation failed: {e}"));
+            return;
+        }
+
+        let clone_result = crate::clone3_container(clone_flags);
+        match clone_result {
+            Err(e) => {
+                if pipe_fds.read >= 0 {
+                    sys::close(pipe_fds.read);
+                }
+                if pipe_fds.write >= 0 {
+                    sys::close(pipe_fds.write);
+                }
+                err(&format!("clone3 failed: {e}"));
+            }
+            Ok(None) => {
+                // ── CHILD ──
+                drop(master);
+                if use_pty {
+                    if let Some(slave) = slave.take()
+                        && let Err(e) = slave.make_controlling()
+                    {
+                        tracing::error!(%e, "pty setup failed in child");
+                        std::process::exit(1);
+                    }
+                } else {
+                    // No PTY: redirect stdout/stderr to the pipe, /dev/null for stdin.
+                    sys::close(pipe_fds.read);
+                    let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
+                    let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
+                    if pipe_fds.write != libc::STDOUT_FILENO
+                        && pipe_fds.write != libc::STDERR_FILENO
+                    {
+                        sys::close(pipe_fds.write);
+                    }
+                    let devnull = CString::from("/dev/null");
+                    let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
+                    if fd < 0 {
+                        tracing::error!("cannot open /dev/null");
+                        std::process::exit(1);
+                    }
+                    let _ = sys::dup2(fd, libc::STDIN_FILENO);
+                    sys::close(fd);
+                }
+
+                if let Err(e) = signal.wait() {
+                    tracing::error!(%e, "sync wait failed");
+                    std::process::exit(1);
+                }
+
+                if let Err(e) = sys::bring_up_lo() {
+                    tracing::warn!(%e, "bring_up_lo failed");
+                }
+
+                if let Err(e) = sys::sethostname("conrt") {
+                    tracing::error!(%e, "sethostname failed");
+                }
+
+                if let Some(ref rootfs_path) = rootfs {
+                    let overlay =
+                        overlay_dir.expect("overlay_dir is always created when rootfs is provided");
+
+                    let container_root = match crate::setup_overlay_rootfs(rootfs_path, &overlay) {
+                        Ok(merged) => merged,
+                        Err(e) => {
+                            tracing::error!(%e, "overlay setup failed");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if let Err(e) = crate::setup_container_root(&container_root) {
+                        tracing::error!(%e, "container root setup failed");
+                        std::process::exit(1);
+                    }
+                }
+
+                let argv = sys::Argv::new(args.command);
+                let errno = crate::execvp(argv.as_slice());
+                tracing::error!(%errno, "execvp failed");
+                std::process::exit(1)
+            }
+            Ok(Some(pid)) => {
+                // ── PARENT ──
+                drop(slave);
+
+                let maps_result = if needs_userns_maps {
+                    crate::setup_userns_maps(pid)
+                } else {
+                    Ok(())
+                };
+                signal.signal();
+
+                if let Err(e) = maps_result {
+                    err(&format!("container aborted: {e}"));
+                    return;
+                }
+
+                let ptm_fd = master.map_or(-1, |m| {
+                    let fd = m.raw_fd();
+                    std::mem::forget(m);
+                    fd
+                });
+                // master is leaked so the fd stays open.
+
+                // Close pipe write end in parent; keep read end (or PTY master).
+                if pipe_fds.write >= 0 {
+                    sys::close(pipe_fds.write);
+                }
+
+                let cmd_str = args
+                    .command
+                    .iter()
+                    .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                // Update session with child info.
+                if let Some(session) = self.attach_sessions.get_mut(&session_id) {
+                    session.child_pid = pid;
+                    session.ptm_fd = ptm_fd;
+                    session.log_read_fd = pipe_fds.read;
+                }
+
+                // Register as a container for log capture.
+                self.containers.insert(pid, ContainerInfo {
+                    pid,
+                    command: cmd_str,
+                    overlay_dir,
+                    save: args.save,
+                    start_time: SystemTime::now(),
+                    gateway: LogGateway::new(LOG_CAPACITY),
+                });
+
+                tracing::info!(%pid, %session_id, "attach container started");
+
+                // Send RunResponse frame.
+                let payload = serde_json::to_vec(&RunResponse {
+                    ok: true,
+                    pid: Some(pid),
+                    error: None,
+                })
+                .unwrap();
+                self.send_attach_frame(session_id, 0x01, &payload);
+
+                // Submit STREAM_READ header. PTY_READ is submitted lazily
+                // by handle_stream_write after the 0x01 STREAM_WRITE completes.
+                self.submit_stream_read_header(session_id);
+            }
+        }
+    }
+
+    fn send_attach_frame(&mut self, session_id: u64, frame_type: u8, payload: &[u8]) {
+        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+            return;
+        };
+        let stream_fd = session.stream_fd;
+        session.stream_wbuf.clear();
+        session.stream_wbuf.push(frame_type);
+        session
+            .stream_wbuf
+            .extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        session.stream_wbuf.extend_from_slice(payload);
+        session.stream_write_pending = true;
+        let mut sq = self.ring.submission();
+        uring::push_write(
+            &mut sq,
+            stream_fd,
+            &session.stream_wbuf,
+            STREAM_WRITE | session_id,
+        );
+    }
+
+    fn submit_output_read(&mut self, session_id: u64) {
+        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+            return;
+        };
+        let fd = if session.ptm_fd >= 0 {
+            session.ptm_fd
+        } else if session.log_read_fd >= 0 {
+            session.log_read_fd
+        } else {
+            return;
+        };
+        let mut sq = self.ring.submission();
+        uring::push_read(&mut sq, fd, &mut session.output_rbuf, PTY_READ | session_id);
+    }
+
+    fn handle_pty_read(&mut self, session_id: u64, ret: i32) {
+        // Fast path: successful read → send data frame (no close_attach_session
+        // needed).
+        if ret > 0 {
+            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+                return;
+            };
+            let n = ret as usize;
+            session.stream_wbuf.clear();
+            session.stream_wbuf.push(0x10); // Data frame type
+            session
+                .stream_wbuf
+                .extend_from_slice(&(n as u16).to_le_bytes());
+            session
+                .stream_wbuf
+                .extend_from_slice(&session.output_rbuf[..n]);
+            session.stream_write_pending = true;
+            let fd = session.stream_fd;
+            let mut sq = self.ring.submission();
+            uring::push_write(&mut sq, fd, &session.stream_wbuf, STREAM_WRITE | session_id);
+            // PTY_READ is NOT resubmitted here — it waits for STREAM_WRITE
+            // completion to provide backpressure.
+            return;
+        }
+        // EOF/error path: close output fds, then maybe close session.
+        let child_exited;
+        {
+            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+                return;
+            };
+            tracing::info!(%session_id, %ret, "PTY/pipe read EOF/error");
+            if session.ptm_fd >= 0 {
+                sys::close(session.ptm_fd);
+                session.ptm_fd = -1;
+            }
+            if session.log_read_fd >= 0 {
+                sys::close(session.log_read_fd);
+                session.log_read_fd = -1;
+            }
+            child_exited = session.child_exited;
+        }
+        if child_exited {
+            self.close_attach_session(session_id);
+        }
+    }
+
+    fn handle_stream_write(&mut self, session_id: u64, ret: i32) {
+        let (child_exited, has_output, no_output_fds, no_pty_write) = {
+            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+                return;
+            };
+            session.stream_write_pending = false;
+            if ret < 0 {
+                tracing::warn!(%session_id, %ret, "stream write error, closing");
+                let _ = session;
+                self.close_attach_session(session_id);
+                return;
+            }
+            // If there's a deferred exit-code frame, send it now.
+            if session.child_exited
+                && !session.stream_wbuf.is_empty()
+                && session.stream_wbuf[0] == 0x02
+            {
+                let fd = session.stream_fd;
+                let buf = session.stream_wbuf.clone();
+                session.stream_wbuf.clear();
+                session.stream_write_pending = true;
+                let _ = session;
+                let mut sq = self.ring.submission();
+                uring::push_write(&mut sq, fd, &buf, STREAM_WRITE | session_id);
+                return;
+            }
+            (
+                session.child_exited,
+                session.ptm_fd >= 0 || session.log_read_fd >= 0,
+                session.ptm_fd < 0 && session.log_read_fd < 0,
+                !session.pty_write_pending,
+            )
+        };
+        // Resubmit output read for more data (ping-pong flow control).
+        if has_output {
+            self.submit_output_read(session_id);
+        }
+        // If child exited and no more output reads pending, close.
+        if child_exited && no_output_fds && no_pty_write {
+            self.close_attach_session(session_id);
+        }
+    }
+
+    fn handle_pty_write(&mut self, session_id: u64, ret: i32) {
+        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.pty_write_pending = false;
+        if ret < 0 {
+            tracing::warn!(%session_id, %ret, "PTY write error, closing PTY");
+            if session.ptm_fd >= 0 {
+                sys::close(session.ptm_fd);
+                session.ptm_fd = -1;
+            }
+            // Child might still be writing output, so PTY_READ stays alive.
+        }
+    }
+
+    fn close_attach_session(&mut self, session_id: u64) {
+        if let Some(session) = self.attach_sessions.remove(&session_id) {
+            tracing::info!(%session_id, "closing attach session");
+            if session.stream_fd >= 0 {
+                sys::close(session.stream_fd);
+            }
+            if session.ptm_fd >= 0 {
+                sys::close(session.ptm_fd);
+            }
+            if session.log_read_fd >= 0 {
+                sys::close(session.log_read_fd);
+            }
+        }
+    }
+
     fn reap_children(&mut self) {
         loop {
             let mut status: i32 = 0;
             match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
                 Ok(pid) if pid > 0 => {
                     tracing::info!(%pid, %status, "container exited");
-                    if let Some(mut info) = self.containers.remove(&pid) {
-                        let cache =
-                            std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
-                        self.log_graveyard.insert(pid, cache);
-                        // Remove all pipe_map entries for this pid and close pipe fds.
-                        self.pipe_map.retain(|_id, &mut p| {
-                            if p == pid {
-                                // close will happen in close_all_pipes below
-                                false
+
+                    // Check if this pid belongs to an attach session.
+                    let session_id = self
+                        .attach_sessions
+                        .iter()
+                        .find_map(|(&id, s)| (s.child_pid == pid).then_some(id));
+
+                    if let Some(sid) = session_id {
+                        // Attached container.
+                        if let Some(session) = self.attach_sessions.get_mut(&sid) {
+                            session.child_exited = true;
+                            // Do NOT close output fds here — let the PTY_READ
+                            // handler drain remaining data and close on EOF.
+                            let exit_code = if libc::WIFEXITED(status) {
+                                libc::WEXITSTATUS(status)
+                            } else if libc::WIFSIGNALED(status) {
+                                128 + libc::WTERMSIG(status)
                             } else {
-                                true
+                                1
+                            };
+                            let payload =
+                                serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code }))
+                                    .unwrap();
+                            // Send ExitCode frame if no pending stream write.
+                            if !session.stream_write_pending {
+                                self.send_attach_frame(sid, 0x02, &payload);
+                            } else {
+                                // Stream write in-flight; defer. We store it.
+                                session.stream_wbuf.clear();
+                                session.stream_wbuf.push(0x02);
+                                session
+                                    .stream_wbuf
+                                    .extend_from_slice(&(payload.len() as u16).to_le_bytes());
+                                session.stream_wbuf.extend_from_slice(&payload);
+                                // Mark stream_write_pending so we send it after
+                                // current write.
                             }
-                        });
-                        info.gateway.close_all_pipes();
-                        if let Some(ref overlay) = info.overlay_dir
-                            && !info.save
-                        {
-                            crate::cleanup_overlay(overlay);
+                        }
+                        // Remove from container tracking but don't move to graveyard
+                        // (attach sessions don't use log subscription).
+                        if let Some(mut info) = self.containers.remove(&pid) {
+                            let cache = std::mem::replace(
+                                &mut info.gateway.cache,
+                                LogCache::new(LOG_CAPACITY),
+                            );
+                            self.log_graveyard.insert(pid, cache);
+                            if let Some(ref overlay) = info.overlay_dir
+                                && !info.save
+                            {
+                                crate::cleanup_overlay(overlay);
+                            }
+                        }
+                    } else {
+                        // Detached container — existing logic.
+                        if let Some(mut info) = self.containers.remove(&pid) {
+                            let cache = std::mem::replace(
+                                &mut info.gateway.cache,
+                                LogCache::new(LOG_CAPACITY),
+                            );
+                            self.log_graveyard.insert(pid, cache);
+                            self.pipe_map.retain(|_id, &mut p| p != pid);
+                            info.gateway.close_all_pipes();
+                            if let Some(ref overlay) = info.overlay_dir
+                                && !info.save
+                            {
+                                crate::cleanup_overlay(overlay);
+                            }
                         }
                     }
                 }
