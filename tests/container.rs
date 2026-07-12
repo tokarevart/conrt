@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
@@ -5,6 +6,8 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 /// Path where we expect the Alpine test rootfs to be.
 /// Override with `CONRT_TEST_ROOTFS` environment variable.
@@ -491,4 +494,98 @@ fn overlay_save_does_not_break() {
         container_stdout(&stdout).contains("save test ok"),
         "should read back written content, got: {stdout:?}"
     );
+}
+
+#[test]
+fn follow_two_clients_receive_all_output() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let socket = daemon.socket();
+    let socket_str = socket.to_str().unwrap().to_string();
+    let conrt = conrt_binary();
+
+    let (ok, stdout, _) = run_conrt(&daemon, &[
+        "run",
+        "--detach",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo alpha; echo beta; echo gamma; sleep 60",
+    ]);
+    assert!(ok, "run should succeed");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Give the container a moment to produce output.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut f1 = Command::new(&conrt)
+        .args([
+            "logs",
+            "--socket-path",
+            &socket_str,
+            "--follow",
+            &pid.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("follower 1 should start");
+    let mut f2 = Command::new(&conrt)
+        .args([
+            "logs",
+            "--socket-path",
+            &socket_str,
+            "--follow",
+            &pid.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("follower 2 should start");
+
+    // Give followers time to subscribe and receive backlog.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Kill the container — triggers close_all_pipes, followers see EOF.
+    let (ok, _, _) = run_conrt(&daemon, &["kill", &pid.to_string()]);
+    assert!(ok, "kill should succeed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    let out1 = wait_for_child(&mut f1, deadline);
+    let out2 = wait_for_child(&mut f2, deadline);
+
+    assert!(out1.contains("alpha"), "follower 1 should see alpha");
+    assert!(out1.contains("beta"), "follower 1 should see beta");
+    assert!(out1.contains("gamma"), "follower 1 should see gamma");
+    assert!(out2.contains("alpha"), "follower 2 should see alpha");
+    assert!(out2.contains("beta"), "follower 2 should see beta");
+    assert!(out2.contains("gamma"), "follower 2 should see gamma");
+}
+
+fn wait_for_child(child: &mut Child, deadline: Instant) -> String {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "follower should exit 0");
+                let mut output = String::new();
+                if let Some(ref mut stdout) = child.stdout {
+                    stdout.read_to_string(&mut output).unwrap();
+                }
+                return output;
+            }
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "follower did not finish within timeout"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("follower wait error: {e}"),
+        }
+    }
 }

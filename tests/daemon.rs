@@ -339,7 +339,7 @@ fn logs_returns_container_output() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io::RawFd> {
+fn follow_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io::RawFd> {
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     assert!(fd >= 0, "socket creation failed");
 
@@ -370,14 +370,14 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
     };
     assert_eq!(ret, 0, "bind failed: {}", std::io::Error::last_os_error());
 
-    let req = format!(r#"{{"type":"Logs","pid":{pid},"stream":true}}"#);
+    let req = format!(r#"{{"type":"Logs","pid":{pid},"follow":true}}"#);
     let socket_c = std::ffi::CString::new(socket.to_str().unwrap()).unwrap();
     let mut dest: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     dest.sun_family = libc::AF_UNIX as _;
     unsafe {
         std::ptr::copy_nonoverlapping(
             socket_c.as_ptr(),
-            dest.sun_path.as_mut_ptr() as *mut i8,
+            dest.sun_path.as_mut_ptr(),
             socket_c.as_bytes().len(),
         );
     }
@@ -396,7 +396,7 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
         "connect failed: {}",
         std::io::Error::last_os_error()
     );
-    eprintln!("subscribe: connected, sending request");
+    eprintln!("follow: connected, sending request");
     let ret = unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) };
     assert_eq!(
         ret,
@@ -404,7 +404,7 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
         "send failed: {}",
         std::io::Error::last_os_error()
     );
-    eprintln!("subscribe: sent, waiting for fd-pass");
+    eprintln!("follow: sent, waiting for fd-pass");
 
     #[repr(align(8))]
     #[derive(Default)]
@@ -427,14 +427,14 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
     let ret = unsafe { libc::recvmsg(fd, &mut msghdr, 0) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        eprintln!("subscribe: recvmsg err={err}");
+        eprintln!("follow: recvmsg err={err}");
         let _ = unsafe { libc::close(fd) };
         return None;
     }
-    eprintln!("subscribe: recvmsg ret={ret}");
+    eprintln!("follow: recvmsg ret={ret}");
     if ret > 0 {
         eprintln!(
-            "subscribe: payload={:?}",
+            "follow: payload={:?}",
             String::from_utf8_lossy(&data_buf[..ret as usize])
         );
     }
@@ -442,13 +442,13 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
     unsafe {
         let cmsg_hdr = cmsg_buf.bytes.as_ptr() as *const libc::cmsghdr;
         if (*cmsg_hdr).cmsg_len == 0 {
-            eprintln!("subscribe: no cmsg (plain datagram reply)");
+            eprintln!("follow: no cmsg (plain datagram reply)");
             let _ = libc::close(fd);
             return None;
         }
         if (*cmsg_hdr).cmsg_level != libc::SOL_SOCKET || (*cmsg_hdr).cmsg_type != libc::SCM_RIGHTS {
             eprintln!(
-                "subscribe: unexpected cmsg level={} type={}",
+                "follow: unexpected cmsg level={} type={}",
                 (*cmsg_hdr).cmsg_level,
                 (*cmsg_hdr).cmsg_type
             );
@@ -458,13 +458,13 @@ fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io
         let data_ptr = libc::CMSG_DATA(cmsg_hdr);
         let rcvd_fd = data_ptr.cast::<RawFd>().read();
         let _ = libc::close(fd);
-        eprintln!("subscribe: received fd={rcvd_fd}");
+        eprintln!("follow: received fd={rcvd_fd}");
         Some(rcvd_fd)
     }
 }
 
 #[test]
-fn subscribe_returns_container_output() {
+fn follow_returns_container_output() {
     let dir = test_dir();
     let socket = dir.join("conrt.sock");
     let daemon = Daemon::new(&socket);
@@ -487,7 +487,7 @@ fn subscribe_returns_container_output() {
     std::thread::sleep(Duration::from_millis(10));
 
     let pipe_fd =
-        subscribe_and_receive_fd(&socket, pid).expect("should receive pipe fd within timeout");
+        follow_and_receive_fd(&socket, pid).expect("should receive pipe fd within timeout");
 
     let mut pipe_reader = unsafe { std::fs::File::from_raw_fd(pipe_fd) };
 
@@ -524,20 +524,20 @@ fn subscribe_returns_container_output() {
 }
 
 #[test]
-fn subscribe_unknown_container_returns_error() {
+fn follow_unknown_container_returns_error() {
     let dir = test_dir();
     let socket = dir.join("conrt.sock");
     let daemon = Daemon::new(&socket);
 
-    let pipe_fd = subscribe_and_receive_fd(&socket, 99999);
-    assert!(pipe_fd.is_none(), "subscribe to unknown pid should fail");
+    let pipe_fd = follow_and_receive_fd(&socket, 99999);
+    assert!(pipe_fd.is_none(), "follow to unknown pid should fail");
 
     daemon.kill_and_wait();
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn subscribe_two_clients_same_container() {
+fn follow_two_clients_same_container() {
     let dir = test_dir();
     let socket = dir.join("conrt.sock");
     let daemon = Daemon::new(&socket);
@@ -558,9 +558,9 @@ fn subscribe_two_clients_same_container() {
     // Give the container a moment to produce output.
     std::thread::sleep(Duration::from_millis(10));
 
-    // Two concurrent subscribers.
-    let pipe1 = subscribe_and_receive_fd(&socket, pid).expect("sub1 should receive pipe fd");
-    let pipe2 = subscribe_and_receive_fd(&socket, pid).expect("sub2 should receive pipe fd");
+    // Two concurrent followers.
+    let pipe1 = follow_and_receive_fd(&socket, pid).expect("sub1 should receive pipe fd");
+    let pipe2 = follow_and_receive_fd(&socket, pid).expect("sub2 should receive pipe fd");
 
     let mut reader1 = unsafe { std::fs::File::from_raw_fd(pipe1) };
     let mut reader2 = unsafe { std::fs::File::from_raw_fd(pipe2) };

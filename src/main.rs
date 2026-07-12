@@ -6,9 +6,14 @@ mod sys;
 mod uring;
 
 use std::ffi::c_int;
+use std::fs::File;
 use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -73,6 +78,9 @@ enum Cli {
     Logs {
         /// Container ID
         id: String,
+        /// Follow (stream) log output
+        #[arg(long, short = 'f')]
+        follow: bool,
         /// Daemon socket path
         #[arg(long)]
         socket_path: Option<PathBuf>,
@@ -145,9 +153,11 @@ fn main() -> ExitCode {
                 })
             }
         }
-        Cli::Logs { id, socket_path } => {
-            show_logs(id, socket_path.unwrap_or_else(default_socket_path))
-        }
+        Cli::Logs {
+            id,
+            follow,
+            socket_path,
+        } => show_logs(id, follow, socket_path.unwrap_or_else(default_socket_path)),
         Cli::List { socket_path } => {
             list_containers(socket_path.unwrap_or_else(default_socket_path))
         }
@@ -675,7 +685,7 @@ fn setup_userns_maps(pid: libc::pid_t) -> io::Result<()> {
     Ok(())
 }
 
-fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
+fn show_logs(id: String, follow: bool, socket_path: PathBuf) -> ExitCode {
     let pid: i32 = match id.parse() {
         Ok(p) => p,
         Err(e) => {
@@ -684,26 +694,150 @@ fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
         }
     };
 
-    let request = daemon::Request::Logs { pid, stream: false };
-    let resp = match daemon::send_request(&socket_path, &request) {
-        Ok(r) => r,
+    if follow {
+        follow_logs(pid, &socket_path)
+    } else {
+        let request = daemon::Request::Logs { pid, follow: false };
+        let resp = match daemon::send_request(&socket_path, &request) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(%e, "cannot connect to daemon");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if let Ok(success) = serde_json::from_slice::<daemon::LogsResponse>(&resp) {
+            for line in &success.lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        } else if let Ok(err) = serde_json::from_slice::<daemon::ErrorResponse>(&resp) {
+            tracing::error!(error = %err.error, "logs failed");
+            ExitCode::FAILURE
+        } else {
+            tracing::error!("invalid daemon response");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn follow_logs(pid: i32, socket_path: &Path) -> ExitCode {
+    let fd = match create_datagram_socket(socket_path) {
+        Ok(fd) => fd,
         Err(e) => {
             tracing::error!(%e, "cannot connect to daemon");
             return ExitCode::FAILURE;
         }
     };
 
-    if let Ok(success) = serde_json::from_slice::<daemon::LogsResponse>(&resp) {
-        for line in &success.lines {
-            println!("{line}");
+    // Send follow request.
+    let req = serde_json::to_vec(&daemon::Request::Logs { pid, follow: true }).unwrap();
+    let ret = unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        tracing::error!(%e, "send failed");
+        let _ = unsafe { libc::close(fd) };
+        return ExitCode::FAILURE;
+    }
+
+    // Receive pipe fd via SCM_RIGHTS.
+    #[repr(align(8))]
+    #[derive(Default)]
+    struct CmsgBuffer {
+        bytes: [u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) as usize }],
+    }
+
+    let mut cmsg_buf = CmsgBuffer::default();
+    let mut data_buf = [0u8; 16];
+    let mut iov = libc::iovec {
+        iov_base: data_buf.as_mut_ptr() as *mut _,
+        iov_len: data_buf.len(),
+    };
+    let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    msghdr.msg_iov = &mut iov;
+    msghdr.msg_iovlen = 1;
+    msghdr.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut _;
+    msghdr.msg_controllen = cmsg_buf.bytes.len() as _;
+
+    let ret = unsafe { libc::recvmsg(fd, &mut msghdr, 0) };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        tracing::error!(%e, "recvmsg failed");
+        let _ = unsafe { libc::close(fd) };
+        return ExitCode::FAILURE;
+    }
+
+    let pipe_fd = unsafe {
+        let cmsg_hdr = cmsg_buf.bytes.as_ptr() as *const libc::cmsghdr;
+        if (*cmsg_hdr).cmsg_len == 0
+            || (*cmsg_hdr).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg_hdr).cmsg_type != libc::SCM_RIGHTS
+        {
+            tracing::error!("daemon did not send a pipe fd");
+            let _ = libc::close(fd);
+            return ExitCode::FAILURE;
         }
-        ExitCode::SUCCESS
-    } else if let Ok(err) = serde_json::from_slice::<daemon::ErrorResponse>(&resp) {
-        tracing::error!(error = %err.error, "logs failed");
-        ExitCode::FAILURE
-    } else {
-        tracing::error!("invalid daemon response");
-        ExitCode::FAILURE
+        let data_ptr = libc::CMSG_DATA(cmsg_hdr);
+        data_ptr.cast::<RawFd>().read()
+    };
+    let _ = unsafe { libc::close(fd) };
+
+    // Read from pipe until EOF, writing to stdout.
+    let mut pipe_reader = unsafe { File::from_raw_fd(pipe_fd) };
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe_reader.read(&mut buf) {
+            Ok(0) => break ExitCode::SUCCESS,
+            Ok(n) => {
+                let _ = std::io::stdout().write_all(&buf[..n]);
+            }
+            Err(e) => {
+                tracing::error!(%e, "pipe read error");
+                break ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+fn create_datagram_socket(socket_path: &Path) -> io::Result<RawFd> {
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as _;
+        let ret = libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sa_family_t>() as _,
+        );
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            let _ = libc::close(fd);
+            return Err(e);
+        }
+        let socket_c = std::ffi::CString::new(socket_path.to_str().unwrap()).unwrap();
+        let mut dest: libc::sockaddr_un = std::mem::zeroed();
+        dest.sun_family = libc::AF_UNIX as _;
+        std::ptr::copy_nonoverlapping(
+            socket_c.as_ptr(),
+            dest.sun_path.as_mut_ptr(),
+            socket_c.as_bytes().len(),
+        );
+        let addr_len =
+            std::mem::size_of::<libc::sa_family_t>() + socket_c.as_bytes_with_nul().len();
+        let ret = libc::connect(
+            fd,
+            &dest as *const _ as *const libc::sockaddr,
+            addr_len as _,
+        );
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            let _ = libc::close(fd);
+            return Err(e);
+        }
+        Ok(fd)
     }
 }
 

@@ -26,7 +26,7 @@ const RING_SIZE: u32 = 1024;
 // user_data flags
 const BACKLOG_WRITE: u64 = 1 << 63;
 const PIPE_WRITE: u64 = 1 << 62;
-const SUBSCRIBE_FD: u64 = 1 << 61;
+const FOLLOW_FD: u64 = 1 << 61;
 const ACCEPT: u64 = 1 << 60;
 const STREAM_READ: u64 = 1 << 59;
 const STREAM_WRITE: u64 = 1 << 58;
@@ -34,13 +34,13 @@ const PTY_READ: u64 = 1 << 57;
 const PTY_WRITE: u64 = 1 << 56;
 const SESSION_MASK: u64 = !(BACKLOG_WRITE
     | PIPE_WRITE
-    | SUBSCRIBE_FD
+    | FOLLOW_FD
     | ACCEPT
     | STREAM_READ
     | STREAM_WRITE
     | PTY_READ
     | PTY_WRITE);
-const PIPE_ID_MASK: u64 = !(BACKLOG_WRITE | PIPE_WRITE | SUBSCRIBE_FD);
+const PIPE_ID_MASK: u64 = !(BACKLOG_WRITE | PIPE_WRITE | FOLLOW_FD);
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -62,7 +62,7 @@ pub enum Request {
     Logs {
         pid: i32,
         #[serde(default)]
-        stream: bool,
+        follow: bool,
     },
 }
 
@@ -312,9 +312,9 @@ impl AsyncPipeWriter {
     }
 }
 
-// ── SubscribeResponse: one-shot fd-pass buffer ────────────────────────────
+// ── FollowResponse: one-shot fd-pass buffer ────────────────────────────
 
-struct SubscribeResponse {
+struct FollowResponse {
     pid: pid_t,
     pipe_writer: RawFd,
     pipe_reader: RawFd,
@@ -329,7 +329,7 @@ struct SubscribeResponse {
     dest_len: libc::socklen_t,
 }
 
-impl SubscribeResponse {
+impl FollowResponse {
     fn new(
         pid: pid_t,
         pipe_writer: RawFd,
@@ -512,9 +512,9 @@ pub struct Daemon {
     outputs: HashMap<u64, Output>,
     next_output_id: u64,
     log_graveyard: HashMap<pid_t, LogCache>,
-    subscribe_pend: HashMap<u64, Box<SubscribeResponse>>,
+    follow_pend: HashMap<u64, Box<FollowResponse>>,
     pipe_map: HashMap<u64, pid_t>,
-    next_sub_id: u64,
+    next_follow_id: u64,
     next_pipe_id: u64,
     attach_sessions: HashMap<u64, AttachSession>,
     next_session_id: u64,
@@ -550,9 +550,9 @@ impl Daemon {
             outputs: HashMap::new(),
             next_output_id: 2,
             log_graveyard: HashMap::new(),
-            subscribe_pend: HashMap::new(),
+            follow_pend: HashMap::new(),
             pipe_map: HashMap::new(),
-            next_sub_id: 0,
+            next_follow_id: 0,
             next_pipe_id: 0,
             attach_sessions: HashMap::new(),
             next_session_id: 0,
@@ -647,8 +647,8 @@ impl Daemon {
                 match user_data {
                     0 => self.handle_datagram_cqe(ret),
                     1 => self.handle_signal(ret),
-                    id if id & SUBSCRIBE_FD != 0 => {
-                        self.complete_subscribe_fd_pass(id & PIPE_ID_MASK, ret)
+                    id if id & FOLLOW_FD != 0 => {
+                        self.complete_follow_fd_pass(id & PIPE_ID_MASK, ret)
                     }
                     id if id & BACKLOG_WRITE != 0 => {
                         self.complete_backlog_write(id & PIPE_ID_MASK, ret)
@@ -749,9 +749,9 @@ impl Daemon {
                 }),
                 Request::List => self.handle_list(sender),
                 Request::Kill { pid } => self.handle_kill(sender, pid),
-                Request::Logs { pid, stream } => {
-                    if stream {
-                        self.handle_subscribe(sender, pid);
+                Request::Logs { pid, follow } => {
+                    if follow {
+                        self.handle_follow(sender, pid);
                     } else {
                         self.handle_logs(sender, pid);
                     }
@@ -1125,17 +1125,17 @@ impl Daemon {
         self.reply(&sender, &LogsResponse { lines });
     }
 
-    fn handle_subscribe(&mut self, sender: libc::sockaddr_un, pid: i32) {
+    fn handle_follow(&mut self, sender: libc::sockaddr_un, pid: i32) {
         let pid = pid as pid_t;
-        tracing::info!(%pid, "handle_subscribe");
+        tracing::info!(%pid, "handle_follow");
 
         // Lock cache and snapshot backlog (short-lived borrow on containers).
         let backlog_buf = match self.containers.get_mut(&pid) {
             Some(info) => {
                 info.gateway.lock_count += 1;
-                tracing::info!(%pid, bytes = %info.gateway.cache.bytes, "subscribe: about to snapshot");
+                tracing::info!(%pid, bytes = %info.gateway.cache.bytes, "follow: about to snapshot");
                 let buf = info.gateway.snapshot();
-                tracing::info!(%pid, backlog_len = %buf.len(), "subscribe backlog snapshot");
+                tracing::info!(%pid, backlog_len = %buf.len(), "follow backlog snapshot");
                 buf
             }
             None => {
@@ -1147,8 +1147,8 @@ impl Daemon {
             }
         };
 
-        let sub_id = self.next_sub_id;
-        self.next_sub_id += 1;
+        let follow_id = self.next_follow_id;
+        self.next_follow_id += 1;
 
         // Create pipe.
         let mut pipe_fds = sys::FdPair {
@@ -1156,7 +1156,7 @@ impl Daemon {
             write: -1,
         };
         if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            tracing::error!(%e, "subscribe pipe creation failed");
+            tracing::error!(%e, "follow pipe creation failed");
             // Undo the lock
             if let Some(info) = self.containers.get_mut(&pid) {
                 info.gateway.lock_count -= 1;
@@ -1168,7 +1168,7 @@ impl Daemon {
             return;
         }
 
-        let resp = Box::new(SubscribeResponse::new(
+        let resp = Box::new(FollowResponse::new(
             pid,
             pipe_fds.write,
             pipe_fds.read,
@@ -1181,20 +1181,20 @@ impl Daemon {
         // Submit backlog write.
         {
             let mut sq = self.ring.submission();
-            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | sub_id);
+            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | follow_id);
         }
 
         let is_backlog_empty = resp.backlog_buf.is_empty();
-        self.subscribe_pend.insert(sub_id, resp);
+        self.follow_pend.insert(follow_id, resp);
 
         if is_backlog_empty {
-            self.complete_backlog_write(sub_id, 0);
+            self.complete_backlog_write(follow_id, 0);
         }
     }
 
-    fn complete_backlog_write(&mut self, sub_id: u64, ret: i32) {
-        tracing::info!(%sub_id, %ret, "complete_backlog_write");
-        let mut resp = match self.subscribe_pend.remove(&sub_id) {
+    fn complete_backlog_write(&mut self, follow_id: u64, ret: i32) {
+        tracing::info!(%follow_id, %ret, "complete_backlog_write");
+        let mut resp = match self.follow_pend.remove(&follow_id) {
             Some(r) => r,
             None => return,
         };
@@ -1235,17 +1235,17 @@ impl Daemon {
         // Set up fd-pass buffer and submit SCM_RIGHTS.
         {
             let mut sq = self.ring.submission();
-            resp.push_fd_pass(&mut sq, SUBSCRIBE_FD | sub_id);
+            resp.push_fd_pass(&mut sq, FOLLOW_FD | follow_id);
         }
 
         // Keep resp alive — fd-pass is in-flight.
-        self.subscribe_pend.insert(sub_id, resp);
+        self.follow_pend.insert(follow_id, resp);
     }
 
-    fn complete_subscribe_fd_pass(&mut self, sub_id: u64, ret: i32) {
-        tracing::info!(%sub_id, %ret, "complete_subscribe_fd_pass");
-        if let Some(resp) = self.subscribe_pend.remove(&sub_id) {
-            tracing::info!(pid = %resp.pid, "subscribe fd-pass done, closing reader");
+    fn complete_follow_fd_pass(&mut self, follow_id: u64, ret: i32) {
+        tracing::info!(%follow_id, %ret, "complete_follow_fd_pass");
+        if let Some(resp) = self.follow_pend.remove(&follow_id) {
+            tracing::info!(pid = %resp.pid, "follow fd-pass done, closing reader");
             let _ = unsafe { libc::close(resp.pipe_reader) };
         }
     }
@@ -1895,13 +1895,14 @@ impl Daemon {
                             }
                         }
                         // Remove from container tracking but don't move to graveyard
-                        // (attach sessions don't use log subscription).
+                        // (attach sessions don't use log follow).
                         if let Some(mut info) = self.containers.remove(&pid) {
                             let cache = std::mem::replace(
                                 &mut info.gateway.cache,
                                 LogCache::new(LOG_CAPACITY),
                             );
                             self.log_graveyard.insert(pid, cache);
+                            info.gateway.close_all_pipes();
                             if let Some(ref overlay) = info.overlay_dir
                                 && !info.save
                             {
