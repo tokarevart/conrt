@@ -522,3 +522,81 @@ fn subscribe_returns_container_output() {
     daemon.kill_and_wait();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn subscribe_unknown_container_returns_error() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let pipe_fd = subscribe_and_receive_fd(&socket, 99999);
+    assert!(pipe_fd.is_none(), "subscribe to unknown pid should fail");
+
+    daemon.kill_and_wait();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn subscribe_two_clients_same_container() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo alpha; echo beta; sleep 10",
+    ]);
+    assert!(ok, "run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Give the container a moment to produce output.
+    std::thread::sleep(Duration::from_millis(10));
+
+    // Two concurrent subscribers.
+    let pipe1 = subscribe_and_receive_fd(&socket, pid).expect("sub1 should receive pipe fd");
+    let pipe2 = subscribe_and_receive_fd(&socket, pid).expect("sub2 should receive pipe fd");
+
+    let mut reader1 = unsafe { std::fs::File::from_raw_fd(pipe1) };
+    let mut reader2 = unsafe { std::fs::File::from_raw_fd(pipe2) };
+
+    // Kill container and give pipes time to drain.
+    let kill_req = format!(r#"{{"type":"Kill","pid":{pid}}}"#);
+    send_request(&socket, kill_req.as_bytes());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp = send_request(&socket, br#"{"type":"List"}"#);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        if v["containers"].as_array().unwrap().is_empty() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for container to die");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut out1 = String::new();
+    let mut out2 = String::new();
+    reader1.read_to_string(&mut out1).ok();
+    reader2.read_to_string(&mut out2).ok();
+
+    for (out, label) in [(&out1, "sub1"), (&out2, "sub2")] {
+        assert!(
+            out.contains("alpha"),
+            "{label} output should contain 'alpha', got: {out:?}"
+        );
+        assert!(
+            out.contains("beta"),
+            "{label} output should contain 'beta', got: {out:?}"
+        );
+    }
+
+    daemon.kill_and_wait();
+    std::fs::remove_dir_all(&dir).ok();
+}

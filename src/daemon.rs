@@ -150,7 +150,6 @@ struct LogCache {
     start: usize,
     end: usize,
     bytes: usize,
-    locked: bool,
 }
 
 impl LogCache {
@@ -161,7 +160,6 @@ impl LogCache {
             start: 0,
             end: 0,
             bytes: 0,
-            locked: false,
         }
     }
 
@@ -254,14 +252,16 @@ impl LogCache {
 // ── AsyncPipeWriter: io_uring-backed pipe writes ──────────────────────────
 
 struct AsyncPipeWriter {
+    id: u64,
     fd: RawFd,
     send_buf: Vec<u8>,
     in_flight: bool,
 }
 
 impl AsyncPipeWriter {
-    fn new(fd: RawFd) -> Self {
+    fn new(id: u64, fd: RawFd) -> Self {
         Self {
+            id,
             fd,
             send_buf: Vec::with_capacity(4097),
             in_flight: false,
@@ -300,6 +300,7 @@ impl AsyncPipeWriter {
 // ── SubscribeResponse: one-shot fd-pass buffer ────────────────────────────
 
 struct SubscribeResponse {
+    pid: pid_t,
     pipe_writer: RawFd,
     pipe_reader: RawFd,
     backlog_buf: Vec<u8>,
@@ -315,6 +316,7 @@ struct SubscribeResponse {
 
 impl SubscribeResponse {
     fn new(
+        pid: pid_t,
         pipe_writer: RawFd,
         pipe_reader: RawFd,
         backlog_buf: Vec<u8>,
@@ -323,6 +325,7 @@ impl SubscribeResponse {
         dest_len: libc::socklen_t,
     ) -> Self {
         Self {
+            pid,
             pipe_writer,
             pipe_reader,
             backlog_buf,
@@ -378,40 +381,42 @@ impl SubscribeResponse {
     }
 }
 
-// ── LogGateway: cache + optional async pipe writer ────────────────────────
+// ── LogGateway: cache + N async pipe writers ─────────────────────────────
 
 struct LogGateway {
     cache: LogCache,
-    pipe: Option<AsyncPipeWriter>,
+    pipes: Vec<AsyncPipeWriter>,
+    lock_count: usize,
 }
 
 impl LogGateway {
     fn new(cap: usize) -> Self {
         Self {
             cache: LogCache::new(cap),
-            pipe: None,
+            pipes: Vec::new(),
+            lock_count: 0,
         }
     }
 
-    fn write(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, line: &[u8], pipe_id: u64) {
+    fn write(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, line: &[u8]) {
         self.cache.push(line);
-        if let Some(p) = &mut self.pipe
-            && !p.in_flight
-        {
-            p.push_write(sq, line, pipe_id);
+        for p in &mut self.pipes {
+            if !p.in_flight {
+                p.push_write(sq, line, PIPE_WRITE | p.id);
+            }
         }
     }
 
-    fn complete_write(&mut self, ret: i32) -> bool {
-        if let Some(p) = &mut self.pipe {
-            let alive = p.complete(ret);
-            if !alive {
-                self.pipe = None;
-            }
-            alive
-        } else {
-            true
+    /// Returns `true` if the pipe was removed (dead).
+    fn complete_write(&mut self, pipe_id: u64, ret: i32) -> bool {
+        let Some(idx) = self.pipes.iter().position(|p| p.id == pipe_id) else {
+            return false;
+        };
+        let alive = self.pipes[idx].complete(ret);
+        if !alive {
+            self.pipes.swap_remove(idx);
         }
+        !alive
     }
 
     fn collect_lines(&self) -> Vec<String> {
@@ -420,6 +425,14 @@ impl LogGateway {
 
     fn snapshot(&self) -> Vec<u8> {
         self.cache.snapshot()
+    }
+
+    fn close_all_pipes(&mut self) {
+        for p in self.pipes.drain(..) {
+            if p.fd >= 0 {
+                let _ = unsafe { libc::close(p.fd) };
+            }
+        }
     }
 }
 
@@ -444,7 +457,10 @@ pub struct Daemon {
     outputs: HashMap<u64, Output>,
     next_output_id: u64,
     log_graveyard: HashMap<pid_t, LogCache>,
-    subscribe_pend: HashMap<pid_t, Box<SubscribeResponse>>,
+    subscribe_pend: HashMap<u64, Box<SubscribeResponse>>,
+    pipe_map: HashMap<u64, pid_t>,
+    next_sub_id: u64,
+    next_pipe_id: u64,
 
     // Datagram receive state
     recv_buf: Vec<u8>,
@@ -477,6 +493,9 @@ impl Daemon {
             next_output_id: 2,
             log_graveyard: HashMap::new(),
             subscribe_pend: HashMap::new(),
+            pipe_map: HashMap::new(),
+            next_sub_id: 0,
+            next_pipe_id: 0,
             recv_buf: vec![0u8; 65536],
             recv_addr: unsafe { std::mem::zeroed() },
             recv_addr_len: 0,
@@ -698,7 +717,7 @@ impl Daemon {
                     {
                         let mut sq = self.ring.submission();
                         if let Some(info) = self.containers.get_mut(&pid) {
-                            info.gateway.write(&mut sq, line, PIPE_WRITE | pid as u64);
+                            info.gateway.write(&mut sq, line);
                         } else if let Some(cache) = self.log_graveyard.get_mut(&pid) {
                             cache.push(line);
                         }
@@ -721,7 +740,7 @@ impl Daemon {
         if !self
             .containers
             .get(&pid)
-            .is_some_and(|c| c.gateway.cache.locked)
+            .is_some_and(|c| c.gateway.lock_count > 0)
         {
             let mut sq = self.ring.submission();
             let output = self.outputs.get_mut(&id).unwrap();
@@ -1023,8 +1042,16 @@ impl Daemon {
     fn handle_subscribe(&mut self, sender: libc::sockaddr_un, pid: i32) {
         let pid = pid as pid_t;
         tracing::info!(%pid, "handle_subscribe");
-        let gateway = match self.containers.get_mut(&pid) {
-            Some(info) => &mut info.gateway,
+
+        // Lock cache and snapshot backlog (short-lived borrow on containers).
+        let backlog_buf = match self.containers.get_mut(&pid) {
+            Some(info) => {
+                info.gateway.lock_count += 1;
+                tracing::info!(%pid, bytes = %info.gateway.cache.bytes, "subscribe: about to snapshot");
+                let buf = info.gateway.snapshot();
+                tracing::info!(%pid, backlog_len = %buf.len(), "subscribe backlog snapshot");
+                buf
+            }
             None => {
                 self.reply(&sender, &ErrorResponse {
                     ok: false,
@@ -1034,19 +1061,20 @@ impl Daemon {
             }
         };
 
-        // Close any pending subscribe for this pid (shouldn't happen, but be safe).
-        if let Some(old) = self.subscribe_pend.remove(&pid) {
-            let _ = unsafe { libc::close(old.pipe_writer) };
-            let _ = unsafe { libc::close(old.pipe_reader) };
-        }
+        let sub_id = self.next_sub_id;
+        self.next_sub_id += 1;
 
-        // Create pipe and snapshot backlog.
+        // Create pipe.
         let mut pipe_fds = sys::FdPair {
             read: -1,
             write: -1,
         };
         if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
             tracing::error!(%e, "subscribe pipe creation failed");
+            // Undo the lock
+            if let Some(info) = self.containers.get_mut(&pid) {
+                info.gateway.lock_count -= 1;
+            }
             self.reply(&sender, &ErrorResponse {
                 ok: false,
                 error: format!("pipe creation failed: {e}"),
@@ -1054,12 +1082,8 @@ impl Daemon {
             return;
         }
 
-        gateway.cache.locked = true;
-        tracing::info!(%pid, bytes = %gateway.cache.bytes, "subscribe: about to snapshot");
-        let backlog_buf = gateway.snapshot();
-        tracing::info!(%pid, backlog_len = %backlog_buf.len(), "subscribe backlog snapshot");
-
         let resp = Box::new(SubscribeResponse::new(
+            pid,
             pipe_fds.write,
             pipe_fds.read,
             backlog_buf,
@@ -1068,40 +1092,48 @@ impl Daemon {
             self.recv_addr_len,
         ));
 
-        // Submit backlog write to pipe first.
+        // Submit backlog write.
         {
             let mut sq = self.ring.submission();
-            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | pid as u64);
+            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | sub_id);
         }
 
         let is_backlog_empty = resp.backlog_buf.is_empty();
-
-        self.subscribe_pend.insert(pid, resp);
+        self.subscribe_pend.insert(sub_id, resp);
 
         if is_backlog_empty {
-            self.complete_backlog_write(pid as _, 0);
+            self.complete_backlog_write(sub_id, 0);
         }
     }
 
-    fn complete_backlog_write(&mut self, pid: u64, ret: i32) {
-        let pid = pid as pid_t;
-        tracing::info!(%pid, %ret, "complete_backlog_write");
-        let mut resp = match self.subscribe_pend.remove(&pid) {
+    fn complete_backlog_write(&mut self, sub_id: u64, ret: i32) {
+        tracing::info!(%sub_id, %ret, "complete_backlog_write");
+        let mut resp = match self.subscribe_pend.remove(&sub_id) {
             Some(r) => r,
             None => return,
         };
+        let pid = resp.pid;
 
         if ret < 0 {
             tracing::error!(%ret, "backlog write to pipe failed");
             let _ = unsafe { libc::close(resp.pipe_writer) };
             let _ = unsafe { libc::close(resp.pipe_reader) };
+            if let Some(info) = self.containers.get_mut(&pid) {
+                info.gateway.lock_count -= 1;
+            }
             return;
         }
 
-        // Backlog written. Set up pipe writer on the container's gateway.
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id += 1;
+
+        // Backlog written. Attach pipe writer to the container's gateway.
         if let Some(info) = self.containers.get_mut(&pid) {
-            info.gateway.pipe = Some(AsyncPipeWriter::new(resp.pipe_writer));
-            info.gateway.cache.locked = false;
+            info.gateway
+                .pipes
+                .push(AsyncPipeWriter::new(pipe_id, resp.pipe_writer));
+            self.pipe_map.insert(pipe_id, pid);
+            info.gateway.lock_count -= 1;
         }
         // Resubmit the output read for this pid (it was held during lock).
         let output_id = self
@@ -1117,26 +1149,31 @@ impl Daemon {
         // Set up fd-pass buffer and submit SCM_RIGHTS.
         {
             let mut sq = self.ring.submission();
-            resp.push_fd_pass(&mut sq, SUBSCRIBE_FD | pid as u64);
+            resp.push_fd_pass(&mut sq, SUBSCRIBE_FD | sub_id);
         }
 
         // Keep resp alive — fd-pass is in-flight.
-        self.subscribe_pend.insert(pid, resp);
+        self.subscribe_pend.insert(sub_id, resp);
     }
 
-    fn complete_subscribe_fd_pass(&mut self, pid: u64, ret: i32) {
-        let pid = pid as pid_t;
-        tracing::info!(%pid, %ret, "complete_subscribe_fd_pass");
-        if let Some(resp) = self.subscribe_pend.remove(&pid) {
-            tracing::info!(%pid, "subscribe fd-pass done, closing reader");
+    fn complete_subscribe_fd_pass(&mut self, sub_id: u64, ret: i32) {
+        tracing::info!(%sub_id, %ret, "complete_subscribe_fd_pass");
+        if let Some(resp) = self.subscribe_pend.remove(&sub_id) {
+            tracing::info!(pid = %resp.pid, "subscribe fd-pass done, closing reader");
             let _ = unsafe { libc::close(resp.pipe_reader) };
         }
     }
 
-    fn complete_pipe_write(&mut self, pid: u64, ret: i32) {
-        let pid = pid as pid_t;
-        if let Some(info) = self.containers.get_mut(&pid) {
-            info.gateway.complete_write(ret);
+    fn complete_pipe_write(&mut self, pipe_id: u64, ret: i32) {
+        let Some(&pid) = self.pipe_map.get(&pipe_id) else {
+            return;
+        };
+        let Some(info) = self.containers.get_mut(&pid) else {
+            self.pipe_map.remove(&pipe_id);
+            return;
+        };
+        if info.gateway.complete_write(pipe_id, ret) {
+            self.pipe_map.remove(&pipe_id);
         }
     }
 
@@ -1150,11 +1187,16 @@ impl Daemon {
                         let cache =
                             std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
                         self.log_graveyard.insert(pid, cache);
-                        if let Some(p) = info.gateway.pipe
-                            && p.fd >= 0
-                        {
-                            let _ = unsafe { libc::close(p.fd) };
-                        }
+                        // Remove all pipe_map entries for this pid and close pipe fds.
+                        self.pipe_map.retain(|_id, &mut p| {
+                            if p == pid {
+                                // close will happen in close_all_pipes below
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        info.gateway.close_all_pipes();
                         if let Some(ref overlay) = info.overlay_dir
                             && !info.save
                         {
@@ -1255,7 +1297,7 @@ mod tests {
     #[test]
     fn log_cache_starts_unlocked() {
         let c = LogCache::new(64);
-        assert!(!c.locked);
+        assert!(c.is_empty());
     }
 
     #[test]
@@ -1321,5 +1363,138 @@ mod tests {
         c.push(b"eeee");
         let lines = c.collect_lines();
         assert_eq!(lines, &["cccc", "dddd", "eeee"], "got {lines:?}");
+    }
+
+    // ── LogGateway unit tests ─────────────────────────────────────────────
+
+    fn make_pipe_pair() -> (RawFd, RawFd) {
+        let mut fds = sys::FdPair {
+            read: -1,
+            write: -1,
+        };
+        sys::pipe2(&mut fds, libc::O_CLOEXEC).unwrap();
+        (fds.read, fds.write)
+    }
+
+    #[test]
+    fn log_gateway_starts_empty() {
+        let g = LogGateway::new(64);
+        assert!(g.pipes.is_empty());
+        assert_eq!(g.lock_count, 0);
+    }
+
+    #[test]
+    fn log_gateway_attach_multiple_pipes() {
+        let mut g = LogGateway::new(64);
+        let (r1, w1) = make_pipe_pair();
+        let (r2, w2) = make_pipe_pair();
+        g.pipes.push(AsyncPipeWriter::new(1, w1));
+        g.pipes.push(AsyncPipeWriter::new(2, w2));
+        assert_eq!(g.pipes.len(), 2);
+        let _ = unsafe { libc::close(r1) };
+        let _ = unsafe { libc::close(r2) };
+    }
+
+    #[test]
+    fn log_gateway_complete_write_alive_pipe() {
+        let (r, w) = make_pipe_pair();
+        let mut g = LogGateway::new(64);
+        g.pipes.push(AsyncPipeWriter::new(1, w));
+        assert!(!g.complete_write(1, 5)); // 5 bytes written = success
+        assert_eq!(g.pipes.len(), 1); // still alive
+        assert!(!g.pipes[0].in_flight);
+        let _ = unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn log_gateway_complete_write_removes_dead_pipe() {
+        let (r, w) = make_pipe_pair();
+        // Close the read end so writing will fail, but for this test
+        // we simulate error by passing ret < 0.
+        let _ = unsafe { libc::close(r) };
+        let mut g = LogGateway::new(64);
+        g.pipes.push(AsyncPipeWriter::new(1, w));
+        // Simulate write error
+        assert!(g.complete_write(1, -1)); // true = removed
+        assert!(g.pipes.is_empty());
+        // w fd was closed by complete()
+    }
+
+    #[test]
+    fn log_gateway_complete_write_unknown_id_does_nothing() {
+        let mut g = LogGateway::new(64);
+        let (r, w) = make_pipe_pair();
+        g.pipes.push(AsyncPipeWriter::new(1, w));
+        assert!(!g.complete_write(999, 0)); // not found
+        assert_eq!(g.pipes.len(), 1);
+        let _ = unsafe { libc::close(r) };
+    }
+
+    #[test]
+    fn log_gateway_close_all_pipes() {
+        let mut g = LogGateway::new(64);
+        let (r1, w1) = make_pipe_pair();
+        let (r2, w2) = make_pipe_pair();
+        g.pipes.push(AsyncPipeWriter::new(1, w1));
+        g.pipes.push(AsyncPipeWriter::new(2, w2));
+        g.close_all_pipes();
+        assert!(g.pipes.is_empty());
+        let _ = unsafe { libc::close(r1) };
+        let _ = unsafe { libc::close(r2) };
+    }
+
+    #[test]
+    fn log_gateway_lock_count_blocks_check() {
+        let mut g = LogGateway::new(64);
+        assert_eq!(g.lock_count, 0);
+        g.lock_count += 1;
+        assert!(g.lock_count > 0);
+        g.lock_count -= 1;
+        assert_eq!(g.lock_count, 0);
+    }
+
+    #[test]
+    fn log_gateway_write_goes_to_all_pipes() {
+        use io_uring::IoUring;
+        let (r1, w1) = make_pipe_pair();
+        let (r2, w2) = make_pipe_pair();
+        let mut g = LogGateway::new(4096);
+
+        let mut ring = IoUring::new(8).unwrap();
+        let mut sq = ring.submission();
+
+        g.pipes.push(AsyncPipeWriter::new(1, w1));
+        g.pipes.push(AsyncPipeWriter::new(2, w2));
+        g.write(&mut sq, b"hello");
+        assert_eq!(g.cache.snapshot(), b"hello\n");
+        // Both pipes should have an SQE in-flight
+        assert!(g.pipes[0].in_flight);
+        assert!(g.pipes[1].in_flight);
+        let _ = unsafe { libc::close(r1) };
+        let _ = unsafe { libc::close(r2) };
+    }
+
+    #[test]
+    fn log_gateway_write_skips_in_flight_pipe() {
+        use io_uring::IoUring;
+        let (r1, w1) = make_pipe_pair();
+        let (r2, w2) = make_pipe_pair();
+        let mut g = LogGateway::new(4096);
+
+        let mut ring = IoUring::new(8).unwrap();
+        let mut sq = ring.submission();
+
+        g.pipes.push(AsyncPipeWriter::new(1, w1));
+        g.pipes.push(AsyncPipeWriter::new(2, w2));
+        // Mark pipe 1 as in_flight
+        g.pipes[0].in_flight = true;
+        g.write(&mut sq, b"world");
+        assert_eq!(g.cache.snapshot(), b"world\n");
+        // Pipe 1 stays in_flight and didn't get a new SQE (its state unchanged)
+        assert!(g.pipes[0].in_flight);
+        // Pipe 2 got the write
+        assert!(g.pipes[1].in_flight);
+        let _ = unsafe { libc::close(r1) };
+        let _ = unsafe { libc::close(r2) };
     }
 }
