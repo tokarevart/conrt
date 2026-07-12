@@ -339,9 +339,6 @@ fn logs_returns_container_output() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ---------------------------------------
-/// THERE MUST BE BUG HERE IN THIS FUNCITON
-/// ---------------------------------------
 fn subscribe_and_receive_fd(socket: &Path, pid: i32) -> Option<std::os::unix::io::RawFd> {
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     assert!(fd >= 0, "socket creation failed");
