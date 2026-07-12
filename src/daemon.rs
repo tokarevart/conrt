@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -7,7 +9,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use bbqueue::nicknames::Churrasco;
 use io_uring::IoUring;
 use libc::pid_t;
 use serde::Deserialize;
@@ -18,8 +19,15 @@ use crate::interprocess;
 use crate::sys;
 use crate::uring;
 
-const LOG_CAPACITY: usize = 65536;
+const CACHE_CAPACITY: usize = 65536;
+const LOG_CAPACITY: usize = CACHE_CAPACITY;
 const RING_SIZE: u32 = 1024;
+
+// user_data flags
+const BACKLOG_WRITE: u64 = 1 << 63;
+const PIPE_WRITE: u64 = 1 << 62;
+const SUBSCRIBE_FD: u64 = 1 << 61;
+const PIPE_ID_MASK: u64 = !(BACKLOG_WRITE | PIPE_WRITE | SUBSCRIBE_FD);
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -40,6 +48,8 @@ pub enum Request {
     },
     Logs {
         pid: i32,
+        #[serde(default)]
+        stream: bool,
     },
 }
 
@@ -132,6 +142,287 @@ enum RecvPhase {
     Consume,
 }
 
+// ── LogCache: single-buffer ring of \n-delimited lines ─────────────────────
+
+struct LogCache {
+    buf: Vec<u8>,
+    cap: usize,
+    start: usize,
+    end: usize,
+    bytes: usize,
+    locked: bool,
+}
+
+impl LogCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: vec![0u8; cap],
+            cap,
+            start: 0,
+            end: 0,
+            bytes: 0,
+            locked: false,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    fn push(&mut self, line: &[u8]) {
+        let need = line.len() + 1;
+        loop {
+            let avail = self.cap - self.bytes;
+            if avail >= need {
+                break;
+            }
+            let mut i = self.start;
+            loop {
+                if self.buf[i] == b'\n' {
+                    let line_bytes = if i >= self.start {
+                        i - self.start + 1
+                    } else {
+                        (self.cap - self.start) + i + 1
+                    };
+                    self.start = (self.start + line_bytes) % self.cap;
+                    self.bytes -= line_bytes;
+                    break;
+                }
+                i = (i + 1) % self.cap;
+            }
+        }
+        for &b in line.iter().chain(std::iter::once(&b'\n')) {
+            self.buf[self.end] = b;
+            self.end = (self.end + 1) % self.cap;
+        }
+        self.bytes += need;
+    }
+
+    /// Copy all cached lines as `line\n` chunks into a fresh Vec.
+    fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bytes);
+        if self.bytes == 0 {
+            return out;
+        }
+        if self.end > self.start {
+            out.extend_from_slice(&self.buf[self.start..self.end]);
+        } else {
+            out.extend_from_slice(&self.buf[self.start..]);
+            out.extend_from_slice(&self.buf[..self.end]);
+        }
+        out
+    }
+
+    /// Non-destructive collect into String lines.
+    fn collect_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.bytes == 0 {
+            return lines;
+        }
+        let mut pos = self.start;
+        let mut remaining = self.bytes;
+        let mut i = self.start;
+        loop {
+            if remaining == 0 {
+                break;
+            }
+            if self.buf[i] == b'\n' {
+                let consumed = if i >= pos {
+                    lines.push(String::from_utf8_lossy(&self.buf[pos..i]).into_owned());
+                    i - pos + 1
+                } else {
+                    let mut v = Vec::with_capacity((self.cap - pos) + i);
+                    v.extend_from_slice(&self.buf[pos..]);
+                    v.extend_from_slice(&self.buf[..i]);
+                    lines.push(String::from_utf8_lossy(&v).into_owned());
+                    (self.cap - pos) + i + 1
+                };
+                remaining -= consumed;
+                pos = (i + 1) % self.cap;
+                i = pos;
+                if remaining == 0 {
+                    break;
+                }
+                continue;
+            }
+            i = (i + 1) % self.cap;
+        }
+        lines
+    }
+}
+
+// ── AsyncPipeWriter: io_uring-backed pipe writes ──────────────────────────
+
+struct AsyncPipeWriter {
+    fd: RawFd,
+    send_buf: Vec<u8>,
+    in_flight: bool,
+}
+
+impl AsyncPipeWriter {
+    fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            send_buf: Vec::with_capacity(4097),
+            in_flight: false,
+        }
+    }
+
+    fn push_write(
+        &mut self,
+        sq: &mut io_uring::squeue::SubmissionQueue,
+        line: &[u8],
+        user_data: u64,
+    ) {
+        if self.in_flight {
+            return;
+        }
+        self.send_buf.clear();
+        self.send_buf.extend_from_slice(line);
+        self.send_buf.push(b'\n');
+        uring::push_write(sq, self.fd, &self.send_buf, user_data);
+        self.in_flight = true;
+    }
+
+    /// Returns `true` if the pipe is still alive.
+    fn complete(&mut self, ret: i32) -> bool {
+        self.in_flight = false;
+        if ret < 0 {
+            let _ = unsafe { libc::close(self.fd) };
+            self.fd = -1;
+            false
+        } else {
+            true
+        }
+    }
+}
+
+// ── SubscribeResponse: one-shot fd-pass buffer ────────────────────────────
+
+struct SubscribeResponse {
+    pipe_writer: RawFd,
+    pipe_reader: RawFd,
+    backlog_buf: Vec<u8>,
+
+    // fd-pass state (set up lazily after backlog write completes)
+    cmsg_buf: Vec<u8>,
+    iov: libc::iovec,
+    msghdr: Box<libc::msghdr>,
+    datagram_fd: RawFd,
+    dest: libc::sockaddr_un,
+    dest_len: libc::socklen_t,
+}
+
+impl SubscribeResponse {
+    fn new(
+        pipe_writer: RawFd,
+        pipe_reader: RawFd,
+        backlog_buf: Vec<u8>,
+        datagram_fd: RawFd,
+        dest: libc::sockaddr_un,
+        dest_len: libc::socklen_t,
+    ) -> Self {
+        Self {
+            pipe_writer,
+            pipe_reader,
+            backlog_buf,
+            cmsg_buf: Vec::new(),
+            iov: unsafe { std::mem::zeroed() },
+            msghdr: Box::new(unsafe { std::mem::zeroed() }),
+            datagram_fd,
+            dest,
+            dest_len,
+        }
+    }
+
+    /// Submit the backlog write SQE — caller calls this first.
+    fn push_backlog_write(&self, sq: &mut io_uring::squeue::SubmissionQueue, user_data: u64) {
+        if !self.backlog_buf.is_empty() {
+            uring::push_write(sq, self.pipe_writer, &self.backlog_buf, user_data);
+        }
+    }
+
+    /// After backlog CQE, set up and submit the fd-pass SCM_RIGHTS sendmsg.
+    fn push_fd_pass(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, user_data: u64) {
+        // Build cmsg: cmsghdr + SCM_RIGHTS with pipe_reader fd.
+        let cmsg_hdr_sz = std::mem::size_of::<libc::cmsghdr>();
+        let fd_size = std::mem::size_of::<RawFd>();
+        let cmsg_align = std::mem::align_of::<libc::cmsghdr>();
+        let cmsg_len_val = cmsg_hdr_sz + fd_size;
+        let cmsg_space = (cmsg_len_val + cmsg_align - 1) & !(cmsg_align - 1);
+        self.cmsg_buf = vec![0u8; cmsg_space];
+        let hdr = self.cmsg_buf.as_mut_ptr() as *mut libc::cmsghdr;
+        unsafe {
+            (*hdr).cmsg_len = cmsg_len_val;
+            (*hdr).cmsg_level = libc::SOL_SOCKET;
+            (*hdr).cmsg_type = libc::SCM_RIGHTS;
+            // Data starts right after the header (offset sizeof(cmsghdr)).
+            let data = self.cmsg_buf.as_mut_ptr().add(cmsg_hdr_sz) as *mut RawFd;
+            std::ptr::write(data, self.pipe_reader);
+        }
+
+        self.iov = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        *self.msghdr = libc::msghdr {
+            msg_name: &self.dest as *const _ as *mut _,
+            msg_namelen: self.dest_len,
+            msg_iov: &self.iov as *const _ as *mut _,
+            msg_iovlen: 1,
+            msg_control: self.cmsg_buf.as_mut_ptr() as *mut _,
+            msg_controllen: cmsg_space,
+            msg_flags: 0,
+        };
+        uring::push_sendmsg(sq, self.datagram_fd, &*self.msghdr, user_data);
+    }
+}
+
+// ── LogGateway: cache + optional async pipe writer ────────────────────────
+
+struct LogGateway {
+    cache: LogCache,
+    pipe: Option<AsyncPipeWriter>,
+}
+
+impl LogGateway {
+    fn new(cap: usize) -> Self {
+        Self {
+            cache: LogCache::new(cap),
+            pipe: None,
+        }
+    }
+
+    fn write(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, line: &[u8], pipe_id: u64) {
+        self.cache.push(line);
+        if let Some(p) = &mut self.pipe
+            && !p.in_flight
+        {
+            p.push_write(sq, line, pipe_id);
+        }
+    }
+
+    fn complete_write(&mut self, ret: i32) -> bool {
+        if let Some(p) = &mut self.pipe {
+            let alive = p.complete(ret);
+            if !alive {
+                self.pipe = None;
+            }
+            alive
+        } else {
+            true
+        }
+    }
+
+    fn collect_lines(&self) -> Vec<String> {
+        self.cache.collect_lines()
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.cache.snapshot()
+    }
+}
+
 // ── Container State ───────────────────────────────────────────────────────
 
 struct ContainerInfo {
@@ -140,7 +431,7 @@ struct ContainerInfo {
     overlay_dir: Option<PathBuf>,
     save: bool,
     start_time: SystemTime,
-    bbq: Churrasco<LOG_CAPACITY>,
+    gateway: LogGateway,
 }
 
 pub struct Daemon {
@@ -152,7 +443,8 @@ pub struct Daemon {
     containers: HashMap<pid_t, ContainerInfo>,
     outputs: HashMap<u64, Output>,
     next_output_id: u64,
-    log_graveyard: HashMap<pid_t, Churrasco<LOG_CAPACITY>>,
+    log_graveyard: HashMap<pid_t, LogCache>,
+    subscribe_pend: HashMap<pid_t, Box<SubscribeResponse>>,
 
     // Datagram receive state
     recv_buf: Vec<u8>,
@@ -184,6 +476,7 @@ impl Daemon {
             outputs: HashMap::new(),
             next_output_id: 2,
             log_graveyard: HashMap::new(),
+            subscribe_pend: HashMap::new(),
             recv_buf: vec![0u8; 65536],
             recv_addr: unsafe { std::mem::zeroed() },
             recv_addr_len: 0,
@@ -202,16 +495,16 @@ impl Daemon {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        // Self-referential pointers: init AFTER self is at its final location.
+        // Self-referential pointers: init AFTER self is at its final location. ??
         self.recv_addr = unsafe { std::mem::zeroed() };
         self.recv_iov = libc::iovec {
             iov_base: self.recv_buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: self.recv_buf.len(),
         };
         self.recv_msghdr = libc::msghdr {
-            msg_name: &mut self.recv_addr as *mut _ as *mut _,
+            msg_name: &raw mut self.recv_addr as *mut _,
             msg_namelen: size_of::<libc::sockaddr_un>() as _,
-            msg_iov: &self.recv_iov as *const _ as *mut _,
+            msg_iov: &raw mut self.recv_iov as *mut _,
             msg_iovlen: 1,
             msg_control: std::ptr::null_mut(),
             msg_controllen: 0,
@@ -238,7 +531,7 @@ impl Daemon {
             uring::push_recvmsg(
                 &mut sq,
                 self.datagram_fd,
-                &mut self.recv_msghdr as *mut _,
+                &raw mut self.recv_msghdr,
                 (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
                 0,
             );
@@ -258,6 +551,13 @@ impl Daemon {
                 match user_data {
                     0 => self.handle_datagram_cqe(ret),
                     1 => self.handle_signal(ret),
+                    id if id & SUBSCRIBE_FD != 0 => {
+                        self.complete_subscribe_fd_pass(id & PIPE_ID_MASK, ret)
+                    }
+                    id if id & BACKLOG_WRITE != 0 => {
+                        self.complete_backlog_write(id & PIPE_ID_MASK, ret)
+                    }
+                    id if id & PIPE_WRITE != 0 => self.complete_pipe_write(id & PIPE_ID_MASK, ret),
                     id => self.handle_output(id, ret),
                 }
             }
@@ -281,13 +581,7 @@ impl Daemon {
     fn submit_datagram_consume(&mut self) {
         self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
         let mut sq = self.ring.submission();
-        uring::push_recvmsg(
-            &mut sq,
-            self.datagram_fd,
-            &mut self.recv_msghdr as *mut _,
-            0,
-            0,
-        );
+        uring::push_recvmsg(&mut sq, self.datagram_fd, &raw mut self.recv_msghdr, 0, 0);
     }
 
     fn handle_datagram_cqe(&mut self, ret: i32) {
@@ -305,6 +599,9 @@ impl Daemon {
             self.recv_buf.resize(size, 0);
             self.recv_iov.iov_base = self.recv_buf.as_mut_ptr() as *mut libc::c_void;
             self.recv_iov.iov_len = size;
+            self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
+            // Re-link the updated iovec pointer to msghdr before giving it to the kernel
+            self.recv_msghdr.msg_iov = &raw mut self.recv_iov as *mut _;
         }
         self.recv_phase = RecvPhase::Consume;
         self.submit_datagram_consume();
@@ -347,7 +644,13 @@ impl Daemon {
                 }),
                 Request::List => self.handle_list(sender),
                 Request::Kill { pid } => self.handle_kill(sender, pid),
-                Request::Logs { pid } => self.handle_logs(sender, pid),
+                Request::Logs { pid, stream } => {
+                    if stream {
+                        self.handle_subscribe(sender, pid);
+                    } else {
+                        self.handle_logs(sender, pid);
+                    }
+                }
             }
         }
         self.submit_datagram_peek();
@@ -375,7 +678,7 @@ impl Daemon {
             return;
         }
         let n = result as usize;
-        let _pid = match self.outputs.get(&id) {
+        let pid = match self.outputs.get(&id) {
             Some(o) => o.pid,
             None => return,
         };
@@ -385,7 +688,6 @@ impl Daemon {
                 Some(o) => o,
                 None => return,
             };
-
             output.line_buf.extend_from_slice(&output.read_buf[..n]);
 
             let mut start = 0usize;
@@ -393,20 +695,12 @@ impl Daemon {
             for i in 0..total {
                 if output.line_buf[i] == b'\n' {
                     let line = &output.line_buf[start..i];
-                    let line_len = line.len() + 1;
-                    if let Some(info) = self.containers.get_mut(&output.pid) {
-                        let prod = info.bbq.stream_producer();
-                        if let Ok(mut wgr) = prod.grant_exact(line_len) {
-                            wgr[..line.len()].copy_from_slice(line);
-                            wgr[line.len()] = b'\n';
-                            wgr.commit(line_len);
-                        }
-                    } else if let Some(bbq) = self.log_graveyard.get_mut(&output.pid) {
-                        let prod = bbq.stream_producer();
-                        if let Ok(mut wgr) = prod.grant_exact(line_len) {
-                            wgr[..line.len()].copy_from_slice(line);
-                            wgr[line.len()] = b'\n';
-                            wgr.commit(line_len);
+                    {
+                        let mut sq = self.ring.submission();
+                        if let Some(info) = self.containers.get_mut(&pid) {
+                            info.gateway.write(&mut sq, line, PIPE_WRITE | pid as u64);
+                        } else if let Some(cache) = self.log_graveyard.get_mut(&pid) {
+                            cache.push(line);
                         }
                     }
                     start = i + 1;
@@ -418,12 +712,16 @@ impl Daemon {
             } else {
                 output.line_buf.clear();
             }
-        }
+        };
 
         let fd = match self.outputs.get(&id) {
             Some(o) => o.fd,
             None => return,
         };
+        if !self
+            .containers
+            .get(&pid)
+            .is_some_and(|c| c.gateway.cache.locked)
         {
             let mut sq = self.ring.submission();
             let output = self.outputs.get_mut(&id).unwrap();
@@ -647,7 +945,7 @@ impl Daemon {
                     overlay_dir,
                     save: args.save,
                     start_time: SystemTime::now(),
-                    bbq: Churrasco::new(),
+                    gateway: LogGateway::new(LOG_CAPACITY),
                 });
 
                 tracing::info!(%pid, "container started");
@@ -707,11 +1005,10 @@ impl Daemon {
 
     fn handle_logs(&mut self, sender: libc::sockaddr_un, pid: i32) {
         let pid = pid as pid_t;
-        let _in_containers = self.containers.contains_key(&pid);
-        let initial = if let Some(info) = self.containers.get_mut(&pid) {
-            drain_bbq(&info.bbq)
-        } else if let Some(bbq) = self.log_graveyard.get_mut(&pid) {
-            drain_bbq(bbq)
+        let lines = if let Some(info) = self.containers.get_mut(&pid) {
+            info.gateway.collect_lines()
+        } else if let Some(cache) = self.log_graveyard.get_mut(&pid) {
+            cache.collect_lines()
         } else {
             self.reply(&sender, &ErrorResponse {
                 ok: false,
@@ -720,7 +1017,127 @@ impl Daemon {
             return;
         };
 
-        self.reply(&sender, &LogsResponse { lines: initial });
+        self.reply(&sender, &LogsResponse { lines });
+    }
+
+    fn handle_subscribe(&mut self, sender: libc::sockaddr_un, pid: i32) {
+        let pid = pid as pid_t;
+        tracing::info!(%pid, "handle_subscribe");
+        let gateway = match self.containers.get_mut(&pid) {
+            Some(info) => &mut info.gateway,
+            None => {
+                self.reply(&sender, &ErrorResponse {
+                    ok: false,
+                    error: format!("container {pid} not found"),
+                });
+                return;
+            }
+        };
+
+        // Close any pending subscribe for this pid (shouldn't happen, but be safe).
+        if let Some(old) = self.subscribe_pend.remove(&pid) {
+            let _ = unsafe { libc::close(old.pipe_writer) };
+            let _ = unsafe { libc::close(old.pipe_reader) };
+        }
+
+        // Create pipe and snapshot backlog.
+        let mut pipe_fds = sys::FdPair {
+            read: -1,
+            write: -1,
+        };
+        if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+            tracing::error!(%e, "subscribe pipe creation failed");
+            self.reply(&sender, &ErrorResponse {
+                ok: false,
+                error: format!("pipe creation failed: {e}"),
+            });
+            return;
+        }
+
+        gateway.cache.locked = true;
+        tracing::info!(%pid, bytes = %gateway.cache.bytes, "subscribe: about to snapshot");
+        let backlog_buf = gateway.snapshot();
+        tracing::info!(%pid, backlog_len = %backlog_buf.len(), "subscribe backlog snapshot");
+
+        let resp = Box::new(SubscribeResponse::new(
+            pipe_fds.write,
+            pipe_fds.read,
+            backlog_buf,
+            self.datagram_fd,
+            sender,
+            self.recv_addr_len,
+        ));
+
+        // Submit backlog write to pipe first.
+        {
+            let mut sq = self.ring.submission();
+            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | pid as u64);
+        }
+
+        let is_backlog_empty = resp.backlog_buf.is_empty();
+
+        self.subscribe_pend.insert(pid, resp);
+
+        if is_backlog_empty {
+            self.complete_backlog_write(pid as _, 0);
+        }
+    }
+
+    fn complete_backlog_write(&mut self, pid: u64, ret: i32) {
+        let pid = pid as pid_t;
+        tracing::info!(%pid, %ret, "complete_backlog_write");
+        let mut resp = match self.subscribe_pend.remove(&pid) {
+            Some(r) => r,
+            None => return,
+        };
+
+        if ret < 0 {
+            tracing::error!(%ret, "backlog write to pipe failed");
+            let _ = unsafe { libc::close(resp.pipe_writer) };
+            let _ = unsafe { libc::close(resp.pipe_reader) };
+            return;
+        }
+
+        // Backlog written. Set up pipe writer on the container's gateway.
+        if let Some(info) = self.containers.get_mut(&pid) {
+            info.gateway.pipe = Some(AsyncPipeWriter::new(resp.pipe_writer));
+            info.gateway.cache.locked = false;
+        }
+        // Resubmit the output read for this pid (it was held during lock).
+        let output_id = self
+            .outputs
+            .iter()
+            .find_map(|(&id, o)| (o.pid == pid).then_some(id));
+        if let Some(id) = output_id {
+            let mut sq = self.ring.submission();
+            let output = self.outputs.get_mut(&id).unwrap();
+            uring::push_read(&mut sq, output.fd, &mut output.read_buf, id);
+        }
+
+        // Set up fd-pass buffer and submit SCM_RIGHTS.
+        {
+            let mut sq = self.ring.submission();
+            resp.push_fd_pass(&mut sq, SUBSCRIBE_FD | pid as u64);
+        }
+
+        // Keep resp alive — fd-pass is in-flight.
+        self.subscribe_pend.insert(pid, resp);
+    }
+
+    fn complete_subscribe_fd_pass(&mut self, pid: u64, ret: i32) {
+        let pid = pid as pid_t;
+        tracing::info!(%pid, %ret, "complete_subscribe_fd_pass");
+        if let Some(resp) = self.subscribe_pend.remove(&pid) {
+            tracing::info!(%pid, "subscribe fd-pass done, closing reader");
+            let _ = unsafe { libc::close(resp.pipe_reader) };
+        }
+    }
+
+    fn complete_pipe_write(&mut self, pid: u64, ret: i32) {
+        let pid = pid as pid_t;
+        if let Some(info) = self.containers.get_mut(&pid) {
+            info.gateway.complete_write(ret);
+        }
     }
 
     fn reap_children(&mut self) {
@@ -730,8 +1147,14 @@ impl Daemon {
                 Ok(pid) if pid > 0 => {
                     tracing::info!(%pid, %status, "container exited");
                     if let Some(mut info) = self.containers.remove(&pid) {
-                        let bbq = std::mem::replace(&mut info.bbq, Churrasco::new());
-                        self.log_graveyard.insert(pid, bbq);
+                        let cache =
+                            std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
+                        self.log_graveyard.insert(pid, cache);
+                        if let Some(p) = info.gateway.pipe
+                            && p.fd >= 0
+                        {
+                            let _ = unsafe { libc::close(p.fd) };
+                        }
                         if let Some(ref overlay) = info.overlay_dir
                             && !info.save
                         {
@@ -786,22 +1209,6 @@ fn setup_sigchld_fd() -> io::Result<RawFd> {
     Ok(fd)
 }
 
-fn drain_bbq(bbq: &Churrasco<LOG_CAPACITY>) -> Vec<String> {
-    let cons = bbq.stream_consumer();
-    let mut lines = Vec::new();
-    while let Ok(grant) = cons.read() {
-        let s = std::str::from_utf8(&grant).unwrap_or_default();
-        let len = grant.len();
-        for part in s.split('\n') {
-            if !part.is_empty() {
-                lines.push(part.to_string());
-            }
-        }
-        grant.release(len);
-    }
-    lines
-}
-
 pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>> {
     let datagram = UnixDatagram::unbound()?;
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -837,4 +1244,82 @@ pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>
     let mut buf = vec![0u8; n as usize];
     datagram.recv(&mut buf)?;
     Ok(buf)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_cache_starts_unlocked() {
+        let c = LogCache::new(64);
+        assert!(!c.locked);
+    }
+
+    #[test]
+    fn log_cache_push_and_snapshot() {
+        let mut c = LogCache::new(4096);
+        c.push(b"hello");
+        c.push(b"world");
+        let snap = c.snapshot();
+        assert_eq!(snap, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn log_cache_collect_lines_non_destructive() {
+        let mut c = LogCache::new(4096);
+        c.push(b"foo");
+        c.push(b"bar");
+        let lines = c.collect_lines();
+        assert_eq!(lines, &["foo", "bar"]);
+        // Snapshot after collect_lines should still have everything.
+        let snap = c.snapshot();
+        assert_eq!(snap, b"foo\nbar\n");
+    }
+
+    #[test]
+    fn log_cache_empty() {
+        let c = LogCache::new(64);
+        assert!(c.snapshot().is_empty());
+        assert!(c.collect_lines().is_empty());
+    }
+
+    #[test]
+    fn log_cache_evicts_oldest_when_full() {
+        let mut c = LogCache::new(16);
+        // 4 pushes of 5 bytes each = 20 bytes total → 1st evicted.
+        c.push(b"aaaa"); // 5 bytes
+        c.push(b"bbbb"); // 5 bytes, total 10
+        c.push(b"cccc"); // 5 bytes, total 15 (1 byte free)
+        c.push(b"dddd"); // 5 bytes, need 5, avail 1 → evict "aaaa\n" → write "dddd\n"
+        let raw = c.snapshot();
+        let snap = String::from_utf8_lossy(&raw);
+        assert!(
+            !snap.contains("aaaa"),
+            "oldest line should be evicted: {snap:?}"
+        );
+        assert!(snap.contains("bbbb"), "bbbb should survive: {snap:?}");
+        assert!(snap.contains("cccc"), "cccc should survive: {snap:?}");
+        assert!(snap.contains("dddd"), "dddd should survive: {snap:?}");
+    }
+
+    #[test]
+    fn log_cache_wraparound() {
+        let mut c = LogCache::new(16);
+        // Fill buffer with wraparound: evict older lines to make room.
+        c.push(b"aaaa"); // bytes=5, end=5
+        c.push(b"bbbb"); // bytes=10, end=10
+        c.push(b"cccc"); // bytes=15, end=15, avail=1
+        // This push evicts "aaaa\n" → bytes=10, start=5, then writes "dddd\n" wrapping
+        // end to 4.
+        c.push(b"dddd");
+        let lines = c.collect_lines();
+        assert_eq!(lines, &["bbbb", "cccc", "dddd"], "got {lines:?}");
+        // One more push evicts "bbbb\n"
+        c.push(b"eeee");
+        let lines = c.collect_lines();
+        assert_eq!(lines, &["cccc", "dddd", "eeee"], "got {lines:?}");
+    }
 }

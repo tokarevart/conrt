@@ -664,7 +664,7 @@ fn show_logs(id: String, socket_path: PathBuf) -> ExitCode {
         }
     };
 
-    let request = daemon::Request::Logs { pid };
+    let request = daemon::Request::Logs { pid, stream: false };
     let resp = match daemon::send_request(&socket_path, &request) {
         Ok(r) => r,
         Err(e) => {
