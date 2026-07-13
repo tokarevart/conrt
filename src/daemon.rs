@@ -849,6 +849,11 @@ impl Daemon {
         }
     }
 
+    /// Run a container in detached mode. All container lifecycle phases run
+    /// asynchronously via the daemon's io_uring event loop — stdout/stderr
+    /// are captured from a pipe, and the caller receives a `RunResponse`
+    /// datagram back. The container PID is returned to the caller for later
+    /// `logs`, `follow`, and `kill` operations.
     fn handle_run(&mut self, sender: libc::sockaddr_un, args: RunArgs) {
         let output_id = self.next_output_id;
         self.next_output_id += 1;
@@ -864,32 +869,11 @@ impl Daemon {
             let _ = send_datagram_raw(datagram_fd, &sender, sender_len, &resp);
         };
 
-        let rootfs = match args.rootfs {
-            Some(p) => match Path::new(&p).canonicalize() {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    err(&format!("invalid rootfs path: {e}"));
-                    return;
-                }
-            },
-            None => None,
-        };
-
-        let overlay_dir = match rootfs {
-            Some(_) => match crate::create_overlay_tempdir() {
-                Ok(dir) => Some(dir),
-                Err(e) => {
-                    err(&format!("cannot create overlay tempdir: {e}"));
-                    return;
-                }
-            },
-            None => None,
-        };
-
-        let signal = match interprocess::OneshotSignal::new() {
-            Ok(s) => s,
+        let save = args.save;
+        let prep = match prepare_run(args) {
+            Ok(p) => p,
             Err(e) => {
-                err(&format!("sync pipe creation failed: {e}"));
+                err(&e);
                 return;
             }
         };
@@ -903,60 +887,7 @@ impl Daemon {
             return;
         }
 
-        let command_c = args.command;
-
-        let (clone_flags, needs_userns_maps) = match args.net_pid {
-            Some(pid) => {
-                let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        sys::close(pipe_fds.read);
-                        sys::close(pipe_fds.write);
-                        err(&format!("cannot open pid {pid} user ns: {e}"));
-                        return;
-                    }
-                };
-                let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        sys::close(pipe_fds.read);
-                        sys::close(pipe_fds.write);
-                        err(&format!("cannot open pid {pid} net ns: {e}"));
-                        return;
-                    }
-                };
-                if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
-                    sys::close(pipe_fds.read);
-                    sys::close(pipe_fds.write);
-                    err(&format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"));
-                    return;
-                }
-                if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
-                    sys::close(pipe_fds.read);
-                    sys::close(pipe_fds.write);
-                    err(&format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"));
-                    return;
-                }
-                (
-                    libc::CLONE_NEWPID
-                        | libc::CLONE_NEWNS
-                        | libc::CLONE_NEWUTS
-                        | libc::CLONE_NEWIPC,
-                    false,
-                )
-            }
-            None => (
-                libc::CLONE_NEWPID
-                    | libc::CLONE_NEWNS
-                    | libc::CLONE_NEWUTS
-                    | libc::CLONE_NEWIPC
-                    | libc::CLONE_NEWUSER
-                    | libc::CLONE_NEWNET,
-                true,
-            ),
-        };
-
-        let clone_result = crate::clone3_container(clone_flags);
+        let clone_result = crate::clone3_container(prep.clone_flags);
         match clone_result {
             Err(e) => {
                 sys::close(pipe_fds.read);
@@ -964,52 +895,28 @@ impl Daemon {
                 err(&format!("clone3 failed: {e}"));
             }
             Ok(None) => {
-                // ── CHILD ──
                 sys::close(pipe_fds.read);
                 let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
                 let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
                 if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
                     sys::close(pipe_fds.write);
                 }
+                let devnull = CString::from("/dev/null");
+                let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
+                if fd < 0 {
+                    tracing::error!("cannot open /dev/null");
+                    std::process::exit(1);
+                }
+                let _ = sys::dup2(fd, libc::STDIN_FILENO);
+                sys::close(fd);
 
-                if let Err(e) = signal.wait() {
+                if let Err(e) = prep.signal.wait() {
                     tracing::error!(%e, "sync wait failed");
                     std::process::exit(1);
                 }
-
-                if let Err(e) = sys::bring_up_lo() {
-                    tracing::warn!(%e, "bring_up_lo failed");
-                }
-
-                if let Err(e) = sys::sethostname("conrt") {
-                    tracing::error!(%e, "sethostname failed");
-                }
-
-                if let Some(ref rootfs_path) = rootfs {
-                    let overlay =
-                        overlay_dir.expect("overlay_dir is always created when rootfs is provided");
-
-                    let container_root = match crate::setup_overlay_rootfs(rootfs_path, &overlay) {
-                        Ok(merged) => merged,
-                        Err(e) => {
-                            tracing::error!(%e, "overlay setup failed");
-                            std::process::exit(1);
-                        }
-                    };
-
-                    if let Err(e) = crate::setup_container_root(&container_root) {
-                        tracing::error!(%e, "container root setup failed");
-                        std::process::exit(1);
-                    }
-                }
-
-                let argv = sys::Argv::new(command_c);
-                let errno = crate::execvp(argv.as_slice());
-                tracing::error!(%errno, "execvp failed");
-                std::process::exit(1)
+                child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
             }
             Ok(Some(pid)) => {
-                // ── PARENT ──
                 sys::close(pipe_fds.write);
 
                 let output = Output {
@@ -1026,20 +933,16 @@ impl Daemon {
                     uring::push_read(&mut sq, pipe_fds.read, &mut output.read_buf, output_id);
                 }
 
-                let maps_result = if needs_userns_maps {
-                    crate::setup_userns_maps(pid)
-                } else {
-                    Ok(())
-                };
-                signal.signal();
-
-                if let Err(e) = maps_result {
+                if let Err(e) =
+                    parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal)
+                {
                     self.cleanup_output(output_id);
                     err(&format!("container aborted: {e}"));
                     return;
                 }
 
-                let cmd_str = command_c
+                let cmd_str = prep
+                    .command
                     .iter()
                     .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
                     .collect::<Vec<_>>()
@@ -1047,8 +950,8 @@ impl Daemon {
                 self.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
-                    overlay_dir,
-                    save: args.save,
+                    overlay_dir: prep.overlay_dir,
+                    save,
                     start_time: SystemTime::now(),
                     gateway: LogGateway::new(LOG_CAPACITY),
                 });
@@ -1430,6 +1333,12 @@ impl Daemon {
         }
     }
 
+    /// Run a container with an interactive stream session. If `tty` or
+    /// `interactive` is set, a PTY is allocated and child I/O flows through
+    /// it; otherwise stdout/stderr go through a pipe (same as detached) and
+    /// stdin is wired to `/dev/null`. The result is sent as a framed
+    /// `RunResponse` on the Unix stream, and the session stays open for
+    /// bidirectional data/EOF/WinSize frames until the child exits.
     fn handle_run_attach(&mut self, session_id: u64, args: RunArgs) {
         let Some(session) = self.attach_sessions.get(&session_id) else {
             return;
@@ -1437,48 +1346,25 @@ impl Daemon {
         let stream_fd = session.stream_fd;
 
         let mut err = |msg: &str| {
-            // Send error RunResponse frame, then close.
             let payload = serde_json::to_vec(&ErrorResponse {
                 ok: false,
                 error: msg.to_string(),
             })
             .unwrap();
             let mut frame = Vec::with_capacity(3 + payload.len());
-            frame.push(0x01); // RunResponse type
+            frame.push(0x01);
             frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
             frame.extend_from_slice(&payload);
             let _ = sys::write(stream_fd, &frame);
             self.close_attach_session(session_id);
         };
 
-        let rootfs = match args.rootfs {
-            Some(p) => match Path::new(&p).canonicalize() {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    err(&format!("invalid rootfs path: {e}"));
-                    return;
-                }
-            },
-            None => None,
-        };
-
-        let overlay_dir = match rootfs {
-            Some(_) => match crate::create_overlay_tempdir() {
-                Ok(dir) => Some(dir),
-                Err(e) => {
-                    err(&format!("cannot create overlay tempdir: {e}"));
-                    return;
-                }
-            },
-            None => None,
-        };
-
         let use_pty = args.tty || args.interactive;
-
-        let signal = match interprocess::OneshotSignal::new() {
-            Ok(s) => s,
+        let save = args.save;
+        let prep = match prepare_run(args) {
+            Ok(p) => p,
             Err(e) => {
-                err(&format!("sync pipe creation failed: {e}"));
+                err(&e);
                 return;
             }
         };
@@ -1495,50 +1381,6 @@ impl Daemon {
             (None, None)
         };
 
-        let (clone_flags, needs_userns_maps) = match args.net_pid {
-            Some(pid) => {
-                let user_f = match std::fs::File::open(format!("/proc/{pid}/ns/user")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        err(&format!("cannot open pid {pid} user ns: {e}"));
-                        return;
-                    }
-                };
-                let net_f = match std::fs::File::open(format!("/proc/{pid}/ns/net")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        err(&format!("cannot open pid {pid} net ns: {e}"));
-                        return;
-                    }
-                };
-                if let Err(e) = sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER) {
-                    err(&format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"));
-                    return;
-                }
-                if let Err(e) = sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET) {
-                    err(&format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"));
-                    return;
-                }
-                (
-                    libc::CLONE_NEWPID
-                        | libc::CLONE_NEWNS
-                        | libc::CLONE_NEWUTS
-                        | libc::CLONE_NEWIPC,
-                    false,
-                )
-            }
-            None => (
-                libc::CLONE_NEWPID
-                    | libc::CLONE_NEWNS
-                    | libc::CLONE_NEWUTS
-                    | libc::CLONE_NEWIPC
-                    | libc::CLONE_NEWUSER
-                    | libc::CLONE_NEWNET,
-                true,
-            ),
-        };
-
-        // Create a pipe for stdout/stderr when not using PTY.
         let mut pipe_fds = sys::FdPair {
             read: -1,
             write: -1,
@@ -1548,7 +1390,7 @@ impl Daemon {
             return;
         }
 
-        let clone_result = crate::clone3_container(clone_flags);
+        let clone_result = crate::clone3_container(prep.clone_flags);
         match clone_result {
             Err(e) => {
                 if pipe_fds.read >= 0 {
@@ -1560,7 +1402,6 @@ impl Daemon {
                 err(&format!("clone3 failed: {e}"));
             }
             Ok(None) => {
-                // ── CHILD ──
                 drop(master);
                 if use_pty {
                     if let Some(slave) = slave.take()
@@ -1570,7 +1411,6 @@ impl Daemon {
                         std::process::exit(1);
                     }
                 } else {
-                    // No PTY: redirect stdout/stderr to the pipe, /dev/null for stdin.
                     sys::close(pipe_fds.read);
                     let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
                     let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
@@ -1589,54 +1429,18 @@ impl Daemon {
                     sys::close(fd);
                 }
 
-                if let Err(e) = signal.wait() {
+                if let Err(e) = prep.signal.wait() {
                     tracing::error!(%e, "sync wait failed");
                     std::process::exit(1);
                 }
-
-                if let Err(e) = sys::bring_up_lo() {
-                    tracing::warn!(%e, "bring_up_lo failed");
-                }
-
-                if let Err(e) = sys::sethostname("conrt") {
-                    tracing::error!(%e, "sethostname failed");
-                }
-
-                if let Some(ref rootfs_path) = rootfs {
-                    let overlay =
-                        overlay_dir.expect("overlay_dir is always created when rootfs is provided");
-
-                    let container_root = match crate::setup_overlay_rootfs(rootfs_path, &overlay) {
-                        Ok(merged) => merged,
-                        Err(e) => {
-                            tracing::error!(%e, "overlay setup failed");
-                            std::process::exit(1);
-                        }
-                    };
-
-                    if let Err(e) = crate::setup_container_root(&container_root) {
-                        tracing::error!(%e, "container root setup failed");
-                        std::process::exit(1);
-                    }
-                }
-
-                let argv = sys::Argv::new(args.command);
-                let errno = crate::execvp(argv.as_slice());
-                tracing::error!(%errno, "execvp failed");
-                std::process::exit(1)
+                child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
             }
             Ok(Some(pid)) => {
-                // ── PARENT ──
                 drop(slave);
 
-                let maps_result = if needs_userns_maps {
-                    crate::setup_userns_maps(pid)
-                } else {
-                    Ok(())
-                };
-                signal.signal();
-
-                if let Err(e) = maps_result {
+                if let Err(e) =
+                    parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal)
+                {
                     err(&format!("container aborted: {e}"));
                     return;
                 }
@@ -1646,40 +1450,35 @@ impl Daemon {
                     std::mem::forget(m);
                     fd
                 });
-                // master is leaked so the fd stays open.
 
-                // Close pipe write end in parent; keep read end (or PTY master).
                 if pipe_fds.write >= 0 {
                     sys::close(pipe_fds.write);
                 }
 
-                let cmd_str = args
+                let cmd_str = prep
                     .command
                     .iter()
                     .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                // Update session with child info.
                 if let Some(session) = self.attach_sessions.get_mut(&session_id) {
                     session.child_pid = pid;
                     session.ptm_fd = ptm_fd;
                     session.log_read_fd = pipe_fds.read;
                 }
 
-                // Register as a container for log capture.
                 self.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
-                    overlay_dir,
-                    save: args.save,
+                    overlay_dir: prep.overlay_dir,
+                    save,
                     start_time: SystemTime::now(),
                     gateway: LogGateway::new(LOG_CAPACITY),
                 });
 
                 tracing::info!(%pid, %session_id, "attach container started");
 
-                // Send RunResponse frame.
                 let payload = serde_json::to_vec(&RunResponse {
                     ok: true,
                     pid: Some(pid),
@@ -1688,8 +1487,6 @@ impl Daemon {
                 .unwrap();
                 self.send_attach_frame(session_id, 0x01, &payload);
 
-                // Submit STREAM_READ header. PTY_READ is submitted lazily
-                // by handle_stream_write after the 0x01 STREAM_WRITE completes.
                 self.submit_stream_read_header(session_id);
             }
         }
@@ -2009,6 +1806,137 @@ pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>
     let mut buf = vec![0u8; n as usize];
     datagram.recv(&mut buf)?;
     Ok(buf)
+}
+
+struct PreparedResources {
+    rootfs: Option<PathBuf>,
+    overlay_dir: Option<PathBuf>,
+    signal: interprocess::OneshotSignal,
+    clone_flags: libc::c_int,
+    needs_userns_maps: bool,
+    command: Vec<CString>,
+}
+
+/// Resolve all container resources needed before `clone3`: canonicalize
+/// rootfs, create overlay tempdir, allocate the interprocess OneshotSignal,
+/// join the target netns if `net_pid` is set, and compute `clone_flags`.
+/// Cleanup of acquired resources (overlay dir, signal) is the caller's
+/// responsibility on error.
+fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
+    let rootfs = match args.rootfs {
+        Some(p) => match Path::new(&p).canonicalize() {
+            Ok(path) => Some(path),
+            Err(e) => return Err(format!("invalid rootfs path: {e}")),
+        },
+        None => None,
+    };
+
+    let overlay_dir = match rootfs {
+        Some(_) => match crate::create_overlay_tempdir() {
+            Ok(dir) => Some(dir),
+            Err(e) => return Err(format!("cannot create overlay tempdir: {e}")),
+        },
+        None => None,
+    };
+
+    let signal = match interprocess::OneshotSignal::new() {
+        Ok(s) => s,
+        Err(e) => return Err(format!("sync pipe creation failed: {e}")),
+    };
+
+    let (clone_flags, needs_userns_maps) = match args.net_pid {
+        Some(pid) => {
+            let user_f = std::fs::File::open(format!("/proc/{pid}/ns/user"))
+                .map_err(|e| format!("cannot open pid {pid} user ns: {e}"))?;
+            let net_f = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("cannot open pid {pid} net ns: {e}"))?;
+            sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER)
+                .map_err(|e| format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"))?;
+            sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET)
+                .map_err(|e| format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"))?;
+            (
+                libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC,
+                false,
+            )
+        }
+        None => (
+            libc::CLONE_NEWPID
+                | libc::CLONE_NEWNS
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNET,
+            true,
+        ),
+    };
+
+    Ok(PreparedResources {
+        rootfs,
+        overlay_dir,
+        signal,
+        clone_flags,
+        needs_userns_maps,
+        command: args.command,
+    })
+}
+
+/// Write uid/gid maps into the child's user namespace (if needed), then
+/// signal the child to proceed. The child is stopped after `clone3` and
+/// blocked on `signal.wait()` — this function unblocks it only after maps
+/// are confirmed written, preventing the child from running with
+/// unconfigured namespaces.
+fn parent_setup_maps_and_signal(
+    pid: pid_t,
+    needs_userns_maps: bool,
+    signal: interprocess::OneshotSignal,
+) -> Result<(), String> {
+    if needs_userns_maps {
+        crate::setup_userns_maps(pid).map_err(|e| format!("uid_map write failed: {e}"))?;
+    }
+    signal.signal();
+    Ok(())
+}
+
+/// Called in the child process after `clone3`. Brings up loopback, sets
+/// hostname, mounts overlay rootfs and pivot_root, then `execvp` into
+/// the workload. Never returns — either execs successfully or calls
+/// `process::exit(1)`.
+fn child_init_environment(
+    rootfs: &Option<PathBuf>,
+    overlay_dir: &Option<PathBuf>,
+    command: Vec<CString>,
+) -> ! {
+    if let Err(e) = sys::bring_up_lo() {
+        tracing::warn!(%e, "bring_up_lo failed");
+    }
+
+    if let Err(e) = sys::sethostname("conrt") {
+        tracing::error!(%e, "sethostname failed");
+    }
+
+    if let Some(rootfs_path) = rootfs {
+        let overlay = overlay_dir
+            .as_ref()
+            .expect("overlay_dir is always created when rootfs is provided");
+
+        let container_root = match crate::setup_overlay_rootfs(rootfs_path, overlay) {
+            Ok(merged) => merged,
+            Err(e) => {
+                tracing::error!(%e, "overlay setup failed");
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = crate::setup_container_root(&container_root) {
+            tracing::error!(%e, "container root setup failed");
+            std::process::exit(1);
+        }
+    }
+
+    let argv = sys::Argv::new(command);
+    let errno = crate::execvp(argv.as_slice());
+    tracing::error!(%errno, "execvp failed");
+    std::process::exit(1)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
