@@ -1030,15 +1030,15 @@ impl Daemon {
 
     fn handle_follow(&mut self, sender: libc::sockaddr_un, pid: i32) {
         let pid = pid as pid_t;
-        tracing::info!(%pid, "handle_follow");
+        tracing::debug!(%pid, "handle_follow");
 
         // Lock cache and snapshot backlog (short-lived borrow on containers).
         let backlog_buf = match self.containers.get_mut(&pid) {
             Some(info) => {
                 info.gateway.lock_count += 1;
-                tracing::info!(%pid, bytes = %info.gateway.cache.bytes, "follow: about to snapshot");
+                tracing::debug!(%pid, bytes = %info.gateway.cache.bytes, "follow: about to snapshot");
                 let buf = info.gateway.snapshot();
-                tracing::info!(%pid, backlog_len = %buf.len(), "follow backlog snapshot");
+                tracing::debug!(%pid, backlog_len = %buf.len(), "follow backlog snapshot");
                 buf
             }
             None => {
@@ -1096,7 +1096,7 @@ impl Daemon {
     }
 
     fn complete_backlog_write(&mut self, follow_id: u64, ret: i32) {
-        tracing::info!(%follow_id, %ret, "complete_backlog_write");
+        tracing::debug!(%follow_id, %ret, "complete_backlog_write");
         let mut resp = match self.follow_pend.remove(&follow_id) {
             Some(r) => r,
             None => return,
@@ -1146,9 +1146,9 @@ impl Daemon {
     }
 
     fn complete_follow_fd_pass(&mut self, follow_id: u64, ret: i32) {
-        tracing::info!(%follow_id, %ret, "complete_follow_fd_pass");
+        tracing::debug!(%follow_id, %ret, "complete_follow_fd_pass");
         if let Some(resp) = self.follow_pend.remove(&follow_id) {
-            tracing::info!(pid = %resp.pid, "follow fd-pass done, closing reader");
+            tracing::debug!(pid = %resp.pid, "follow fd-pass done, closing reader");
             let _ = unsafe { libc::close(resp.pipe_reader) };
         }
     }
@@ -1179,7 +1179,7 @@ impl Daemon {
         let stream_fd = ret;
         let session_id = self.next_session_id;
         self.next_session_id += 1;
-        tracing::info!(%session_id, %stream_fd, "attach session accepted");
+        tracing::debug!(%session_id, %stream_fd, "attach session accepted");
         self.attach_sessions
             .insert(session_id, AttachSession::new(stream_fd));
         // Read first header.
@@ -1208,8 +1208,11 @@ impl Daemon {
         };
 
         if ret <= 0 {
-            // Client disconnected or error.
-            tracing::info!(%session_id, %ret, "stream read EOF/error, closing session");
+            if ret < 0 {
+                tracing::error!(%session_id, %ret, "stream read error, closing session");
+            } else {
+                tracing::info!(%session_id, "stream read EOF, closing session");
+            }
             self.close_attach_session(session_id);
             return;
         }
@@ -1558,7 +1561,11 @@ impl Daemon {
             let Some(session) = self.attach_sessions.get_mut(&session_id) else {
                 return;
             };
-            tracing::info!(%session_id, %ret, "PTY/pipe read EOF/error");
+            if ret < 0 {
+                tracing::error!(%session_id, %ret, "PTY/pipe read error");
+            } else {
+                tracing::info!(%session_id, "PTY/pipe read EOF");
+            }
             if session.ptm_fd >= 0 {
                 sys::close(session.ptm_fd);
                 session.ptm_fd = -1;

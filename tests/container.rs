@@ -567,6 +567,98 @@ fn follow_two_clients_receive_all_output() {
     assert!(out2.contains("gamma"), "follower 2 should see gamma");
 }
 
+#[test]
+fn detached_stdin_is_devnull_cat_exits_immediately() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+
+    // `cat` reads from stdin until EOF. With stdin wired to /dev/null
+    // (our fix), cat gets EOF immediately and exits with status 0.
+    let (ok, stdout, stderr) = run_conrt(&daemon, &[
+        "run", "--detach", "--rootfs", &rootfs, "--", "/bin/cat",
+    ]);
+    assert!(ok, "detached run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Poll `list` until the container disappears (it exited, reaped).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, list_out, _) = run_conrt(&daemon, &["list"]);
+        if !list_out.contains(&pid.to_string()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "container {pid} (cat) did not exit within timeout"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Logs should succeed (container is in graveyard).
+    let (ok, _, _) = run_conrt(&daemon, &["logs", &pid.to_string()]);
+    assert!(ok, "logs should succeed after container exits");
+
+    // Best-effort kill in case it's still alive.
+    let _ = run_conrt(&daemon, &["kill", &pid.to_string()]);
+}
+
+#[test]
+fn detached_shell_loop_produces_all_output() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+
+    // This is the pattern the user reported: a shell loop that echoes output
+    // periodically. Without the /dev/null stdin fix, commands that check stdin
+    // could fail. More importantly, this validates that a long-lived detached
+    // container runs to completion and all output is captured.
+    let (ok, stdout, stderr) = run_conrt(&daemon, &[
+        "run",
+        "--detach",
+        "--rootfs",
+        &rootfs,
+        "--",
+        "/bin/sh",
+        "-c",
+        "for i in 1 2 3; do echo line_$i; done",
+    ]);
+    assert!(ok, "detached run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Poll until the container exits (loop finishes near-instantly).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, list_out, _) = run_conrt(&daemon, &["list"]);
+        if !list_out.contains(&pid.to_string()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "container {pid} (shell loop) did not finish within timeout"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // All output lines must be captured in the log graveyard.
+    let (ok, logs_stdout, _) = run_conrt(&daemon, &["logs", &pid.to_string()]);
+    assert!(ok, "logs should succeed for exited container");
+    assert!(
+        logs_stdout.contains("line_1"),
+        "logs should contain line_1, got: {logs_stdout:?}"
+    );
+    assert!(
+        logs_stdout.contains("line_2"),
+        "logs should contain line_2, got: {logs_stdout:?}"
+    );
+    assert!(
+        logs_stdout.contains("line_3"),
+        "logs should contain line_3, got: {logs_stdout:?}"
+    );
+}
+
 fn wait_for_child(child: &mut Child, deadline: Instant) -> String {
     loop {
         match child.try_wait() {
