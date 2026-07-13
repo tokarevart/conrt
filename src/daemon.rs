@@ -161,7 +161,6 @@ enum RecvPhase {
 
 struct LogCache {
     buf: Vec<u8>,
-    cap: usize,
     start: usize,
     end: usize,
     bytes: usize,
@@ -171,7 +170,6 @@ impl LogCache {
     fn new(cap: usize) -> Self {
         Self {
             buf: vec![0u8; cap],
-            cap,
             start: 0,
             end: 0,
             bytes: 0,
@@ -185,7 +183,7 @@ impl LogCache {
     fn push(&mut self, line: &[u8]) {
         let need = line.len() + 1;
         loop {
-            let avail = self.cap - self.bytes;
+            let avail = self.buf.len() - self.bytes;
             if avail >= need {
                 break;
             }
@@ -195,18 +193,18 @@ impl LogCache {
                     let line_bytes = if i >= self.start {
                         i - self.start + 1
                     } else {
-                        (self.cap - self.start) + i + 1
+                        (self.buf.len() - self.start) + i + 1
                     };
-                    self.start = (self.start + line_bytes) % self.cap;
+                    self.start = (self.start + line_bytes) % self.buf.len();
                     self.bytes -= line_bytes;
                     break;
                 }
-                i = (i + 1) % self.cap;
+                i = (i + 1) % self.buf.len();
             }
         }
         for &b in line.iter().chain(std::iter::once(&b'\n')) {
             self.buf[self.end] = b;
-            self.end = (self.end + 1) % self.cap;
+            self.end = (self.end + 1) % self.buf.len();
         }
         self.bytes += need;
     }
@@ -244,21 +242,21 @@ impl LogCache {
                     lines.push(String::from_utf8_lossy(&self.buf[pos..i]).into_owned());
                     i - pos + 1
                 } else {
-                    let mut v = Vec::with_capacity((self.cap - pos) + i);
+                    let mut v = Vec::with_capacity((self.buf.len() - pos) + i);
                     v.extend_from_slice(&self.buf[pos..]);
                     v.extend_from_slice(&self.buf[..i]);
                     lines.push(String::from_utf8_lossy(&v).into_owned());
-                    (self.cap - pos) + i + 1
+                    (self.buf.len() - pos) + i + 1
                 };
                 remaining -= consumed;
-                pos = (i + 1) % self.cap;
+                pos = (i + 1) % self.buf.len();
                 i = pos;
                 if remaining == 0 {
                     break;
                 }
                 continue;
             }
-            i = (i + 1) % self.cap;
+            i = (i + 1) % self.buf.len();
         }
         lines
     }
