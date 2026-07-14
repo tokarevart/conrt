@@ -2,10 +2,12 @@
 #![feature(unix_send_signal)]
 
 use std::io::Read;
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ChildExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -598,5 +600,290 @@ fn follow_two_clients_same_container() {
     }
 
     daemon.kill_and_wait();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Stream helpers for attach tests ──────────────────────────────────────
+
+fn stream_path(socket: &Path) -> PathBuf {
+    let mut s = socket.to_str().unwrap().to_string();
+    s.push_str(".stream");
+    PathBuf::from(s)
+}
+
+fn send_stream_frame(stream: &mut UnixStream, ty: u8, payload: &[u8]) {
+    let mut hdr = [0u8; 3];
+    hdr[0] = ty;
+    hdr[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    stream.write_all(&hdr).unwrap();
+    stream.write_all(payload).unwrap();
+}
+
+fn recv_stream_frame(stream: &mut UnixStream) -> (u8, Vec<u8>) {
+    let mut hdr = [0u8; 3];
+    stream.read_exact(&mut hdr).unwrap();
+    let ty = hdr[0];
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut buf).unwrap();
+    }
+    (ty, buf)
+}
+
+fn stream_attach(socket: &Path, pid: i32) -> (UnixStream, serde_json::Value) {
+    let mut stream = UnixStream::connect(stream_path(socket)).unwrap();
+    let req = serde_json::json!({"type": "Attach", "pid": pid});
+    let payload = serde_json::to_vec(&req).unwrap();
+    send_stream_frame(&mut stream, 0x00, &payload);
+    let (ty, resp) = recv_stream_frame(&mut stream);
+    assert_eq!(ty, 0x01, "expected 0x01 response frame");
+    (stream, serde_json::from_slice(&resp).unwrap())
+}
+
+// ── Attach tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn attach_unknown_container_returns_error() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let _daemon = Daemon::new(&socket);
+
+    let (_stream, v) = stream_attach(&socket, 99999);
+    assert!(
+        !v["ok"].as_bool().unwrap(),
+        "attach to unknown pid should fail"
+    );
+    assert!(
+        v["error"].as_str().unwrap().contains("not found"),
+        "error should mention 'not found', got: {:?}",
+        v["error"]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn attach_to_detached_interactive_container() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let _daemon = Daemon::new(&socket);
+
+    // Start a detached interactive container that reads stdin and echoes it.
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--interactive",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/cat",
+    ]);
+    assert!(ok, "run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Attach.
+    let (mut stream, v) = stream_attach(&socket, pid);
+    assert!(v["ok"].as_bool().unwrap(), "attach should succeed");
+
+    // Write "hello\n" via 0x10 frame.
+    let msg = b"hello\n";
+    send_stream_frame(&mut stream, 0x10, msg);
+
+    // Send stdin EOF (0x11).
+    send_stream_frame(&mut stream, 0x11, &[]);
+
+    // Read output until we get EOF or timeout.
+    let mut output = Vec::new();
+    let mut got_output = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let poll_timeout = if got_output { 200 } else { 500 };
+        let mut pollfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout) };
+        if ret < 0 {
+            break;
+        }
+        if ret == 0 {
+            if got_output || std::time::Instant::now() > deadline {
+                break;
+            }
+            continue;
+        }
+
+        let (ty, data) = recv_stream_frame(&mut stream);
+        match ty {
+            0x10 => {
+                got_output = true;
+                output.extend_from_slice(&data);
+            }
+            0x02 => break,
+            t => panic!("unexpected frame type 0x{t:02x}"),
+        }
+    }
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("hello"),
+        "attach output should contain 'hello', got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    // Clean up.
+    let kill_req = format!(r#"{{"type":"Kill","pid":{pid}}}"#);
+    send_request(&socket, kill_req.as_bytes());
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn attach_to_detached_noninteractive_container() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let _daemon = Daemon::new(&socket);
+
+    // Start a detached non-interactive container that produces output
+    // AFTER a brief delay so we can attach before it writes.
+    // Note: single echo line to avoid LogGateway pipe-writer in-flight drops.
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 0.1; echo 'hello-from-attach and second-line'",
+    ]);
+    assert!(ok, "run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Attach immediately (before the container writes).
+    let (mut stream, v) = stream_attach(&socket, pid);
+    assert!(v["ok"].as_bool().unwrap(), "attach should succeed");
+
+    // Read output. The container writes after ~100ms.
+    let mut output = Vec::new();
+    let mut got_output = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let poll_timeout = if got_output { 200 } else { 500 };
+        let mut pollfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout) };
+        if ret < 0 {
+            break;
+        }
+        if ret == 0 {
+            if got_output || std::time::Instant::now() > deadline {
+                break;
+            }
+            continue;
+        }
+
+        let (ty, data) = recv_stream_frame(&mut stream);
+        match ty {
+            0x10 => {
+                got_output = true;
+                output.extend_from_slice(&data);
+            }
+            0x02 => break,
+            t => panic!("unexpected frame type 0x{t:02x}"),
+        }
+    }
+
+    let out_str = String::from_utf8_lossy(&output);
+    assert!(
+        out_str.contains("hello-from-attach"),
+        "output should contain 'hello-from-attach', got: {out_str:?}"
+    );
+    assert!(
+        out_str.contains("second-line"),
+        "output should contain 'second-line', got: {out_str:?}"
+    );
+
+    // Clean up.
+    let kill_req = format!(r#"{{"type":"Kill","pid":{pid}}}"#);
+    send_request(&socket, kill_req.as_bytes());
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn attach_to_detached_tty_container() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let _daemon = Daemon::new(&socket);
+
+    // Start a detached TTY container that reads one line and echoes via printf.
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--tty",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "read line; printf 'got: %s\\n' \"$line\"",
+    ]);
+    assert!(ok, "run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    // Attach immediately.
+    let (mut stream, v) = stream_attach(&socket, pid);
+    assert!(v["ok"].as_bool().unwrap(), "attach should succeed");
+
+    // Write input (PTY canonical mode: \r terminates the line).
+    let msg = b"hello-tty\r";
+    send_stream_frame(&mut stream, 0x10, msg);
+
+    // Read output. The container processes the line, prints "got: hello-tty",
+    // and exits. Data arrives as 0x10 frames; the session closes after
+    // the container exits (POLLHUP on the stream).
+    let mut output = Vec::new();
+    let mut got_output = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let poll_timeout = if got_output { 200 } else { 500 };
+        let mut pollfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout) };
+        if ret < 0 {
+            break;
+        }
+        if ret == 0 {
+            if got_output || std::time::Instant::now() > deadline {
+                break;
+            }
+            continue;
+        }
+
+        let (ty, data) = recv_stream_frame(&mut stream);
+        match ty {
+            0x10 => {
+                got_output = true;
+                output.extend_from_slice(&data);
+            }
+            0x02 => break,
+            t => panic!("unexpected frame type 0x{t:02x}"),
+        }
+    }
+
+    let out_str = String::from_utf8_lossy(&output);
+    assert!(
+        out_str.contains("hello-tty"),
+        "attach TTY output should contain 'hello-tty', got: {out_str:?}"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -100,6 +100,15 @@ enum Cli {
         #[arg(long)]
         socket_path: Option<PathBuf>,
     },
+    /// Attach to a running container
+    Attach {
+        /// Container PID
+        pid: i32,
+
+        /// Daemon socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -163,6 +172,12 @@ fn main() -> ExitCode {
         }
         Cli::Kill { pid, socket_path } => {
             kill_container(pid, socket_path.unwrap_or_else(default_socket_path))
+        }
+        Cli::Attach { pid, socket_path } => {
+            let socket = socket_path.unwrap_or_else(default_socket_path);
+            let mut sock = socket.into_os_string();
+            sock.push(".stream");
+            attach_container(PathBuf::from(sock), pid)
         }
     }
 }
@@ -478,6 +493,131 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
     if let Some(termios) = original_termios {
         pty::restore_terminal(&termios).ok();
         unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL) };
+    }
+
+    let exit_code = match reader_handle.join() {
+        Ok(code) => code as u8,
+        Err(_) => 1,
+    };
+
+    ExitCode::from(exit_code)
+}
+
+/// Attach to a running container (stream protocol).
+fn attach_container(stream_path: PathBuf, pid: i32) -> ExitCode {
+    let stream = match std::os::unix::net::UnixStream::connect(&stream_path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(%e, path = %stream_path.display(), "cannot connect to daemon stream");
+            return ExitCode::FAILURE;
+        }
+    };
+    let raw_fd = stream.as_raw_fd();
+
+    // Send Attach request.
+    let request = daemon::Request::Attach { pid };
+    let payload = serde_json::to_vec(&request).unwrap();
+    if let Err(e) = send_frame(raw_fd, 0x00, &payload) {
+        tracing::error!(%e, "failed to send attach request");
+        return ExitCode::FAILURE;
+    }
+
+    let (ty, resp_data) = match read_frame(raw_fd) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "failed to read attach response");
+            return ExitCode::FAILURE;
+        }
+    };
+    if ty != 0x01 {
+        tracing::error!(%ty, "expected RunResponse frame");
+        return ExitCode::FAILURE;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AttachResp {
+        ok: bool,
+        #[allow(dead_code)]
+        pid: Option<i32>,
+        error: Option<String>,
+    }
+    let resp: AttachResp = match serde_json::from_slice(&resp_data) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "invalid AttachResponse JSON");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !resp.ok {
+        tracing::error!(error = %resp.error.as_deref().unwrap_or("unknown"), "daemon rejected attach");
+        return ExitCode::FAILURE;
+    }
+
+    // Reader thread: stream → stdout
+    let reader_stream = stream.try_clone().unwrap();
+    let reader_fd = reader_stream.as_raw_fd();
+    std::mem::forget(reader_stream);
+
+    let reader_handle = std::thread::spawn(move || {
+        loop {
+            match read_frame(reader_fd) {
+                Ok((0x10, data)) => {
+                    let mut written = 0usize;
+                    while written < data.len() {
+                        match crate::sys::write(libc::STDOUT_FILENO, &data[written..]) {
+                            Ok(n) => written += n as usize,
+                            Err(e) => {
+                                tracing::error!(%e, "stdout write failed");
+                                return 1i32;
+                            }
+                        }
+                    }
+                }
+                Ok((0x02, payload)) => {
+                    #[derive(serde::Deserialize)]
+                    struct ExitPayload {
+                        exit_code: i32,
+                    }
+                    if let Ok(ep) = serde_json::from_slice::<ExitPayload>(&payload) {
+                        return ep.exit_code;
+                    }
+                    return 1;
+                }
+                Ok((ty, _)) => {
+                    tracing::warn!(%ty, "unexpected frame from daemon");
+                    return 1;
+                }
+                Err(e) => {
+                    tracing::error!(%e, "reader: stream read error");
+                    return 1;
+                }
+            }
+        }
+    });
+
+    // Main thread: stdin → stream (0x10 frames)
+    let mut stdin_buf = [0u8; 4096];
+    let stdin_fd = libc::STDIN_FILENO;
+    loop {
+        match crate::sys::read(stdin_fd, &mut stdin_buf) {
+            Ok(0) => {
+                let _ = send_frame(raw_fd, 0x11, &[]);
+                break;
+            }
+            Ok(n) => {
+                if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
+                    tracing::error!(%e, "stdin → stream write failed");
+                    break;
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof || e.raw_os_error() == Some(libc::EIO) {
+                    let _ = send_frame(raw_fd, 0x11, &[]);
+                }
+                break;
+            }
+        }
     }
 
     let exit_code = match reader_handle.join() {
