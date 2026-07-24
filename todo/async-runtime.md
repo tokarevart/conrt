@@ -96,18 +96,60 @@ Lifecycle per slot:
 
 ### Future-side pattern
 
-IO-issuing futures store the `io_slot` (bit position) they are using. On
-each poll they check `submitted` to determine whether their IO has completed:
+IO-issuing futures are created via an intermediate future (`ReadOp`) that
+reserves the slot on its first poll (when the task index is available from
+the waker) and returns `(ReadFuture, CancelFuture)`. No allocation, no
+shared state — both get the slot as a plain `u32`.
 
 ```rust
-struct ReadFuture<T> {
+// Intermediate future — reserves slot, returns (ReadFuture, CancelFuture)
+struct ReadOp<'a, T> {
     fd: RawFd,
-    buf: Vec<u8>,
-    slot: Rc<Cell<Option<u32>>>,
+    buf: &'a mut [u8],
     _marker: PhantomData<T>,
 }
 
-impl<T> Future for ReadFuture<T> {
+impl<'a, T> Future for ReadOp<'a, T> {
+    type Output = (ReadFuture<'a, T>, CancelFuture);
+
+    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Self::Output> {
+        let ti = task_index(cx);
+        let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
+        let task = &rt.tasks[ti];
+
+        // Reserve slot — set bit in submitted, SQE not pushed yet
+        let io_slot = (!task.io.submitted).trailing_zeros();
+        task.io.submitted |= 1 << io_slot;
+
+        Poll::Ready((
+            ReadFuture {
+                fd: self.fd, buf: self.buf, task_index: ti,
+                io_slot, sqe_pushed: false, _marker: PhantomData,
+            },
+            CancelFuture { io_slot, submitted: false },
+        ))
+    }
+}
+
+fn read<'a, T>(fd: RawFd, buf: &'a mut [u8]) -> ReadOp<'a, T> {
+    ReadOp { fd, buf, _marker: PhantomData }
+}
+```
+
+The actual IO future — pushes the SQE on first poll, checks CQE on
+subsequent polls. The slot is already reserved by `ReadOp`.
+
+```rust
+struct ReadFuture<'a, T> {
+    fd: RawFd,
+    buf: &'a mut [u8],
+    task_index: u32,
+    io_slot: u32,
+    sqe_pushed: bool,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Future for ReadFuture<'_, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<T> {
@@ -115,39 +157,43 @@ impl<T> Future for ReadFuture<T> {
         let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
         let task = &rt.tasks[ti];
 
-        if let Some(slot) = self.slot.get() {
-            if task.io.submitted & (1 << slot) != 0 {
-                return Poll::Pending;
+        if !self.sqe_pushed {
+            // First poll — push SQE (slot already reserved)
+            let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
+            let user_data = IoUserData { task_index: ti, io_slot: self.io_slot }.into();
+            unsafe {
+                push_read(sq, self.fd, self.buf, user_data)
+                    .expect("SQ full — need retry");
             }
-            let result = task.io.results[slot as usize];
-            return Poll::Ready(unsafe { transmute_copy(&result) });
+            self.sqe_pushed = true;
+            return Poll::Pending;
         }
 
-        let slot = (!task.io.submitted).trailing_zeros();
-        task.io.submitted |= 1 << slot;
-        self.slot.set(Some(slot));
-
-        let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
-        let user_data = IoUserData { task_index: ti, io_slot: slot }.into();
-        unsafe {
-            push_read(sq, self.fd, &mut self.buf, user_data)
-                .expect("SQ full — need retry");
+        // Subsequent polls — check if CQE arrived
+        if task.io.submitted & (1 << self.io_slot) != 0 {
+            return Poll::Pending;
         }
-        Poll::Pending
+
+        let result = task.io.results[self.io_slot as usize];
+        Poll::Ready(unsafe { transmute_copy(&result) })
     }
 }
 
-fn read<T>(fd: RawFd, buf: Vec<u8>) -> (ReadFuture<T>, CancelFuture) {
-    let slot = Rc::new(Cell::new(None));
-    let future = ReadFuture { fd, buf, slot: slot.clone(), _marker: PhantomData };
-    let cancel = CancelFuture { slot, submitted: false };
-    (future, cancel)
+impl<T> Drop for ReadFuture<'_, T> {
+    fn drop(&mut self) {
+        if !self.sqe_pushed {
+            // SQE never pushed — clear the reserved bit
+            let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
+            let task = &mut rt.tasks[self.task_index];
+            task.io.submitted &= !(1 << self.io_slot);
+        }
+    }
 }
 ```
 
-The future owns the slot lifecycle: it finds a free bit, sets it, and later
-reads the result when the bit is clear. The runtime never assigns slots —
-it only clears `submitted` bits when CQEs arrive.
+The `ReadOp` future owns the slot lifecycle: it reserves a free bit on its
+first poll, then `ReadFuture` pushes the SQE. The runtime only clears
+`submitted` bits when CQEs arrive.
 
 ---
 
@@ -353,13 +399,12 @@ Both cases are idempotent — the `submitted` bit ends up clear either way.
 A standalone future that cancels one in-flight IO. Reusable outside select
 — any future can create one and `.await` it to cancel a pending operation.
 
-Shares the `io_slot` with the owning future via `Rc<Cell<Option<u32>>>`.
-The slot is `None` until the owning future's first poll assigns it —
-`CancelFuture` returns `Pending` in that case.
+The `io_slot` is known at creation time (reserved by `ReadOp`). No shared
+state needed.
 
 ```rust
 struct CancelFuture {
-    slot: Rc<Cell<Option<u32>>>,
+    io_slot: u32,
     submitted: bool,
 }
 
@@ -371,20 +416,15 @@ impl Future for CancelFuture {
         let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
         let task = &rt.tasks[ti];
 
-        let slot = match self.slot.get() {
-            Some(s) => s,
-            None => return Poll::Pending,
-        };
-
         if !self.submitted {
             let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
-            let ud = IoUserData { task_index: ti, io_slot: slot };
+            let ud = IoUserData { task_index: ti, io_slot: self.io_slot };
             unsafe { push_cancel(sq, ud.into()) };
             self.submitted = true;
             return Poll::Pending;
         }
 
-        if task.io.submitted & (1 << slot) != 0 {
+        if task.io.submitted & (1 << self.io_slot) != 0 {
             return Poll::Pending;
         }
 
@@ -422,19 +462,19 @@ where
 Usage:
 
 ```rust
-let (read_a, cancel_a) = read::<i32>(fd1, buf1);
-let (read_b, cancel_b) = read::<i32>(fd2, buf2);
+// Simple read
+let result = read::<i32>(fd, buf).await;
 
-// Without closure — returns A::Output directly
+// Select between two reads
 let result = select(
-    (read_a, cancel_a),
-    (read_b, cancel_b),
+    read::<i32>(fd1, buf1).await,
+    read::<i32>(fd2, buf2).await,
 ).await;
 
-// With closure — returns T
+// With closure
 let result = select(
-    (read_a, cancel_a),
-    (read_b, cancel_b),
+    read::<i32>(fd1, buf1).await,
+    read::<i32>(fd2, buf2).await,
 ).then(|result| process(result)).await;
 ```
 
