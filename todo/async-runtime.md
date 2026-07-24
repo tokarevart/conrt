@@ -100,34 +100,32 @@ IO-issuing futures store the `io_slot` (bit position) they are using. On
 each poll they check `submitted` to determine whether their IO has completed:
 
 ```rust
-struct ReadFuture {
+struct ReadFuture<T> {
     fd: RawFd,
     buf: Vec<u8>,
-    io_slot: Option<u32>,  // found by future on first submit
+    slot: Rc<Cell<Option<u32>>>,
+    _marker: PhantomData<T>,
 }
 
-impl Future for ReadFuture {
-    type Output = i32;
+impl<T> Future for ReadFuture<T> {
+    type Output = T;
 
-    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<i32> {
+    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<T> {
         let ti = task_index(cx);
         let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
         let task = &rt.tasks[ti];
 
-        if let Some(slot) = self.io_slot {
-            // Already submitted — check if CQE arrived
+        if let Some(slot) = self.slot.get() {
             if task.io.submitted & (1 << slot) != 0 {
-                return Poll::Pending;  // still awaiting CQE
+                return Poll::Pending;
             }
-            // CQE arrived — read result, slot is now free for reuse
             let result = task.io.results[slot as usize];
-            return Poll::Ready(result);
+            return Poll::Ready(unsafe { transmute_copy(&result) });
         }
 
-        // First poll — find free slot, submit SQE
         let slot = (!task.io.submitted).trailing_zeros();
         task.io.submitted |= 1 << slot;
-        self.io_slot = Some(slot);
+        self.slot.set(Some(slot));
 
         let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
         let user_data = IoUserData { task_index: ti, io_slot: slot }.into();
@@ -137,6 +135,13 @@ impl Future for ReadFuture {
         }
         Poll::Pending
     }
+}
+
+fn read<T>(fd: RawFd, buf: Vec<u8>) -> (ReadFuture<T>, CancelFuture) {
+    let slot = Rc::new(Cell::new(None));
+    let future = ReadFuture { fd, buf, slot: slot.clone(), _marker: PhantomData };
+    let cancel = CancelFuture { slot, submitted: false };
+    (future, cancel)
 }
 ```
 
@@ -348,16 +353,14 @@ Both cases are idempotent — the `submitted` bit ends up clear either way.
 A standalone future that cancels one in-flight IO. Reusable outside select
 — any future can create one and `.await` it to cancel a pending operation.
 
+Shares the `io_slot` with the owning future via `Rc<Cell<Option<u32>>>`.
+The slot is `None` until the owning future's first poll assigns it —
+`CancelFuture` returns `Pending` in that case.
+
 ```rust
 struct CancelFuture {
-    io_slot: u32,
+    slot: Rc<Cell<Option<u32>>>,
     submitted: bool,
-}
-
-impl CancelFuture {
-    fn new(io_slot: u32) -> Self {
-        Self { io_slot, submitted: false }
-    }
 }
 
 impl Future for CancelFuture {
@@ -368,16 +371,20 @@ impl Future for CancelFuture {
         let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
         let task = &rt.tasks[ti];
 
+        let slot = match self.slot.get() {
+            Some(s) => s,
+            None => return Poll::Pending,
+        };
+
         if !self.submitted {
             let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
-            let ud = IoUserData { task_index: ti, io_slot: self.io_slot };
+            let ud = IoUserData { task_index: ti, io_slot: slot };
             unsafe { push_cancel(sq, ud.into()) };
             self.submitted = true;
             return Poll::Pending;
         }
 
-        // Cancel CQE arrived — bit is clear
-        if task.io.submitted & (1 << self.io_slot) != 0 {
+        if task.io.submitted & (1 << slot) != 0 {
             return Poll::Pending;
         }
 
@@ -386,19 +393,62 @@ impl Future for CancelFuture {
 }
 ```
 
-### Select pattern
+### Select
 
-Races two IOs, runs a closure on the winner's result immediately, then
-cancels the loser and waits for the cancel to complete before returning.
+Generic future combinator. Races any two futures, optionally applies a
+closure to the winner's result, then cancels the loser and waits for the
+cancel future to complete before returning.
+
+Accepts `(future, cancel_token)` tuples — each arm carries its own future
+and cancellation mechanism. The cancel tokens are generic `Future<Output = ()>`,
+not tied to any specific runtime. IO futures return `CancelFuture`; other
+futures may return no-op or custom cancel tokens.
 
 ```rust
-struct SelectFuture<F, T> {
-    slot_a: u32,
-    slot_b: u32,
-    cancel: CancelFuture,
-    closure: F,
-    closure_result: MaybeUninit<T>,
+fn select<A, B, CA, CB>(
+    a: (A, CA),
+    b: (B, CB),
+) -> Select<A, B, CA, CB>
+where
+    A: Future,
+    B: Future<Output = A::Output>,
+    CA: Future<Output = ()>,
+    CB: Future<Output = ()>,
+{
+    Select { a: a.0, b: b.0, cancel_a: a.1, cancel_b: b.1, result: MaybeUninit::uninit(), phase: Racing, winner: 0 }
+}
+```
+
+Usage:
+
+```rust
+let (read_a, cancel_a) = read::<i32>(fd1, buf1);
+let (read_b, cancel_b) = read::<i32>(fd2, buf2);
+
+// Without closure — returns A::Output directly
+let result = select(
+    (read_a, cancel_a),
+    (read_b, cancel_b),
+).await;
+
+// With closure — returns T
+let result = select(
+    (read_a, cancel_a),
+    (read_b, cancel_b),
+).then(|result| process(result)).await;
+```
+
+#### Select (no closure)
+
+```rust
+struct Select<A, B, CA, CB> {
+    a: A,
+    b: B,
+    cancel_a: CA,
+    cancel_b: CB,
+    result: MaybeUninit<A::Output>,
     phase: SelectPhase,
+    winner: u8,
 }
 
 enum SelectPhase {
@@ -406,53 +456,145 @@ enum SelectPhase {
     CancelPending,
 }
 
-impl<F, T> Future for SelectFuture<F, T>
+impl<A, B, CA, CB> Future for Select<A, B, CA, CB>
 where
-    F: FnOnce(&i32) -> T,
+    A: Future,
+    B: Future<Output = A::Output>,
+    CA: Future<Output = ()>,
+    CB: Future<Output = ()>,
 {
-    type Output = T;
+    type Output = A::Output;
 
-    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<T> {
-        // SAFETY: we only project to fields, never move the future
+    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<A::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let ti = task_index(cx);
-        let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
-        let task = &rt.tasks[ti];
 
         match this.phase {
             Racing => {
-                let a_done = task.io.submitted & (1 << this.slot_a) == 0;
-                let b_done = task.io.submitted & (1 << this.slot_b) == 0;
+                let a = unsafe { Pin::new_unchecked(&mut this.a) };
+                let b = unsafe { Pin::new_unchecked(&mut this.b) };
 
-                if !a_done && !b_done {
+                let winner_result = if let Poll::Ready(result) = a.poll(cx) {
+                    this.winner = 0;
+                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_b) };
+                    let _ = cancel.poll(cx); // submits cancel SQE
+                    result
+                } else if let Poll::Ready(result) = b.poll(cx) {
+                    this.winner = 1;
+                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_a) };
+                    let _ = cancel.poll(cx);
+                    result
+                } else {
                     return Poll::Pending;
-                }
+                };
 
-                // Winner found — read result, run closure, submit cancel
-                let winner = if a_done { this.slot_a } else { this.slot_b };
-                let loser = if a_done { this.slot_b } else { this.slot_a };
-                let result = task.io.results[winner as usize];
-                let closure_result = (this.closure)(&result);
-                this.closure_result = MaybeUninit::new(closure_result);
-
-                // Submit cancel for loser
-                this.cancel = CancelFuture::new(loser);
-                let cancel = unsafe { Pin::new_unchecked(&mut this.cancel) };
-                let _ = cancel.poll(cx); // always returns Pending (submits SQE)
-
+                this.result = MaybeUninit::new(winner_result);
                 this.phase = CancelPending;
                 Poll::Pending
             }
 
             CancelPending => {
-                let cancel = unsafe { Pin::new_unchecked(&mut this.cancel) };
+                let cancel = if this.winner == 0 {
+                    unsafe { Pin::new_unchecked(&mut this.cancel_b) }
+                } else {
+                    unsafe { Pin::new_unchecked(&mut this.cancel_a) }
+                };
                 match cancel.poll(cx) {
                     Poll::Ready(()) => {
-                        // Cancel done — safe to drop both buffers
-                        let result = unsafe {
-                            this.closure_result.assume_init_read()
-                        };
-                        Poll::Ready(result)
+                        Poll::Ready(unsafe { this.result.assume_init_read() })
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl<A, B, CA, CB> Select<A, B, CA, CB>
+where
+    A: Future,
+    B: Future<Output = A::Output>,
+    CA: Future<Output = ()>,
+    CB: Future<Output = ()>,
+{
+    fn then<F, T>(self, closure: F) -> SelectThen<A, B, CA, CB, F, T>
+    where
+        F: FnOnce(A::Output) -> T,
+    {
+        SelectThen {
+            a: self.a,
+            b: self.b,
+            cancel_a: self.cancel_a,
+            cancel_b: self.cancel_b,
+            closure,
+            closure_result: MaybeUninit::uninit(),
+            phase: self.phase,
+            winner: self.winner,
+        }
+    }
+}
+```
+
+#### SelectThen (with closure)
+
+```rust
+struct SelectThen<A, B, CA, CB, F, T> {
+    a: A,
+    b: B,
+    cancel_a: CA,
+    cancel_b: CB,
+    closure: F,
+    closure_result: MaybeUninit<T>,
+    phase: SelectPhase,
+    winner: u8,
+}
+
+impl<A, B, CA, CB, F, T> Future for SelectThen<A, B, CA, CB, F, T>
+where
+    A: Future,
+    B: Future<Output = A::Output>,
+    CA: Future<Output = ()>,
+    CB: Future<Output = ()>,
+    F: FnOnce(A::Output) -> T,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<T> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        match this.phase {
+            Racing => {
+                let a = unsafe { Pin::new_unchecked(&mut this.a) };
+                let b = unsafe { Pin::new_unchecked(&mut this.b) };
+
+                let winner_result = if let Poll::Ready(result) = a.poll(cx) {
+                    this.winner = 0;
+                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_b) };
+                    let _ = cancel.poll(cx);
+                    result
+                } else if let Poll::Ready(result) = b.poll(cx) {
+                    this.winner = 1;
+                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_a) };
+                    let _ = cancel.poll(cx);
+                    result
+                } else {
+                    return Poll::Pending;
+                };
+
+                let closure_result = (this.closure)(winner_result);
+                this.closure_result = MaybeUninit::new(closure_result);
+                this.phase = CancelPending;
+                Poll::Pending
+            }
+
+            CancelPending => {
+                let cancel = if this.winner == 0 {
+                    unsafe { Pin::new_unchecked(&mut this.cancel_b) }
+                } else {
+                    unsafe { Pin::new_unchecked(&mut this.cancel_a) }
+                };
+                match cancel.poll(cx) {
+                    Poll::Ready(()) => {
+                        Poll::Ready(unsafe { this.closure_result.assume_init_read() })
                     }
                     Poll::Pending => Poll::Pending,
                 }
@@ -462,40 +604,32 @@ where
 }
 ```
 
-Usage:
-
-```rust
-let result = select(read(fd1, buf1), read(fd2, buf2))
-    .then(|result| process(result))
-    .await;
-```
-
-### Select flow
+#### Select flow
 
 ```
 poll 1 (Racing):
-  slot_a submitted clear → winner found
-  → run closure(&result) → store closure_result
-  → create CancelFuture for slot_b, poll → submits cancel SQE
+  → poll both futures
+  → a returns Ready(result)
+  → poll b's cancel future → submits cancel SQE
+  → run closure(result) → store closure_result (SelectThen only)
   → transition to CancelPending
   → return Pending
 
 poll 2 (CancelPending):
-  → poll CancelFuture → check slot_b submitted bit
-  → if clear → return Ready(closure_result) — safe to drop both buffers
-  → if set → return Pending (wait for cancel CQE)
+  → poll cancel future → check submitted bit
+  → if clear → return Ready(result / closure_result)
+  → if set → return Pending
 ```
 
-The closure runs **immediately** when the winner is detected — not after the
-cancel completes. The cancel is submitted after the closure returns. By the
+The closure (if any) runs **immediately** when the winner is detected, not
+after the cancel completes. The cancel is submitted in the same poll. By the
 time we re-poll, the cancel CQE has almost certainly arrived (submitted and
 collected in the same `submit_and_wait` call). The `CancelPending` phase is
 a defensive safety net.
 
-The future cannot return `Poll::Ready` until the losing slot's `submitted`
-bit is clear — otherwise the kernel may still own that buffer. The cancel
-CQE clears the bit, allowing the future to safely complete and drop both
-buffers.
+The future cannot return `Poll::Ready` until the losing future's IOs are
+complete — otherwise the kernel may still own those buffers. The cancel
+future ensures this by waiting for the cancel CQE.
 
 ---
 
