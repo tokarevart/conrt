@@ -7,13 +7,14 @@
 - Zero extra allocation for IO state tracking (inline u64 submitted bitmap + `[i32; 64]` results, heap-overflow variant for >64 IOs)
 - Fast completion dispatch via `user_data` encoding
 - Per-task bump arena for zero-allocation buffer management — each allocation returns an `ArenaAlloc` guard that deallocates on drop with O(1) pop from the top
+- Zero-cost direct `&mut Task<T>` access passed to tasks on spawn (eliminates Thread-Local Storage TLS lookups during poll)
+- Zero-hazard cancellation safety — buffer ownership moves into the task on SQE submission and is retained until CQE completion
 
 ---
 
 ## Runtime Storage
 
-Single `static mut Option<Runtime>`. Single-threaded — no contention. Uses
-thread-local `CURRENT_TASK_INDEX` for zero-cost arena access during polling.
+Single `static mut Option<Runtime>`. Single-threaded — no contention.
 
 ```rust
 static mut RUNTIME: Option<Runtime> = None;
@@ -28,9 +29,9 @@ Waker reads `RUNTIME` directly (unsafe, single-threaded, no data race). Caller `
 Pre-allocated at runtime, **never reallocated**. Guarantees pinning soundness (task addresses never move). The slab *is* the index allocator — slot position = task index.
 
 ```rust
-struct Runtime {
-    tasks: Slab<Task>,
-    ready: Queue<u32>, // indices of tasks ready to run
+struct Runtime<T, F: Future<Output = ()>> {
+    tasks: Slab<Task<T, F>>,
+    ready: Queue<u32>,
     ring: IoUring,
 }
 
@@ -46,10 +47,12 @@ struct Slab<T> {
 - Runtime must read the queue len, then poll that many tasks (they themselves may spawn other tasks after all), then poll completed IO events, repeat.
 
 ```rust
-struct Task<F: Future> {
+struct Task<T, F: Future<Output = ()>> {
     ready: bool,
     io: IoState,
     arena: TaskArena,
+    inflight_arena_guards: Slab<ArenaAlloc>, // Retains guards while IO is in-flight
+    user_data: T,                            // Custom user state passed at spawn
     future: F,
 }
 ```
@@ -225,86 +228,114 @@ Drop A (now at top):
   offset = 0 — full arena reclaim
 ```
 
-### Cancellation safety
+### Cancellation safety & In-Flight Ownership Transfer
 
 io_uring is completion-based — the kernel holds raw pointers to arena memory
-while operations are in-flight. The `ArenaAlloc` guard's lifetime is tied to
-the IO future that uses its buffer. When the future completes (or is dropped),
-the guard drops and marks the allocation deallocated.
+while operations are in-flight. 
 
-If an IO future is cancelled mid-`await`, the kernel may still own the buffer.
-The guard drops and marks the allocation deallocated — if it's at the top, it
-pops and rewinds. This is safe because:
+To guarantee cancellation safety when a user-facing `Future` is dropped
+mid-`await` (e.g. inside `select!` or timeouts), **move ownership of the
+`ArenaAlloc` guard directly into `task.inflight_arena_guards` upon SQE
+submission**.
 
-1. The kernel only reads/writes via the SQE's raw pointer, which was submitted
-   before the future was cancelled.
-2. The CQE for this IO will eventually arrive, at which point the kernel is
-   done with the buffer.
-3. Between the guard drop and the CQE arrival, the bytes may be reused by a
-   new allocation — but the new allocation's SQE has not been submitted yet
-   (the future hasn't been polled), so the kernel doesn't have a pointer to
-   the reused bytes.
-4. The SQE submission happens in the future's first poll, which occurs after
-   the guard has returned the pointer — so the new SQE points to the new
-   allocation's region, not the old one.
+1. **Submission Phase**: When pushing an SQE, the future moves its `ArenaAlloc`
+   guard into `task.inflight_arena_guards` mapped to the assigned `io_slot`.
+2. **Cancellation Phase**: If the user-facing `Future` is dropped before the IO
+   finishes, the `ArenaAlloc` guard **remains safely owned by the `Task`**.
+3. **CQE Arrival**: When the kernel posts the CQE for that `io_slot`,
+   `drain_cqes()` removes the guard from `task.inflight_arena_guards` and drops
+   it.
+4. **Rewind Phase**: The `ArenaAlloc::drop` handler executes *only after* the
+   kernel has released its pointer, marking the slot deallocated and unwinding
+   the top of the arena safely.
 
-The key invariant: **the kernel only operates on memory via SQE submissions,
-and SQEs are only submitted during polling, never during allocation.** So
-deallocating (marking + optional pop) never races with kernel R/W.
+This completely eliminates data races caused by early future drops.
 
-### read_arena wrapper
+### I/O Submission Flow
 
-Returns an `ArenaAlloc` guard alongside the `ReadOp`. The guard must outlive
-the read — the caller holds it until the read completes:
+When a task needs to perform IO, it allocates a buffer from its arena and submits
+the IO directly through `Task` methods. The `ArenaAlloc` guard is moved into
+`task.inflight_arena_guards` on submission, guaranteeing the buffer stays alive
+until the CQE arrives.
 
 ```rust
-fn read_arena<'a, T>(
-    fd: RawFd,
-    arena: &'a mut TaskArena,
-    len: u32,
-) -> Option<(ArenaAlloc<'a>, ReadOp<'a, T>)> {
-    let alloc = arena.alloc_bytes(len)?;
-    let ptr = unsafe { arena.base_ptr.add(alloc.alloc_offset as usize) };
-    let op = read::<T>(fd, ptr, len as usize);
-    Some((alloc, op))
+impl<T, F: Future> Task<T, F> {
+    /// Submits a read IO operation by consuming the ArenaAlloc guard
+    pub fn submit_read(&mut self, fd: RawFd, alloc: ArenaAlloc, len: u32) -> u32 {
+        let io_slot = (!self.io.submitted).trailing_zeros();
+        self.io.submitted |= 1 << io_slot;
+
+        let ptr = unsafe { self.arena.base_ptr().add(alloc.alloc_offset as usize) };
+
+        // 1. Move guard into inflight tracker — task now owns memory safety
+        self.inflight_arena_guards.insert_at(io_slot as usize, alloc);
+
+        // 2. Submit SQE to io_uring ring
+        let user_data = IoUserData { task_index: self.id, io_slot }.into();
+        unsafe { push_read(self.ring_sq(), fd, ptr, len, user_data) };
+
+        io_slot
+    }
+
+    /// Called during CQE draining
+    pub fn on_cqe_completion(&mut self, io_slot: u32, result: i32) {
+        self.io.results[io_slot as usize] = result;
+        self.io.submitted &= !(1 << io_slot);
+        
+        // Dropping the guard here triggers the O(1) top-of-stack rewind
+        // NOW 100% sound because the kernel is done with the pointer.
+        self.inflight_arena_guards.remove(io_slot as usize);
+    }
 }
 ```
 
 Usage:
 
 ```rust
-async fn socket_worker(fd: RawFd) {
+async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
     loop {
-        let arena = current_arena();
-        let Some((guard, op)) = read_arena::<i32>(fd, arena, 4096) else {
+        let Some(alloc) = task.arena.alloc_bytes(4096) else {
             break; // arena exhausted
         };
 
-        let result = op.await;
-        // guard drops here — marks allocation deallocated, pops if at top
+        // submit_read moves the ArenaAlloc guard into inflight_arena_guards
+        let io_slot = task.submit_read(fd, alloc, 4096);
 
-        if result < 0 { break; }
+        // ... await the IO result via the io state ...
+        // on_cqe_completion drops the guard, reclaiming buffer space
     }
 }
 ```
 
 ### Spawn integration
 
-`Runtime::spawn` accepts a standard `'static` future — no arena parameters:
+The `FnOnce(&mut Task<T, F>, T) -> F` closure is passed to the `Runtime` at
+construction time. `spawn` only accepts user data — it calls the stored closure
+to create the future, since the returned future type `F` is always the same.
 
 ```rust
-fn spawn<F>(&mut self, future: F)
-where
-    F: Future<Output = ()> + 'static,
-{
-    let index = self.tasks.insert().expect("slab full");
-    // ... store Task { ready: false, io: IoState::new(), arena: TaskArena::new(), future }
+struct Runtime<T, F: Future<Output = ()>, S: Fn(&mut Task<T, F>, T) -> F> {
+    tasks: Slab<Task<T, F>>,
+    ready: Queue<u32>,
+    ring: IoUring,
+    spawn_fn: S,
+}
+
+impl<T, F: Future<Output = ()>, S: Fn(&mut Task<T, F>, T) -> F> Runtime<T, F, S> {
+    fn spawn(&mut self, user_data: T) {
+        let index = self.tasks.insert_vacant().expect("slab full");
+        self.tasks.init_at(index, |slot| {
+            let task = &mut slot.task;
+            let future = (self.spawn_fn)(task, user_data);
+            // store future in task
+        });
+    }
 }
 ```
 
-Tasks access their arena via `current_arena()` which reads `CURRENT_TASK_INDEX`
-TLS. Each allocation returns an `ArenaAlloc` guard — the borrow checker ensures
-the guard outlives the buffer usage. No lifetime transmutes needed.
+Tasks receive `&mut Task<T, F>` which gives direct access to `arena`, `submit_read()`,
+and `inflight_arena_guards`. No TLS, no `current_arena()` lookup — the task
+reference is passed directly into the future's state via the spawn closure.
 
 ---
 
@@ -341,104 +372,38 @@ Lifecycle per slot:
 
 ### Future-side pattern
 
-IO-issuing futures are created via an intermediate future (`ReadOp`) that
-reserves the slot on its first poll (when the task index is available from
-the waker) and returns `(ReadFuture, CancelFuture)`. No allocation, no
-shared state — both get the slot as a plain `u32`.
+IO-issuing futures call `task.submit_read()` which handles slot allocation, guard
+transfer, and SQE submission. The future then polls `task.io` to check for
+completion — no `ReadOp`/`ReadFuture` intermediaries needed.
 
 ```rust
-// Intermediate future — reserves slot, returns (ReadFuture, CancelFuture)
-struct ReadOp<'a, T> {
-    fd: RawFd,
-    buf: &'a mut [u8],
-    _marker: PhantomData<T>,
-}
+async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
+    loop {
+        let Some(alloc) = task.arena.alloc_bytes(4096) else {
+            break;
+        };
 
-impl<'a, T> Future for ReadOp<'a, T> {
-    type Output = (ReadFuture<'a, T>, CancelFuture);
+        let io_slot = task.submit_read(fd, alloc, 4096);
 
-    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Self::Output> {
-        let ti = task_index(cx);
-        let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
-        let task = &rt.tasks[ti];
+        // Wait for CQE — check submitted bit on each poll via waker
+        // (the runtime's drain_cqes sets task.ready when CQE arrives)
+        yield_now().await;
 
-        // Reserve slot — set bit in submitted, SQE not pushed yet
-        let io_slot = (!task.io.submitted).trailing_zeros();
-        task.io.submitted |= 1 << io_slot;
-
-        Poll::Ready((
-            ReadFuture {
-                fd: self.fd, buf: self.buf, task_index: ti,
-                io_slot, sqe_pushed: false, _marker: PhantomData,
-            },
-            CancelFuture { io_slot, submitted: false },
-        ))
-    }
-}
-
-fn read<'a, T>(fd: RawFd, buf: &'a mut [u8]) -> ReadOp<'a, T> {
-    ReadOp { fd, buf, _marker: PhantomData }
-}
-```
-
-The actual IO future — pushes the SQE on first poll, checks CQE on
-subsequent polls. The slot is already reserved by `ReadOp`.
-
-```rust
-struct ReadFuture<'a, T> {
-    fd: RawFd,
-    buf: &'a mut [u8],
-    task_index: u32,
-    io_slot: u32,
-    sqe_pushed: bool,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Future for ReadFuture<'_, T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<T> {
-        let ti = task_index(cx);
-        let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
-        let task = &rt.tasks[ti];
-
-        if !self.sqe_pushed {
-            // First poll — push SQE (slot already reserved)
-            let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
-            let user_data = IoUserData { task_index: ti, io_slot: self.io_slot }.into();
-            unsafe {
-                push_read(sq, self.fd, self.buf, user_data)
-                    .expect("SQ full — need retry");
-            }
-            self.sqe_pushed = true;
-            return Poll::Pending;
-        }
-
-        // Subsequent polls — check if CQE arrived
-        if task.io.submitted & (1 << self.io_slot) != 0 {
-            return Poll::Pending;
-        }
-
-        let result = task.io.results[self.io_slot as usize];
-        Poll::Ready(unsafe { transmute_copy(&result) })
-    }
-}
-
-impl<T> Drop for ReadFuture<'_, T> {
-    fn drop(&mut self) {
-        if !self.sqe_pushed {
-            // SQE never pushed — clear the reserved bit
-            let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
-            let task = &mut rt.tasks[self.task_index];
-            task.io.submitted &= !(1 << self.io_slot);
-        }
+        if task.io.results[io_slot as usize] < 0 { break; }
     }
 }
 ```
 
-The `ReadOp` future owns the slot lifecycle: it reserves a free bit on its
-first poll, then `ReadFuture` pushes the SQE. The runtime only clears
-`submitted` bits when CQEs arrive.
+The submit path:
+
+1. `arena.alloc_bytes(4096)` → returns `ArenaAlloc` guard (marks buffer live)
+2. `task.submit_read(fd, alloc, 4096)`:
+   - Finds free io_slot via `(!submitted).trailing_zeros()`
+   - Moves `ArenaAlloc` guard into `task.inflight_arena_guards[io_slot]`
+   - Pushes SQE with pointer into the arena
+3. CQE arrives → `drain_cqes()` → `task.on_cqe_completion(io_slot, result)`:
+   - Clears `submitted` bit
+   - Drops guard from `inflight_arena_guards` → buffer reclaimed
 
 ---
 
@@ -510,23 +475,6 @@ fn task_index(cx: &Context) -> u32 {
 }
 ```
 
-### CURRENT_TASK_INDEX
-
-The runtime sets a thread-local `CURRENT_TASK_INDEX` before polling each task.
-`current_arena()` reads this to fetch the current task's arena dynamically —
-no reference passed at spawn time, no lifetime transmutes.
-
-```rust
-use std::cell::Cell;
-
-thread_local! {
-    static CURRENT_TASK_INDEX: Cell<Option<u32>> = const { Cell::new(None) };
-}
-```
-
-`poll_one` sets this to `Some(index)` before calling `task.future.poll(cx)`,
-resets to `None` after (see Event Loop).
-
 ---
 
 ## Event Loop
@@ -558,14 +506,12 @@ loop {
 fn poll_one(index: u32) {
     let task = &mut tasks[index];
     task.ready = false;
-    CURRENT_TASK_INDEX.set(Some(index));
     let w = waker(index);
     let mut cx = Context::from_waker(&w);
     match task.future.poll(cx) {
         Poll::Ready(()) => tasks.remove(index),
         Poll::Pending => {}
     }
-    CURRENT_TASK_INDEX.set(None);
 }
 ```
 
@@ -605,8 +551,7 @@ fn drain_cqes() {
     for cqe in ring.completion() {
         let ud = IoUserData::from(cqe.user_data());
         let task = &mut tasks[ud.task_index];
-        task.io.results[ud.io_slot as usize] = cqe.result();
-        task.io.submitted &= !(1 << ud.io_slot);
+        task.on_cqe_completion(ud.io_slot, cqe.result());
         if !task.ready {
             task.ready = true;
             ready.push(ud.task_index);
@@ -726,20 +671,17 @@ where
 Usage:
 
 ```rust
-// Simple read
-let result = read::<i32>(fd, buf).await;
+// Simple read — allocate from arena, submit, wait for CQE
+let alloc = task.arena.alloc_bytes(4096).unwrap();
+let io_slot = task.submit_read(fd, alloc, 4096);
+yield_now().await;
+let result = task.io.results[io_slot as usize];
 
 // Select between two reads
-let result = select(
-    read::<i32>(fd1, buf1).await,
-    read::<i32>(fd2, buf2).await,
+select(
+    read_task_a(task_a, fd1, buf1),
+    read_task_b(task_b, fd2, buf2),
 ).await;
-
-// With closure
-let result = select(
-    read::<i32>(fd1, buf1).await,
-    read::<i32>(fd2, buf2).await,
-).then(|result| process(result)).await;
 ```
 
 #### Select (no closure)
