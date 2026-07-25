@@ -50,9 +50,8 @@ struct Slab<T> {
 struct Task<T, F: Future<Output = ()>> {
     ready: bool,
     io: IoState,
-    arena: TaskArena,
-    inflight_arena_guards: Slab<ArenaAlloc>, // Retains guards while IO is in-flight
-    user_data: T,                            // Custom user state passed at spawn
+    buffers: IoBuffers,
+    user_data: T,
     future: F,
 }
 ```
@@ -228,6 +227,36 @@ Drop A (now at top):
   offset = 0 — full arena reclaim
 ```
 
+## Dual-Mode Buffer Management (`IoBuffers`)
+
+While `TaskArena` provides $O(1)$ stack rewind for task-local IO temporaries, some workloads require buffers that outlive the task or are transferred across tasks. `IoBuffers` encapsulates both bump allocation and owned heap vector tracking under a single zero-cost interface.
+
+```rust
+pub struct IoBuffers {
+    pub arena: TaskArena,
+    pub inflight_arena_guards: Slab<ArenaAlloc>,
+    pub inflight_vecs: Slab<Vec<u8>>,
+}
+
+impl IoBuffers {
+    pub fn new(arena_capacity: u32) -> Self {
+        Self {
+            arena: TaskArena::new(arena_capacity),
+            inflight_arena_guards: Slab::new(),
+            inflight_vecs: Slab::new(),
+        }
+    }
+}
+
+/// Flexible input source for IO operations
+pub enum BufferInput {
+    /// Arena-backed allocation with top-of-stack rewind on drop
+    Arena(ArenaAlloc),
+    /// Standard heap-allocated vector
+    Vector(Vec<u8>),
+}
+```
+
 ### Cancellation safety & In-Flight Ownership Transfer
 
 io_uring is completion-based — the kernel holds raw pointers to arena memory
@@ -235,15 +264,15 @@ while operations are in-flight.
 
 To guarantee cancellation safety when a user-facing `Future` is dropped
 mid-`await` (e.g. inside `select!` or timeouts), **move ownership of the
-`ArenaAlloc` guard directly into `task.inflight_arena_guards` upon SQE
+`ArenaAlloc` guard directly into `task.buffers.inflight_arena_guards` upon SQE
 submission**.
 
 1. **Submission Phase**: When pushing an SQE, the future moves its `ArenaAlloc`
-   guard into `task.inflight_arena_guards` mapped to the assigned `io_slot`.
+   guard into `task.buffers.inflight_arena_guards` mapped to the assigned `io_slot`.
 2. **Cancellation Phase**: If the user-facing `Future` is dropped before the IO
    finishes, the `ArenaAlloc` guard **remains safely owned by the `Task`**.
 3. **CQE Arrival**: When the kernel posts the CQE for that `io_slot`,
-   `drain_cqes()` removes the guard from `task.inflight_arena_guards` and drops
+   `drain_cqes()` removes the guard from `task.buffers.inflight_arena_guards` and drops
    it.
 4. **Rewind Phase**: The `ArenaAlloc::drop` handler executes *only after* the
    kernel has released its pointer, marking the slot deallocated and unwinding
@@ -253,24 +282,33 @@ This completely eliminates data races caused by early future drops.
 
 ### I/O Submission Flow
 
-When a task needs to perform IO, it allocates a buffer from its arena and submits
-the IO directly through `Task` methods. The `ArenaAlloc` guard is moved into
-`task.inflight_arena_guards` on submission, guaranteeing the buffer stays alive
-until the CQE arrives.
+When a task needs to perform IO, it allocates a buffer (from the arena or a heap
+`Vec<u8>`) and submits the IO directly through `Task` methods. The buffer's
+ownership is moved into the appropriate inflight slab on submission, guaranteeing
+it stays alive until the CQE arrives.
 
 ```rust
-impl<T, F: Future> Task<T, F> {
-    /// Submits a read IO operation by consuming the ArenaAlloc guard
-    pub fn submit_read(&mut self, fd: RawFd, alloc: ArenaAlloc, len: u32) -> u32 {
+impl<T, F: Future<Output = ()>> Task<T, F> {
+    /// Submits a read IO operation accepting either an ArenaAlloc guard or a heap Vec<u8>
+    pub fn submit_read(&mut self, fd: RawFd, buf: BufferInput, len: u32) -> u32 {
         let io_slot = (!self.io.submitted).trailing_zeros();
         self.io.submitted |= 1 << io_slot;
 
-        let ptr = unsafe { self.arena.base_ptr().add(alloc.alloc_offset as usize) };
+        // Resolve raw pointer and stash ownership into the appropriate inflight slab
+        let ptr = match buf {
+            BufferInput::Arena(alloc) => {
+                let p = unsafe { self.buffers.arena.base_ptr().add(alloc.alloc_offset as usize) };
+                self.buffers.inflight_arena_guards.insert_at(io_slot as usize, alloc);
+                p
+            }
+            BufferInput::Vector(vec) => {
+                let p = vec.as_ptr() as *mut u8;
+                self.buffers.inflight_vecs.insert_at(io_slot as usize, vec);
+                p
+            }
+        };
 
-        // 1. Move guard into inflight tracker — task now owns memory safety
-        self.inflight_arena_guards.insert_at(io_slot as usize, alloc);
-
-        // 2. Submit SQE to io_uring ring
+        // Submit SQE to io_uring ring
         let user_data = IoUserData { task_index: self.id, io_slot }.into();
         unsafe { push_read(self.ring_sq(), fd, ptr, len, user_data) };
 
@@ -281,10 +319,15 @@ impl<T, F: Future> Task<T, F> {
     pub fn on_cqe_completion(&mut self, io_slot: u32, result: i32) {
         self.io.results[io_slot as usize] = result;
         self.io.submitted &= !(1 << io_slot);
-        
-        // Dropping the guard here triggers the O(1) top-of-stack rewind
-        // NOW 100% sound because the kernel is done with the pointer.
-        self.inflight_arena_guards.remove(io_slot as usize);
+
+        // Remove and drop from whichever slab held ownership for this io_slot.
+        // Dropping an ArenaAlloc triggers O(1) top-of-stack rewind.
+        // Dropping a Vec<u8> deallocates the heap buffer.
+        if self.buffers.inflight_arena_guards.contains(io_slot as usize) {
+            self.buffers.inflight_arena_guards.remove(io_slot as usize);
+        } else if self.buffers.inflight_vecs.contains(io_slot as usize) {
+            self.buffers.inflight_vecs.remove(io_slot as usize);
+        }
     }
 }
 ```
@@ -294,15 +337,18 @@ Usage:
 ```rust
 async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
     loop {
-        let Some(alloc) = task.arena.alloc_bytes(4096) else {
-            break; // arena exhausted
-        };
-
-        // submit_read moves the ArenaAlloc guard into inflight_arena_guards
-        let io_slot = task.submit_read(fd, alloc, 4096);
-
-        // ... await the IO result via the io state ...
-        // on_cqe_completion drops the guard, reclaiming buffer space
+        // Fast path: Zero-allocation Arena Read
+        if let Some(alloc) = task.buffers.arena.alloc_bytes(4096) {
+            let io_slot = task.submit_read(fd, BufferInput::Arena(alloc), 4096);
+            yield_now().await;
+            if task.io.results[io_slot as usize] < 0 { break; }
+        } else {
+            // Fallback path: Heap vector allocation if arena is full
+            let vec_buf = vec![0u8; 4096];
+            let io_slot = task.submit_read(fd, BufferInput::Vector(vec_buf), 4096);
+            yield_now().await;
+            if task.io.results[io_slot as usize] < 0 { break; }
+        }
     }
 }
 ```
@@ -333,8 +379,8 @@ impl<T, F: Future<Output = ()>, S: Fn(&mut Task<T, F>, T) -> F> Runtime<T, F, S>
 }
 ```
 
-Tasks receive `&mut Task<T, F>` which gives direct access to `arena`, `submit_read()`,
-and `inflight_arena_guards`. No TLS, no `current_arena()` lookup — the task
+Tasks receive `&mut Task<T, F>` which gives direct access to `buffers` (arena + inflight guards),
+`submit_read()`. No TLS, no `current_arena()` lookup — the task
 reference is passed directly into the future's state via the spawn closure.
 
 ---
@@ -379,17 +425,16 @@ completion — no `ReadOp`/`ReadFuture` intermediaries needed.
 ```rust
 async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
     loop {
-        let Some(alloc) = task.arena.alloc_bytes(4096) else {
-            break;
-        };
-
-        let io_slot = task.submit_read(fd, alloc, 4096);
-
-        // Wait for CQE — check submitted bit on each poll via waker
-        // (the runtime's drain_cqes sets task.ready when CQE arrives)
-        yield_now().await;
-
-        if task.io.results[io_slot as usize] < 0 { break; }
+        if let Some(alloc) = task.buffers.arena.alloc_bytes(4096) {
+            let io_slot = task.submit_read(fd, BufferInput::Arena(alloc), 4096);
+            yield_now().await;
+            if task.io.results[io_slot as usize] < 0 { break; }
+        } else {
+            let vec_buf = vec![0u8; 4096];
+            let io_slot = task.submit_read(fd, BufferInput::Vector(vec_buf), 4096);
+            yield_now().await;
+            if task.io.results[io_slot as usize] < 0 { break; }
+        }
     }
 }
 ```
@@ -397,9 +442,9 @@ async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd)
 The submit path:
 
 1. `arena.alloc_bytes(4096)` → returns `ArenaAlloc` guard (marks buffer live)
-2. `task.submit_read(fd, alloc, 4096)`:
+2. `task.submit_read(fd, BufferInput::Arena(alloc), 4096)`:
    - Finds free io_slot via `(!submitted).trailing_zeros()`
-   - Moves `ArenaAlloc` guard into `task.inflight_arena_guards[io_slot]`
+   - Moves `ArenaAlloc` guard into `buffers.inflight_arena_guards[io_slot]`
    - Pushes SQE with pointer into the arena
 3. CQE arrives → `drain_cqes()` → `task.on_cqe_completion(io_slot, result)`:
    - Clears `submitted` bit
@@ -672,8 +717,8 @@ Usage:
 
 ```rust
 // Simple read — allocate from arena, submit, wait for CQE
-let alloc = task.arena.alloc_bytes(4096).unwrap();
-let io_slot = task.submit_read(fd, alloc, 4096);
+let alloc = task.buffers.arena.alloc_bytes(4096).unwrap();
+let io_slot = task.submit_read(fd, BufferInput::Arena(alloc), 4096);
 yield_now().await;
 let result = task.io.results[io_slot as usize];
 
