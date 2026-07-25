@@ -6,12 +6,14 @@
 - Runtime has a single task future type; different behaviors are composed into one future (e.g. an enum dispatch)
 - Zero extra allocation for IO state tracking (inline u64 submitted bitmap + `[i32; 64]` results, heap-overflow variant for >64 IOs)
 - Fast completion dispatch via `user_data` encoding
+- Per-task bump arena for zero-allocation buffer management — all IO buffers, intermediate strings, and small temporaries live in the arena, freed on task completion (O(1) rewind)
 
 ---
 
 ## Runtime Storage
 
-Single `static mut Option<Runtime>`. Single-threaded — no TLS, no contention.
+Single `static mut Option<Runtime>`. Single-threaded — no contention. Uses
+thread-local `CURRENT_TASK_INDEX` for zero-cost arena access during polling.
 
 ```rust
 static mut RUNTIME: Option<Runtime> = None;
@@ -47,6 +49,7 @@ struct Slab<T> {
 struct Task<F: Future> {
     ready: bool,
     io: IoState,
+    arena: TaskArena,
     future: F,
 }
 ```
@@ -60,6 +63,182 @@ supported by the runtime. IO cancellation (via `IORING_OP_ASYNC_CANCEL`) is
 for internal future use only, e.g. implementing select between multiple IOs.
 
 **Access**: `&slots[index]` — O(1), direct, no hashing or version checking.
+
+---
+
+## Task Arena
+
+Each task gets a fixed-size bump arena for zero-allocation buffer management.
+All IO buffers, intermediate strings, and temporaries live in the arena — freed
+on task completion via O(1) offset rewind. No per-allocation `malloc`/`free`,
+no fragmentation, no deallocation cost.
+
+The arena is a simple bump pointer into a pre-allocated byte array. Tasks
+access their arena dynamically via `arena_scope!` (see below), which fetches
+from `CURRENT_TASK_INDEX` TLS — no reference passed at spawn time, no lifetime
+transmutes.
+
+### TaskArena
+
+```rust
+struct TaskArena {
+    base_ptr: *mut u8,      // pointer to arena byte array
+    offset: usize,          // next free byte position
+    prev_offset: usize,     // saved offset for arena_scope! rewind
+    max_capacity: usize,    // total arena size in bytes
+    inflight_locks: u32,    // count of outstanding ArenaBuf borrows
+}
+```
+
+### ArenaBuf
+
+Borrowed view into an arena allocation. Carries a lifetime tied to the arena.
+Does **not** own the memory — the arena owns it.
+
+```rust
+struct ArenaBuf<'a> {
+    ptr: *mut u8,
+    len: usize,
+    arena: &'a mut TaskArena,
+}
+```
+
+`ArenaBuf` is `!Send` and `!Sync` — it cannot leave the task, which is fine
+because the runtime is single-threaded.
+
+### Allocation methods
+
+```rust
+impl TaskArena {
+    fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
+        let aligned_offset = (self.offset + layout.align() - 1) & !(layout.align() - 1);
+        let new_offset = aligned_offset + layout.size();
+        if new_offset > self.max_capacity {
+            return None; // arena exhausted
+        }
+        let ptr = unsafe { self.base_ptr.add(aligned_offset) };
+        self.offset = new_offset;
+        Some(ptr)
+    }
+
+    fn alloc_bytes(&mut self, len: usize) -> Option<ArenaBuf<'_>> {
+        let layout = Layout::from_size_align(len, align_of::<u8>()).unwrap();
+        let ptr = self.alloc(layout)?;
+        Some(ArenaBuf {
+            ptr,
+            len,
+            arena: self,
+        })
+    }
+
+    fn alloc_type<T>(&mut self) -> Option<*mut T> {
+        let layout = Layout::new::<T>();
+        let ptr = self.alloc(layout)? as *mut T;
+        Some(ptr)
+    }
+}
+```
+
+### arena_scope! macro
+
+Forces all `.await` points to happen in-place (cancel-safe), then rewinds the
+arena offset on scope exit. Takes an async closure that receives `&mut TaskArena`
+— the closure's parameter gets a properly higher-ranked local lifetime tied to
+the macro frame, enforced by the borrow checker.
+
+A standalone `fn current_arena<'a>() -> &'a mut TaskArena` is unsound: `'a` is
+unconstrained (no input reference to anchor it), so callers could infer `'static`
+and bypass borrow checking entirely. The macro avoids this by creating the
+`&mut` borrow inside an expanded block and passing it into the closure, where
+Rust's native async closure lifetimes bind it correctly.
+
+```rust
+#[macro_export]
+macro_rules! arena_scope {
+    ($scope_async_closure:expr) => {{
+        let task_idx = $crate::CURRENT_TASK_INDEX.get().expect("no task active");
+
+        // Local re-borrow created inside the macro frame
+        let arena_ref: &mut $crate::TaskArena = unsafe {
+            let rt = (*core::ptr::addr_of_mut!($crate::RUNTIME)).as_mut().unwrap_unchecked();
+            &mut rt.tasks[task_idx as usize].arena
+        };
+
+        // Save complete state frame for nested unwinding
+        let saved_offset = arena_ref.offset;
+        let saved_prev_offset = arena_ref.prev_offset;
+
+        // Execute the native async closure — arena lifetime is bound to this call
+        let result = ($scope_async_closure)(arena_ref).await;
+
+        debug_assert_eq!(
+            arena_ref.inflight_locks, 0,
+            "CRITICAL: Scope exited while io_uring kernel locks were still active!"
+        );
+
+        // Instant O(1) rewind
+        arena_ref.offset = saved_offset;
+        arena_ref.prev_offset = saved_prev_offset;
+
+        result
+    }};
+}
+```
+
+Usage:
+
+```rust
+async fn socket_worker(fd: RawFd) {
+    loop {
+        let keep_going = arena_scope!(async |arena| {
+            // `arena` is &'a mut TaskArena, bound to this async block
+            let layout = Layout::from_size_align(4096, 4096).unwrap();
+            let mut page_buf = arena.alloc(layout).expect("Arena full");
+
+            // Perform io_uring operations...
+            true
+        });
+
+        if !keep_going { break; }
+    }
+}
+```
+
+- **No compiler lies:** `arena` carries an authentic local lifetime `'a`.
+- **Static leak protection:** returning or moving an `ArenaBuf<'a>` out of
+  `arena_scope!` is a hard compile error (`borrowed value does not live long enough`).
+- **Zero overhead:** raw pointer dereference from `CURRENT_TASK_INDEX` — no
+  `RefCell` dynamic borrow checks.
+
+### read_arena wrapper
+
+Convenience wrapper that reads directly into an arena-allocated buffer:
+
+```rust
+fn read_arena<'a, T>(fd: RawFd, arena: &'a mut TaskArena, len: usize) -> ReadOp<'a, T> {
+    let buf = arena.alloc_bytes(len).expect("arena exhausted");
+    read::<T>(fd, buf)
+}
+```
+
+### Spawn integration
+
+`Runtime::spawn` accepts a standard `'static` future — no arena parameters:
+
+```rust
+fn spawn<F>(&mut self, future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let index = self.tasks.insert().expect("slab full");
+    // ... store Task { ready: false, io: IoState::new(), arena: TaskArena::new(), future }
+}
+```
+
+Tasks fetch their arena at runtime via `arena_scope!`, which reads
+`CURRENT_TASK_INDEX` TLS. The outer future stays `'static` — no fake lifetime
+transmutes. Inner arena borrows are properly bounded by the async closure's
+execution frame, enforced by the borrow checker.
 
 ---
 
@@ -265,6 +444,23 @@ fn task_index(cx: &Context) -> u32 {
 }
 ```
 
+### CURRENT_TASK_INDEX
+
+The runtime sets a thread-local `CURRENT_TASK_INDEX` before polling each task.
+`arena_scope!` reads this to fetch the current task's arena — no parameters
+passed into task entry points, no lifetime transmutes, no `RefCell`.
+
+```rust
+use std::cell::Cell;
+
+thread_local! {
+    static CURRENT_TASK_INDEX: Cell<Option<u32>> = const { Cell::new(None) };
+}
+```
+
+`poll_one` sets this to `Some(index)` before calling `task.future.poll(cx)`,
+resets to `None` after (see Event Loop).
+
 ---
 
 ## Event Loop
@@ -296,12 +492,14 @@ loop {
 fn poll_one(index: u32) {
     let task = &mut tasks[index];
     task.ready = false;
+    CURRENT_TASK_INDEX.set(Some(index));
     let w = waker(index);
     let mut cx = Context::from_waker(&w);
     match task.future.poll(cx) {
         Poll::Ready(()) => tasks.remove(index),
         Poll::Pending => {}
     }
+    CURRENT_TASK_INDEX.set(None);
 }
 ```
 
