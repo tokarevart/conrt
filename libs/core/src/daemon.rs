@@ -9,14 +9,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use conrt_cstring::CString;
+use conrt_sys as sys;
 use io_uring::IoUring;
 use libc::pid_t;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::cstring::CString;
 use crate::interprocess;
-use crate::sys;
 use crate::uring;
 
 const CACHE_CAPACITY: usize = 65536;

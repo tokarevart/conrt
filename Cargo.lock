@@ -62,12 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.103"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -129,15 +123,40 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "conrt"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
+ "conrt-core",
+ "conrt-cstring",
+ "conrt-sys",
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "conrt-core"
+version = "0.1.0"
+dependencies = [
+ "conrt-cstring",
+ "conrt-sys",
  "io-uring",
  "libc",
  "serde",
  "serde_json",
- "thiserror",
  "tracing",
- "tracing-subscriber",
+]
+
+[[package]]
+name = "conrt-cstring"
+version = "0.1.0"
+
+[[package]]
+name = "conrt-sys"
+version = "0.1.0"
+dependencies = [
+ "conrt-cstring",
+ "libc",
 ]
 
 [[package]]
@@ -337,26 +356,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

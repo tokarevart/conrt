@@ -1,15 +1,18 @@
+[workspace]
+members = ["libs/*"]
+
 [package]
 name = "conrt"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+conrt-core = { path = "libs/core" }
+conrt-cstring = { path = "libs/cstring" }
+conrt-sys = { path = "libs/sys" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-io-uring = "0.7"

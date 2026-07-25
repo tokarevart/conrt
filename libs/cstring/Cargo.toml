@@ -1,0 +1,4 @@
+[package]
+name = "conrt-cstring"
+version = "0.1.0"
+edition = "2024"

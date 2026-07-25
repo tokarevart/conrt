@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use core::convert::Infallible;
 use core::ffi::c_char;
 use core::fmt;

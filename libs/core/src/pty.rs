@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use crate::sys;
+use conrt_sys as sys;
 
 /// A PTY master fd. The fd is closed on drop.
 pub struct PtyMaster(RawFd);

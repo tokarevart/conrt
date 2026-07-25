@@ -1,7 +1,7 @@
 use std::io;
 
-use crate::sys;
-use crate::sys::FdPair;
+use conrt_sys as sys;
+use conrt_sys::FdPair;
 
 pub struct OneshotSignal {
     fds: FdPair,

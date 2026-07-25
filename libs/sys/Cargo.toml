@@ -1,0 +1,8 @@
+[package]
+name = "conrt-sys"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+conrt-cstring = { path = "../cstring" }
+libc = "0.2"

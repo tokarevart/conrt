@@ -1,0 +1,13 @@
+[package]
+name = "conrt-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+conrt-cstring = { path = "../cstring" }
+conrt-sys = { path = "../sys" }
+io-uring = "0.7"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"

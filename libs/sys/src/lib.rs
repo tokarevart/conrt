@@ -4,17 +4,14 @@
 //! no buffer reinterpretation, no null-termination guarantees. Caller
 //! manages all layout and owns all buffers.
 
-#![allow(dead_code)]
-
 use core::ffi::c_char;
 use core::ffi::c_int;
 use std::io;
 use std::os::fd::RawFd;
 
+use conrt_cstring::CStr;
+use conrt_cstring::CString;
 use libc::pid_t;
-
-use crate::cstring::CStr;
-use crate::cstring::CString;
 
 #[inline]
 fn sys_ensure(ret: i32) -> io::Result<i32> {
@@ -43,6 +40,10 @@ macro_rules! syscall {
 }
 
 /// `read(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `size_of::<T>()` bytes.
 #[inline]
 pub unsafe fn read_value<T>(fd: RawFd, buf: &mut T) -> io::Result<isize> {
     syscall!(libc::SYS_read, fd, buf as *mut _, size_of::<T>())
@@ -55,6 +56,10 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<isize> {
 }
 
 /// `write(fd, buf, count)` — raw syscall, does NOT retry on `EINTR`.
+///
+/// # Safety
+///
+/// `buf` must be valid for reads of `size_of::<T>()` bytes.
 #[inline]
 pub unsafe fn write_value<T>(fd: RawFd, buf: &T) -> io::Result<isize> {
     syscall!(libc::SYS_write, fd, buf as *const _, size_of::<T>())
@@ -162,6 +167,11 @@ pub fn execvp(argv: &ArgvSlice) -> io::Error {
 
 /// `clone3(args, size)` — raw syscall. Returns 0 in the child, child pid
 /// in the parent. Caller interprets the return value.
+///
+/// # Safety
+///
+/// `args` must point to a valid `clone_args` structure with sensible fields.
+/// The kernel may read all fields, including optional ones.
 #[inline]
 pub unsafe fn clone3(args: &libc::clone_args) -> io::Result<isize> {
     syscall!(
