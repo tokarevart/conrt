@@ -648,13 +648,24 @@ Two outcomes when a cancel is submitted:
 
 Both cases are idempotent — the `submitted` bit ends up clear either way.
 
+### Cancel trait
+
+Implemented by IO futures. Provides a `cancel()` method that returns a future
+which submits a cancel SQE and waits for the CQE. Users can implement `Cancel`
+for composed futures to make entire compositions cancellable.
+
+```rust
+trait Cancel: Future {
+    type CancelFuture: Future<Output = ()>;
+    fn cancel(&mut self) -> Self::CancelFuture;
+}
+```
+
 ### CancelFuture
 
-A standalone future that cancels one in-flight IO. Reusable outside select
-— any future can create one and `.await` it to cancel a pending operation.
-
-The `io_slot` is known at creation time (reserved by `ReadOp`). No shared
-state needed.
+Concrete future returned by `Cancel::cancel()`. Submits a cancel SQE on first
+poll, checks the CQE on subsequent polls. Created by IO futures when they
+implement `Cancel`.
 
 ```rust
 struct CancelFuture {
@@ -687,29 +698,75 @@ impl Future for CancelFuture {
 }
 ```
 
-### Select
+### Implementing Cancel for IO futures
 
-Generic future combinator. Races any two futures, optionally applies a
-closure to the winner's result, then cancels the loser and waits for the
-cancel future to complete before returning.
-
-Accepts `(future, cancel_token)` tuples — each arm carries its own future
-and cancellation mechanism. The cancel tokens are generic `Future<Output = ()>`,
-not tied to any specific runtime. IO futures return `CancelFuture`; other
-futures may return no-op or custom cancel tokens.
+Any IO future that holds an `io_slot` can implement `Cancel`:
 
 ```rust
-fn select<A, B, CA, CB>(
-    a: (A, CA),
-    b: (B, CB),
-) -> Select<A, B, CA, CB>
+impl Cancel for MyIoFuture {
+    type CancelFuture = CancelFuture;
+
+    fn cancel(&mut self) -> CancelFuture {
+        CancelFuture { io_slot: self.io_slot, submitted: false }
+    }
+}
+```
+
+Composed futures implement `Cancel` by canceling all sub-operations:
+
+```rust
+struct ComposedIo {
+    slot_a: u32,
+    slot_b: u32,
+}
+
+impl Cancel for ComposedIo {
+    type CancelFuture = ComposedCancelFuture;
+
+    fn cancel(&mut self) -> ComposedCancelFuture {
+        ComposedCancelFuture {
+            cancel_a: CancelFuture { io_slot: self.slot_a, submitted: false },
+            cancel_b: CancelFuture { io_slot: self.slot_b, submitted: false },
+        }
+    }
+}
+
+struct ComposedCancelFuture {
+    cancel_a: CancelFuture,
+    cancel_b: CancelFuture,
+}
+
+impl Future for ComposedCancelFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let a = unsafe { Pin::new_unchecked(&mut this.cancel_a) };
+        let b = unsafe { Pin::new_unchecked(&mut this.cancel_b) };
+        if a.poll(cx).is_pending() || b.poll(cx).is_pending() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+```
+
+### Select
+
+Generic future combinator. Races any two cancellable futures, then cancels the
+loser and waits for the cancel to complete before returning.
+
+Both futures must implement `Cancel` — when one wins, the other's `cancel()`
+is called to produce a cancel future that is polled until completion.
+
+```rust
+fn select<A, B>(a: A, b: B) -> Select<A, B>
 where
-    A: Future,
-    B: Future<Output = A::Output>,
-    CA: Future<Output = ()>,
-    CB: Future<Output = ()>,
+    A: Cancel,
+    B: Cancel<Output = A::Output>,
 {
-    Select { a: a.0, b: b.0, cancel_a: a.1, cancel_b: b.1, result: MaybeUninit::uninit(), phase: Racing, winner: 0 }
+    Select { a, b, cancel_fut: None, result: MaybeUninit::uninit(), phase: Racing, winner: 0 }
 }
 ```
 
@@ -722,7 +779,7 @@ let io_slot = task.submit_read(fd, BufferInput::Arena(alloc), 4096);
 yield_now().await;
 let result = task.io.results[io_slot as usize];
 
-// Select between two reads
+// Select between two reads — both futures implement Cancel
 select(
     read_task_a(task_a, fd1, buf1),
     read_task_b(task_b, fd2, buf2),
@@ -732,11 +789,19 @@ select(
 #### Select (no closure)
 
 ```rust
-struct Select<A, B, CA, CB> {
+enum CancelFut<A: Cancel, B: Cancel> {
+    A(A::CancelFuture),
+    B(B::CancelFuture),
+}
+
+struct Select<A, B>
+where
+    A: Cancel,
+    B: Cancel,
+{
     a: A,
     b: B,
-    cancel_a: CA,
-    cancel_b: CB,
+    cancel_fut: Option<CancelFut<A, B>>,
     result: MaybeUninit<A::Output>,
     phase: SelectPhase,
     winner: u8,
@@ -747,12 +812,10 @@ enum SelectPhase {
     CancelPending,
 }
 
-impl<A, B, CA, CB> Future for Select<A, B, CA, CB>
+impl<A, B> Future for Select<A, B>
 where
-    A: Future,
-    B: Future<Output = A::Output>,
-    CA: Future<Output = ()>,
-    CB: Future<Output = ()>,
+    A: Cancel,
+    B: Cancel<Output = A::Output>,
 {
     type Output = A::Output;
 
@@ -761,61 +824,78 @@ where
 
         match this.phase {
             Racing => {
-                let a = unsafe { Pin::new_unchecked(&mut this.a) };
-                let b = unsafe { Pin::new_unchecked(&mut this.b) };
-
-                let winner_result = if let Poll::Ready(result) = a.poll(cx) {
-                    this.winner = 0;
-                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_b) };
-                    let _ = cancel.poll(cx); // submits cancel SQE
-                    result
-                } else if let Poll::Ready(result) = b.poll(cx) {
-                    this.winner = 1;
-                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_a) };
-                    let _ = cancel.poll(cx);
-                    result
-                } else {
-                    return Poll::Pending;
+                // Poll a — release borrow before calling cancel on b
+                let winner_result = {
+                    let a = unsafe { Pin::new_unchecked(&mut this.a) };
+                    match a.poll(cx) {
+                        Poll::Ready(result) => {
+                            this.winner = 0;
+                            Some(result)
+                        }
+                        Poll::Pending => None,
+                    }
                 };
 
-                this.result = MaybeUninit::new(winner_result);
-                this.phase = CancelPending;
+                if let Some(result) = winner_result {
+                    this.result = MaybeUninit::new(result);
+                    let cancel = this.b.cancel();
+                    this.cancel_fut = Some(CancelFut::B(cancel));
+                    this.phase = CancelPending;
+                    return Poll::Pending;
+                }
+
+                // Poll b
+                let winner_result = {
+                    let b = unsafe { Pin::new_unchecked(&mut this.b) };
+                    match b.poll(cx) {
+                        Poll::Ready(result) => {
+                            this.winner = 1;
+                            Some(result)
+                        }
+                        Poll::Pending => None,
+                    }
+                };
+
+                if let Some(result) = winner_result {
+                    this.result = MaybeUninit::new(result);
+                    let cancel = this.a.cancel();
+                    this.cancel_fut = Some(CancelFut::A(cancel));
+                    this.phase = CancelPending;
+                    return Poll::Pending;
+                }
+
                 Poll::Pending
             }
 
             CancelPending => {
-                let cancel = if this.winner == 0 {
-                    unsafe { Pin::new_unchecked(&mut this.cancel_b) }
-                } else {
-                    unsafe { Pin::new_unchecked(&mut this.cancel_a) }
+                let cancel_fut = this.cancel_fut.as_mut().unwrap();
+                let done = match cancel_fut {
+                    CancelFut::A(f) => unsafe { Pin::new_unchecked(f) }.poll(cx).is_ready(),
+                    CancelFut::B(f) => unsafe { Pin::new_unchecked(f) }.poll(cx).is_ready(),
                 };
-                match cancel.poll(cx) {
-                    Poll::Ready(()) => {
-                        Poll::Ready(unsafe { this.result.assume_init_read() })
-                    }
-                    Poll::Pending => Poll::Pending,
+                if done {
+                    Poll::Ready(unsafe { this.result.assume_init_read() })
+                } else {
+                    Poll::Pending
                 }
             }
         }
     }
 }
 
-impl<A, B, CA, CB> Select<A, B, CA, CB>
+impl<A, B> Select<A, B>
 where
-    A: Future,
-    B: Future<Output = A::Output>,
-    CA: Future<Output = ()>,
-    CB: Future<Output = ()>,
+    A: Cancel,
+    B: Cancel<Output = A::Output>,
 {
-    fn then<F, T>(self, closure: F) -> SelectThen<A, B, CA, CB, F, T>
+    fn then<F, T>(self, closure: F) -> SelectThen<A, B, F, T>
     where
         F: FnOnce(A::Output) -> T,
     {
         SelectThen {
             a: self.a,
             b: self.b,
-            cancel_a: self.cancel_a,
-            cancel_b: self.cancel_b,
+            cancel_fut: self.cancel_fut,
             closure,
             closure_result: MaybeUninit::uninit(),
             phase: self.phase,
@@ -828,23 +908,24 @@ where
 #### SelectThen (with closure)
 
 ```rust
-struct SelectThen<A, B, CA, CB, F, T> {
+struct SelectThen<A, B, F, T>
+where
+    A: Cancel,
+    B: Cancel,
+{
     a: A,
     b: B,
-    cancel_a: CA,
-    cancel_b: CB,
+    cancel_fut: Option<CancelFut<A, B>>,
     closure: F,
     closure_result: MaybeUninit<T>,
     phase: SelectPhase,
     winner: u8,
 }
 
-impl<A, B, CA, CB, F, T> Future for SelectThen<A, B, CA, CB, F, T>
+impl<A, B, F, T> Future for SelectThen<A, B, F, T>
 where
-    A: Future,
-    B: Future<Output = A::Output>,
-    CA: Future<Output = ()>,
-    CB: Future<Output = ()>,
+    A: Cancel,
+    B: Cancel<Output = A::Output>,
     F: FnOnce(A::Output) -> T,
 {
     type Output = T;
@@ -854,40 +935,59 @@ where
 
         match this.phase {
             Racing => {
-                let a = unsafe { Pin::new_unchecked(&mut this.a) };
-                let b = unsafe { Pin::new_unchecked(&mut this.b) };
-
-                let winner_result = if let Poll::Ready(result) = a.poll(cx) {
-                    this.winner = 0;
-                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_b) };
-                    let _ = cancel.poll(cx);
-                    result
-                } else if let Poll::Ready(result) = b.poll(cx) {
-                    this.winner = 1;
-                    let cancel = unsafe { Pin::new_unchecked(&mut this.cancel_a) };
-                    let _ = cancel.poll(cx);
-                    result
-                } else {
-                    return Poll::Pending;
+                let winner_result = {
+                    let a = unsafe { Pin::new_unchecked(&mut this.a) };
+                    match a.poll(cx) {
+                        Poll::Ready(result) => {
+                            this.winner = 0;
+                            Some(result)
+                        }
+                        Poll::Pending => None,
+                    }
                 };
 
-                let closure_result = (this.closure)(winner_result);
-                this.closure_result = MaybeUninit::new(closure_result);
-                this.phase = CancelPending;
+                if let Some(result) = winner_result {
+                    let closure_result = (this.closure)(result);
+                    this.closure_result = MaybeUninit::new(closure_result);
+                    let cancel = this.b.cancel();
+                    this.cancel_fut = Some(CancelFut::B(cancel));
+                    this.phase = CancelPending;
+                    return Poll::Pending;
+                }
+
+                let winner_result = {
+                    let b = unsafe { Pin::new_unchecked(&mut this.b) };
+                    match b.poll(cx) {
+                        Poll::Ready(result) => {
+                            this.winner = 1;
+                            Some(result)
+                        }
+                        Poll::Pending => None,
+                    }
+                };
+
+                if let Some(result) = winner_result {
+                    let closure_result = (this.closure)(result);
+                    this.closure_result = MaybeUninit::new(closure_result);
+                    let cancel = this.a.cancel();
+                    this.cancel_fut = Some(CancelFut::A(cancel));
+                    this.phase = CancelPending;
+                    return Poll::Pending;
+                }
+
                 Poll::Pending
             }
 
             CancelPending => {
-                let cancel = if this.winner == 0 {
-                    unsafe { Pin::new_unchecked(&mut this.cancel_b) }
-                } else {
-                    unsafe { Pin::new_unchecked(&mut this.cancel_a) }
+                let cancel_fut = this.cancel_fut.as_mut().unwrap();
+                let done = match cancel_fut {
+                    CancelFut::A(f) => unsafe { Pin::new_unchecked(f) }.poll(cx).is_ready(),
+                    CancelFut::B(f) => unsafe { Pin::new_unchecked(f) }.poll(cx).is_ready(),
                 };
-                match cancel.poll(cx) {
-                    Poll::Ready(()) => {
-                        Poll::Ready(unsafe { this.closure_result.assume_init_read() })
-                    }
-                    Poll::Pending => Poll::Pending,
+                if done {
+                    Poll::Ready(unsafe { this.closure_result.assume_init_read() })
+                } else {
+                    Poll::Pending
                 }
             }
         }
@@ -899,15 +999,14 @@ where
 
 ```
 poll 1 (Racing):
-  → poll both futures
-  → a returns Ready(result)
-  → poll b's cancel future → submits cancel SQE
+  → poll a → Ready(result)
+  → call b.cancel() → stores CancelFuture in cancel_fut
   → run closure(result) → store closure_result (SelectThen only)
   → transition to CancelPending
   → return Pending
 
 poll 2 (CancelPending):
-  → poll cancel future → check submitted bit
+  → poll cancel_fut → check submitted bit
   → if clear → return Ready(result / closure_result)
   → if set → return Pending
 ```
