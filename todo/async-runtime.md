@@ -6,7 +6,7 @@
 - Runtime has a single task future type; different behaviors are composed into one future (e.g. an enum dispatch)
 - Zero extra allocation for IO state tracking (inline u64 submitted bitmap + `[i32; 64]` results, heap-overflow variant for >64 IOs)
 - Fast completion dispatch via `user_data` encoding
-- Per-task bump arena for zero-allocation buffer management — all IO buffers, intermediate strings, and small temporaries live in the arena, freed on task completion (O(1) rewind)
+- Per-task bump arena for zero-allocation buffer management — each allocation returns an `ArenaAlloc` guard that deallocates on drop with O(1) pop from the top
 
 ---
 
@@ -73,115 +73,200 @@ All IO buffers, intermediate strings, and temporaries live in the arena — free
 on task completion via O(1) offset rewind. No per-allocation `malloc`/`free`,
 no fragmentation, no deallocation cost.
 
-The arena is a simple bump pointer into a pre-allocated byte array. Tasks
-access their arena dynamically via `arena_scope!` (see below), which fetches
-from `CURRENT_TASK_INDEX` TLS — no reference passed at spawn time, no lifetime
-transmutes.
+Each allocation returns an `ArenaAlloc` guard that marks the allocation as
+deallocated on drop. If the allocation is at the top of the arena, the guard
+pops it and all consecutive deallocated allocations below it until hitting a
+live allocation. If it's not at the top, it just marks it deallocated — the
+space is reclaimed later when upper allocations are dropped.
 
 ### TaskArena
 
 ```rust
+const ARENA_MAX: u32 = u32::MAX;
+const FOOTER_SIZE: u32 = core::mem::size_of::<AllocFooter>() as u32;
+
+#[repr(C, packed)]
+struct AllocFooter {
+    size: u32,        // span from previous footer end to this footer start (includes alignment padding)
+    deallocated: u8,  // 0 = live, 1 = dead
+}
+
 struct TaskArena {
-    base_ptr: *mut u8,      // pointer to arena byte array
-    offset: usize,          // next free byte position
-    prev_offset: usize,     // saved offset for arena_scope! rewind
-    max_capacity: usize,    // total arena size in bytes
-    inflight_locks: u32,    // count of outstanding ArenaBuf borrows
+    base_ptr: *mut u8,
+    offset: u32,       // next free byte (end of last footer)
+    max_capacity: u32, // arena size in bytes (≤ u32::MAX)
 }
 ```
 
-### ArenaBuf
+Three fields (16 bytes with pointer), zero heap allocation for metadata. Arena
+capacity is capped at `u32::MAX` (4GB) — plenty for per-task IO buffers. Every
+allocation's metadata lives inside the arena buffer itself, right after the
+allocated bytes:
 
-Borrowed view into an arena allocation. Carries a lifetime tied to the arena.
-Does **not** own the memory — the arena owns it.
+```
+[alloc A bytes][footer A] [alloc B bytes][footer B] [alloc C bytes][footer C] ...
+                                                           ^
+                                                     offset
+```
+
+The footer of the current top allocation is always at
+`base_ptr + offset - FOOTER_SIZE`. Walking backward from any footer to the
+previous one: read `footer.size` (includes alignment padding) → previous footer
+at `current - FOOTER_SIZE - size` → check its `deallocated` flag → repeat.
+
+### ArenaAlloc
+
+RAII guard returned by every allocation. On drop, marks the allocation as
+deallocated and pops from the top of the arena if possible.
 
 ```rust
-struct ArenaBuf<'a> {
-    ptr: *mut u8,
-    len: usize,
+struct ArenaAlloc<'a> {
     arena: &'a mut TaskArena,
+    alloc_offset: u32, // where user data starts in the arena buffer
+    alloc_size: u32,   // byte count of the allocation (needed to find its footer)
 }
 ```
 
-`ArenaBuf` is `!Send` and `!Sync` — it cannot leave the task, which is fine
-because the runtime is single-threaded.
+16 bytes. `ArenaAlloc` is `!Send` and `!Sync` — it cannot leave the task.
+
+```rust
+impl<'a> Drop for ArenaAlloc<'a> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // Mark this allocation's footer as deallocated
+        let footer = unsafe {
+            &mut *(self.arena.base_ptr
+                .add(self.alloc_offset as usize)
+                .add(self.alloc_size as usize) as *mut AllocFooter)
+        };
+        footer.deallocated = 1;
+
+        // Pop from top while consecutive deallocated footers
+        while self.arena.offset > FOOTER_SIZE {
+            let top = unsafe {
+                &mut *(self.arena.base_ptr
+                    .add((self.arena.offset - FOOTER_SIZE) as usize) as *mut AllocFooter)
+            };
+            if top.deallocated == 0 { break; }
+            let size = top.size;
+            self.arena.offset -= FOOTER_SIZE + size;
+            // Clear flag — clean state for reused memory
+            let new_top = unsafe {
+                &mut *(self.arena.base_ptr
+                    .add((self.arena.offset - FOOTER_SIZE) as usize) as *mut AllocFooter)
+            };
+            new_top.deallocated = 0;
+        }
+    }
+}
+```
 
 ### Allocation methods
 
 ```rust
 impl TaskArena {
-    fn alloc(&mut self, layout: Layout) -> Option<*mut u8> {
-        let aligned_offset = (self.offset + layout.align() - 1) & !(layout.align() - 1);
-        let new_offset = aligned_offset + layout.size();
-        if new_offset > self.max_capacity {
+    fn alloc(&mut self, layout: Layout) -> Option<ArenaAlloc<'_>> {
+        let align = layout.align() as u32;
+        let size = layout.size() as u32;
+        let aligned = (self.offset + align - 1) & !(align - 1);
+        let padded = aligned + size;
+        // Check with u32 arithmetic — no overflow since max_capacity ≤ u32::MAX
+        if padded + FOOTER_SIZE > self.max_capacity || padded + FOOTER_SIZE < padded {
             return None; // arena exhausted
         }
-        let ptr = unsafe { self.base_ptr.add(aligned_offset) };
-        self.offset = new_offset;
-        Some(ptr)
-    }
-
-    fn alloc_bytes(&mut self, len: usize) -> Option<ArenaBuf<'_>> {
-        let layout = Layout::from_size_align(len, align_of::<u8>()).unwrap();
-        let ptr = self.alloc(layout)?;
-        Some(ArenaBuf {
-            ptr,
-            len,
+        // Write footer — size includes alignment padding so pop can walk backward
+        let footer = unsafe {
+            &mut *(self.base_ptr.add(padded as usize) as *mut AllocFooter)
+        };
+        footer.size = padded - self.offset;
+        footer.deallocated = 0;
+        self.offset = padded + FOOTER_SIZE;
+        Some(ArenaAlloc {
             arena: self,
+            alloc_offset: aligned,
+            alloc_size: size,
         })
     }
 
-    fn alloc_type<T>(&mut self) -> Option<*mut T> {
-        let layout = Layout::new::<T>();
-        let ptr = self.alloc(layout)? as *mut T;
-        Some(ptr)
+    fn alloc_bytes(&mut self, len: u32) -> Option<ArenaAlloc<'_>> {
+        self.alloc(Layout::from_size_align(len as usize, align_of::<u8>()).unwrap())
+    }
+
+    fn alloc_type<T>(&mut self) -> Option<ArenaAlloc<'_>> {
+        self.alloc(Layout::new::<T>())
     }
 }
 ```
 
-### arena_scope! macro
+### Pop behavior — examples
 
-Forces all `.await` points to happen in-place (cancel-safe), then rewinds the
-arena offset on scope exit. Takes an async closure that receives `&mut TaskArena`
-— the closure's parameter gets a properly higher-ranked local lifetime tied to
-the macro frame, enforced by the borrow checker.
+```
+Arena layout after 3 allocations:
+  [pad A][A:100B][fA] [pad B][B:64B][fB] [C:32B][fC] ...
+  fA.size = 100 + pad A (includes alignment gap)
+  fB.size = 64 + pad B
+  fC.size = 32 (no padding needed)
+  offset = end of fC
 
-A standalone `fn current_arena<'a>() -> &'a mut TaskArena` is unsound: `'a` is
-unconstrained (no input reference to anchor it), so callers could infer `'static`
-and bypass borrow checking entirely. The macro avoids this by creating the
-`&mut` borrow inside an expanded block and passing it into the closure, where
-Rust's native async closure lifetimes bind it correctly.
+Drop B (not at top):
+  mark fB.deallocated = 1
+  offset stays — fC is still live
+
+Drop C (at top):
+  mark fC.deallocated = 1
+  check top footer → fC deallocated → pop: offset -= 8 + 32
+  check new top footer → fB deallocated → pop: offset -= 8 + fB.size
+  check new top footer → fA live → stop
+  offset now points right after fA
+
+Drop A (now at top):
+  mark fA.deallocated = 1
+  pop: offset -= 8 + fA.size
+  offset = 0 — full arena reclaim
+```
+
+### Cancellation safety
+
+io_uring is completion-based — the kernel holds raw pointers to arena memory
+while operations are in-flight. The `ArenaAlloc` guard's lifetime is tied to
+the IO future that uses its buffer. When the future completes (or is dropped),
+the guard drops and marks the allocation deallocated.
+
+If an IO future is cancelled mid-`await`, the kernel may still own the buffer.
+The guard drops and marks the allocation deallocated — if it's at the top, it
+pops and rewinds. This is safe because:
+
+1. The kernel only reads/writes via the SQE's raw pointer, which was submitted
+   before the future was cancelled.
+2. The CQE for this IO will eventually arrive, at which point the kernel is
+   done with the buffer.
+3. Between the guard drop and the CQE arrival, the bytes may be reused by a
+   new allocation — but the new allocation's SQE has not been submitted yet
+   (the future hasn't been polled), so the kernel doesn't have a pointer to
+   the reused bytes.
+4. The SQE submission happens in the future's first poll, which occurs after
+   the guard has returned the pointer — so the new SQE points to the new
+   allocation's region, not the old one.
+
+The key invariant: **the kernel only operates on memory via SQE submissions,
+and SQEs are only submitted during polling, never during allocation.** So
+deallocating (marking + optional pop) never races with kernel R/W.
+
+### read_arena wrapper
+
+Returns an `ArenaAlloc` guard alongside the `ReadOp`. The guard must outlive
+the read — the caller holds it until the read completes:
 
 ```rust
-#[macro_export]
-macro_rules! arena_scope {
-    ($scope_async_closure:expr) => {{
-        let task_idx = $crate::CURRENT_TASK_INDEX.get().expect("no task active");
-
-        // Local re-borrow created inside the macro frame
-        let arena_ref: &mut $crate::TaskArena = unsafe {
-            let rt = (*core::ptr::addr_of_mut!($crate::RUNTIME)).as_mut().unwrap_unchecked();
-            &mut rt.tasks[task_idx as usize].arena
-        };
-
-        // Save complete state frame for nested unwinding
-        let saved_offset = arena_ref.offset;
-        let saved_prev_offset = arena_ref.prev_offset;
-
-        // Execute the native async closure — arena lifetime is bound to this call
-        let result = ($scope_async_closure)(arena_ref).await;
-
-        debug_assert_eq!(
-            arena_ref.inflight_locks, 0,
-            "CRITICAL: Scope exited while io_uring kernel locks were still active!"
-        );
-
-        // Instant O(1) rewind
-        arena_ref.offset = saved_offset;
-        arena_ref.prev_offset = saved_prev_offset;
-
-        result
-    }};
+fn read_arena<'a, T>(
+    fd: RawFd,
+    arena: &'a mut TaskArena,
+    len: u32,
+) -> Option<(ArenaAlloc<'a>, ReadOp<'a, T>)> {
+    let alloc = arena.alloc_bytes(len)?;
+    let ptr = unsafe { arena.base_ptr.add(alloc.alloc_offset as usize) };
+    let op = read::<T>(fd, ptr, len as usize);
+    Some((alloc, op))
 }
 ```
 
@@ -190,34 +275,16 @@ Usage:
 ```rust
 async fn socket_worker(fd: RawFd) {
     loop {
-        let keep_going = arena_scope!(async |arena| {
-            // `arena` is &'a mut TaskArena, bound to this async block
-            let layout = Layout::from_size_align(4096, 4096).unwrap();
-            let mut page_buf = arena.alloc(layout).expect("Arena full");
+        let arena = current_arena();
+        let Some((guard, op)) = read_arena::<i32>(fd, arena, 4096) else {
+            break; // arena exhausted
+        };
 
-            // Perform io_uring operations...
-            true
-        });
+        let result = op.await;
+        // guard drops here — marks allocation deallocated, pops if at top
 
-        if !keep_going { break; }
+        if result < 0 { break; }
     }
-}
-```
-
-- **No compiler lies:** `arena` carries an authentic local lifetime `'a`.
-- **Static leak protection:** returning or moving an `ArenaBuf<'a>` out of
-  `arena_scope!` is a hard compile error (`borrowed value does not live long enough`).
-- **Zero overhead:** raw pointer dereference from `CURRENT_TASK_INDEX` — no
-  `RefCell` dynamic borrow checks.
-
-### read_arena wrapper
-
-Convenience wrapper that reads directly into an arena-allocated buffer:
-
-```rust
-fn read_arena<'a, T>(fd: RawFd, arena: &'a mut TaskArena, len: usize) -> ReadOp<'a, T> {
-    let buf = arena.alloc_bytes(len).expect("arena exhausted");
-    read::<T>(fd, buf)
 }
 ```
 
@@ -235,10 +302,9 @@ where
 }
 ```
 
-Tasks fetch their arena at runtime via `arena_scope!`, which reads
-`CURRENT_TASK_INDEX` TLS. The outer future stays `'static` — no fake lifetime
-transmutes. Inner arena borrows are properly bounded by the async closure's
-execution frame, enforced by the borrow checker.
+Tasks access their arena via `current_arena()` which reads `CURRENT_TASK_INDEX`
+TLS. Each allocation returns an `ArenaAlloc` guard — the borrow checker ensures
+the guard outlives the buffer usage. No lifetime transmutes needed.
 
 ---
 
@@ -447,8 +513,8 @@ fn task_index(cx: &Context) -> u32 {
 ### CURRENT_TASK_INDEX
 
 The runtime sets a thread-local `CURRENT_TASK_INDEX` before polling each task.
-`arena_scope!` reads this to fetch the current task's arena — no parameters
-passed into task entry points, no lifetime transmutes, no `RefCell`.
+`current_arena()` reads this to fetch the current task's arena dynamically —
+no reference passed at spawn time, no lifetime transmutes.
 
 ```rust
 use std::cell::Cell;
