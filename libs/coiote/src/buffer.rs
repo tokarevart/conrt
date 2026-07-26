@@ -9,26 +9,30 @@ pub trait IoWriteBuffer: Sized {
 }
 
 /// # Safety
-/// Slot must correspond to a completed IO operation.
+/// Slot must correspond to a completed IO operation (ready bit set).
 /// Caller must guarantee the buffer's underlying memory is still valid.
 pub unsafe fn complete_read<B: Sized>(task: &mut Task, slot: u32) -> Option<B> {
-    let alloc = task.inflight.remove(slot);
+    let alloc = task.io.take_alloc(slot);
     let value = task.arena.read::<B>(&alloc);
     unsafe {
         task.arena.dealloc(alloc);
     }
+    task.io.set_submitted(slot, false);
+    task.io.set_ready(slot, false);
     Some(value)
 }
 
 /// # Safety
-/// Slot must correspond to a completed IO operation.
+/// Slot must correspond to a completed IO operation (ready bit set).
 /// Caller must guarantee the buffer's underlying memory is still valid.
 pub unsafe fn complete_write<B: Sized>(task: &mut Task, slot: u32) -> Option<B> {
-    let alloc = task.inflight.remove(slot);
+    let alloc = task.io.take_alloc(slot);
     let value = task.arena.read::<B>(&alloc);
     unsafe {
         task.arena.dealloc(alloc);
     }
+    task.io.set_submitted(slot, false);
+    task.io.set_ready(slot, false);
     Some(value)
 }
 
@@ -37,7 +41,7 @@ impl IoReadBuffer for Vec<u8> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
         let alloc = task.arena.alloc_write(self)?;
-        task.inflight.insert_at(slot, alloc);
+        task.io.set_alloc(slot, alloc);
         Some(slot)
     }
 }
@@ -47,7 +51,7 @@ impl IoWriteBuffer for Vec<u8> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
         let alloc = task.arena.alloc_write(self)?;
-        task.inflight.insert_at(slot, alloc);
+        task.io.set_alloc(slot, alloc);
         Some(slot)
     }
 }
@@ -57,7 +61,7 @@ impl IoWriteBuffer for &[u8] {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
         let alloc = task.arena.alloc_write(self)?;
-        task.inflight.insert_at(slot, alloc);
+        task.io.set_alloc(slot, alloc);
         Some(slot)
     }
 }
@@ -67,7 +71,7 @@ impl IoReadBuffer for &mut [u8] {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
         let alloc = task.arena.alloc_write(self)?;
-        task.inflight.insert_at(slot, alloc);
+        task.io.set_alloc(slot, alloc);
         Some(slot)
     }
 }
@@ -77,7 +81,7 @@ impl IoWriteBuffer for &mut [u8] {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
         let alloc = task.arena.alloc_write(self)?;
-        task.inflight.insert_at(slot, alloc);
+        task.io.set_alloc(slot, alloc);
         Some(slot)
     }
 }

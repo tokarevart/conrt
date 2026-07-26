@@ -4,17 +4,42 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use std::alloc::alloc;
 use std::alloc::dealloc;
-use std::alloc::handle_alloc_error;
 use std::cell::Cell;
 use std::num::NonZeroU32;
 
 pub const ARENA_MAX: u32 = u32::MAX;
 pub const FOOTER_SIZE: u32 = size_of::<AllocFooter>() as u32;
+pub const PAGE_SIZE: usize = 4096;
 
-#[repr(C, packed)]
-struct AllocFooter {
-    pub size: u32,
-    pub deallocated: u8,
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct AllocFooter(u32);
+
+impl AllocFooter {
+    const DEALLOCATED_BIT: u32 = 1 << 31;
+    const SIZE_MASK: u32 = 0x7FFF_FFFF;
+
+    fn new(size: u32, deallocated: bool) -> Self {
+        Self(
+            size | if deallocated {
+                Self::DEALLOCATED_BIT
+            } else {
+                0
+            },
+        )
+    }
+
+    fn size(self) -> u32 {
+        self.0 & Self::SIZE_MASK
+    }
+
+    fn is_deallocated(self) -> bool {
+        self.0 & Self::DEALLOCATED_BIT != 0
+    }
+
+    fn mark_deallocated(&mut self) {
+        self.0 |= Self::DEALLOCATED_BIT;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -30,20 +55,20 @@ const _: () = assert!(size_of::<Option<ArenaAlloc>>() == size_of::<ArenaAlloc>()
 pub struct ArenaAllocSlice(pub NonNull<[u8]>);
 
 pub struct Arena {
-    base_ptr: *mut u8,
+    base_ptr: NonNull<u8>, // page aligned
     offset: Cell<u32>,
     max_capacity: u32,
 }
 
 impl Arena {
     pub fn new(capacity: u32) -> Self {
-        let layout = Layout::from_size_align(capacity as usize, 16).unwrap();
+        let layout = Layout::from_size_align(capacity as usize, PAGE_SIZE).unwrap();
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
-            handle_alloc_error(layout);
+            std::alloc::handle_alloc_error(layout);
         }
         Self {
-            base_ptr: ptr,
+            base_ptr: unsafe { NonNull::new_unchecked(ptr) },
             offset: Cell::new(0),
             max_capacity: capacity,
         }
@@ -59,9 +84,15 @@ impl Arena {
         if total > self.max_capacity {
             return None;
         }
-        let footer = unsafe { &mut *(self.base_ptr.add(padded as usize) as *mut AllocFooter) };
-        footer.size = padded - self.offset.get();
-        footer.deallocated = 0;
+        let footer_addr = unsafe {
+            self.base_ptr
+                .as_ptr()
+                .add(padded as usize)
+                .cast::<AllocFooter>()
+        };
+        unsafe {
+            footer_addr.write_unaligned(AllocFooter::new(padded - self.offset.get(), false));
+        }
         self.offset.set(padded + FOOTER_SIZE);
         Some(ArenaAlloc {
             offset: aligned,
@@ -82,7 +113,7 @@ impl Arena {
     }
 
     pub fn ptr_for(&self, alloc: &ArenaAlloc) -> *mut u8 {
-        unsafe { self.base_ptr.add(alloc.offset as usize) }
+        unsafe { self.base_ptr.as_ptr().add(alloc.offset as usize) }
     }
 
     pub fn get_alloc_slice(&self, alloc: &ArenaAlloc) -> ArenaAllocSlice {
@@ -101,29 +132,26 @@ impl Arena {
     /// `alloc` must have been returned by a prior `alloc` call on this arena,
     /// and must not have been deallocated already.
     pub unsafe fn dealloc(&self, alloc: ArenaAlloc) {
-        let ptr = self.ptr_for(&alloc);
-        let footer = unsafe { &mut *(ptr.add(alloc.size.get() as usize) as *mut AllocFooter) };
-        footer.deallocated = 1;
+        unsafe {
+            let ptr = self.ptr_for(&alloc);
+            let footer_addr = ptr.add(alloc.size.get() as usize).cast::<AllocFooter>();
+            let mut val = footer_addr.read_unaligned();
+            val.mark_deallocated();
+            footer_addr.write_unaligned(val);
 
-        while self.offset.get() > FOOTER_SIZE {
-            let top = unsafe {
-                &mut *(self
+            while self.offset.get() > 0 {
+                let top_addr = self
                     .base_ptr
+                    .as_ptr()
                     .add((self.offset.get() - FOOTER_SIZE) as usize)
-                    as *mut AllocFooter)
-            };
-            if top.deallocated == 0 {
-                break;
+                    .cast::<AllocFooter>();
+                let top = top_addr.read_unaligned();
+                if !top.is_deallocated() {
+                    break;
+                }
+                self.offset
+                    .set(self.offset.get() - FOOTER_SIZE - top.size());
             }
-            let size = top.size;
-            self.offset.set(self.offset.get() - FOOTER_SIZE - size);
-            let new_top = unsafe {
-                &mut *(self
-                    .base_ptr
-                    .add((self.offset.get() - FOOTER_SIZE) as usize)
-                    as *mut AllocFooter)
-            };
-            new_top.deallocated = 0;
         }
     }
 }
@@ -131,6 +159,6 @@ impl Arena {
 impl Drop for Arena {
     fn drop(&mut self) {
         let layout = Layout::from_size_align(self.max_capacity as usize, 16).unwrap();
-        unsafe { dealloc(self.base_ptr, layout) };
+        unsafe { dealloc(self.base_ptr.as_ptr(), layout) };
     }
 }

@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::Context;
@@ -8,12 +9,14 @@ use core::task::Waker;
 use std::os::fd::RawFd;
 
 use crate::arena::Arena;
-use crate::slab::Slab;
+use crate::arena::ArenaAlloc;
 use crate::task::Task;
 use crate::task::TaskSlab;
 
-pub static mut RUNTIME: Option<*mut ()> = None;
-pub static mut WAKE_QUEUE: Vec<u32> = Vec::new();
+thread_local! {
+    static RUNTIME: Cell<Option<*mut ()>> = const { Cell::new(None) };
+    static WAKE_QUEUE_PTR: Cell<*mut Vec<u32>> = const { Cell::new(core::ptr::null_mut()) };
+}
 
 #[repr(C)]
 pub struct IoUserData {
@@ -72,7 +75,9 @@ pub unsafe fn push_write(
 }
 
 pub async fn await_cqe(task: &mut Task, slot: u32) -> i32 {
-    yield_now().await;
+    while !task.io.is_ready(slot) {
+        yield_now().await;
+    }
     task.io.result(slot)
 }
 
@@ -102,13 +107,15 @@ impl Future for Yield {
 pub enum IoState {
     Inline {
         submitted: u64,
-
+        ready: u64,
         results: [i32; 64],
+        allocs: [Option<ArenaAlloc>; 64],
     },
     Heap {
         submitted: Vec<u64>,
-
+        ready: Vec<u64>,
         results: Vec<i32>,
+        allocs: Vec<Option<ArenaAlloc>>,
     },
 }
 
@@ -120,9 +127,12 @@ impl Default for IoState {
 
 impl IoState {
     pub fn new() -> Self {
+        const NONE_ALLOC: Option<ArenaAlloc> = None;
         Self::Inline {
             submitted: 0,
+            ready: 0,
             results: [0; 64],
+            allocs: [NONE_ALLOC; 64],
         }
     }
 
@@ -158,6 +168,38 @@ impl IoState {
         }
     }
 
+    pub fn is_ready(&self, bit: u32) -> bool {
+        match self {
+            Self::Inline { ready, .. } => *ready & (1 << bit) != 0,
+            Self::Heap { ready, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                word < ready.len() && ready[word] & (1 << bit) != 0
+            }
+        }
+    }
+
+    pub fn set_ready(&mut self, bit: u32, value: bool) {
+        match self {
+            Self::Inline { ready, .. } => {
+                if value {
+                    *ready |= 1 << bit;
+                } else {
+                    *ready &= !(1 << bit);
+                }
+            }
+            Self::Heap { ready, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                if value {
+                    ready[word] |= 1 << bit;
+                } else {
+                    ready[word] &= !(1 << bit);
+                }
+            }
+        }
+    }
+
     pub fn result(&self, slot: u32) -> i32 {
         match self {
             Self::Inline { results, .. } => results[slot as usize],
@@ -169,6 +211,26 @@ impl IoState {
         match self {
             Self::Inline { results, .. } => results[slot as usize] = value,
             Self::Heap { results, .. } => results[slot as usize] = value,
+        }
+    }
+
+    pub fn set_alloc(&mut self, slot: u32, alloc: ArenaAlloc) {
+        match self {
+            Self::Inline { allocs, .. } => allocs[slot as usize] = Some(alloc),
+            Self::Heap { allocs, .. } => {
+                let idx = slot as usize;
+                if idx >= allocs.len() {
+                    allocs.resize(idx + 1, None);
+                }
+                allocs[idx] = Some(alloc);
+            }
+        }
+    }
+
+    pub fn take_alloc(&mut self, slot: u32) -> ArenaAlloc {
+        match self {
+            Self::Inline { allocs, .. } => allocs[slot as usize].take().unwrap(),
+            Self::Heap { allocs, .. } => allocs[slot as usize].take().unwrap(),
         }
     }
 
@@ -193,6 +255,7 @@ where
 {
     pub tasks: TaskSlab<F>,
     pub ready: Vec<u32>,
+    pub wake_queue: Vec<u32>,
     pub ring: io_uring::IoUring,
     spawn_fn: S,
     _phantom: core::marker::PhantomData<T>,
@@ -207,6 +270,7 @@ where
         Self {
             tasks: TaskSlab::new(task_capacity),
             ready: Vec::new(),
+            wake_queue: Vec::new(),
             ring: io_uring::IoUring::new(ring_entries).expect("failed to create io_uring"),
             spawn_fn,
             _phantom: core::marker::PhantomData,
@@ -216,11 +280,9 @@ where
     pub fn spawn(&mut self, user_data: T) -> Option<u32> {
         let index = self.tasks.insert_vacant()?;
         let task = Task {
-            index,
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
-            inflight: Slab::new(),
         };
         self.tasks.init_task(index, task);
         let future = (self.spawn_fn)(self.tasks.task_mut(index).unwrap(), user_data);
@@ -230,6 +292,9 @@ where
     }
 
     pub fn run(&mut self) {
+        WAKE_QUEUE_PTR.with(|p| p.set(&mut self.wake_queue));
+        RUNTIME.with(|r| r.set(Some(self as *mut _ as *mut ())));
+
         loop {
             let n = self.ready.len();
             for _ in 0..n {
@@ -237,13 +302,9 @@ where
                 self.poll_one(index);
             }
 
-            // Drain wake queue from wakers into ready queue
-            unsafe {
-                let queue = &mut *core::ptr::addr_of_mut!(WAKE_QUEUE);
-                for index in queue.drain(..) {
-                    if !self.ready.contains(&index) {
-                        self.ready.push(index);
-                    }
+            for index in self.wake_queue.drain(..) {
+                if !self.ready.contains(&index) {
+                    self.ready.push(index);
                 }
             }
 
@@ -284,11 +345,7 @@ where
 
             if let Some(task) = self.tasks.task_mut(task_index) {
                 task.io.set_result(io_slot, result);
-                task.io.set_submitted(io_slot, false);
-                let alloc = task.inflight.remove(io_slot);
-                unsafe {
-                    task.arena.dealloc(alloc);
-                }
+                task.io.set_ready(io_slot, true);
                 if !task.ready {
                     task.ready = true;
                     self.ready.push(task_index);
@@ -301,7 +358,10 @@ where
 unsafe fn waker(task_index: u32) -> Waker {
     unsafe fn wake_by_ref(data: *const ()) {
         let index = data as u32;
-        unsafe { (*core::ptr::addr_of_mut!(WAKE_QUEUE)).push(index) };
+        WAKE_QUEUE_PTR.with(|p| unsafe {
+            let queue = &mut *p.get();
+            queue.push(index);
+        });
     }
     unsafe fn wake(data: *const ()) {
         unsafe { wake_by_ref(data) };

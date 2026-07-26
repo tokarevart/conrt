@@ -1,133 +1,96 @@
 use core::mem::MaybeUninit;
-use std::marker::PhantomData;
 
-#[derive(Default)]
 pub struct Slab<T> {
     slots: Vec<MaybeUninit<T>>,
-    occupied: Vec<u64>,
+    inline_free: u64,
     free: Vec<u32>,
-    _not_send_sync: PhantomData<*mut T>,
+}
+
+impl<T> Default for Slab<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> Slab<T> {
     pub fn new() -> Self {
         Self {
             slots: Vec::new(),
-            occupied: Vec::new(),
+            inline_free: u64::MAX,
             free: Vec::new(),
-            _not_send_sync: PhantomData,
         }
     }
 
     pub fn insert(&mut self, value: T) -> Option<u32> {
-        let index = if let Some(index) = self.free.pop() {
-            index
-        } else {
-            self.find_free_slot()?
-        };
-
-        self.set_occupied(index, true);
-
+        let index = self.find_free_slot()?;
         if index as usize >= self.slots.len() {
-            self.grow(index as usize + 1);
+            self.slots
+                .resize_with(index as usize + 1, MaybeUninit::uninit);
         }
-
         self.slots[index as usize] = MaybeUninit::new(value);
         Some(index)
     }
 
     pub fn insert_at(&mut self, index: u32, value: T) {
-        if index as usize >= self.slots.len() {
-            self.grow(index as usize + 1);
+        let idx = index as usize;
+        if idx >= self.slots.len() {
+            let old_len = self.slots.len();
+            self.slots.resize_with(idx + 1, MaybeUninit::uninit);
+            for i in old_len..(idx + 1).min(64) {
+                self.inline_free |= 1 << i;
+            }
         }
-
-        self.set_occupied(index, true);
-
-        self.slots[index as usize] = MaybeUninit::new(value);
+        self.mark_occupied(index);
+        self.slots[idx] = MaybeUninit::new(value);
     }
 
     pub fn remove(&mut self, index: u32) -> T {
-        self.set_occupied(index, false);
-
-        self.free.push(index);
-
+        self.mark_free(index);
         unsafe { self.slots[index as usize].assume_init_read() }
     }
 
     pub fn contains(&self, index: u32) -> bool {
-        self.is_occupied(index)
+        !self.is_free(index)
     }
 
-    fn find_free_slot(&self) -> Option<u32> {
-        for (word_idx, &word) in self.occupied.iter().enumerate() {
-            if word != u64::MAX {
-                let bit = (!word).trailing_zeros();
-                let index = word_idx as u32 * 64 + bit;
-                return Some(index);
-            }
+    fn find_free_slot(&mut self) -> Option<u32> {
+        if self.inline_free != 0 {
+            let i = self.inline_free.trailing_zeros();
+            self.inline_free &= !(1 << i);
+            return Some(i);
         }
-        // All existing words full — next slot is at the end
-        let index = self.occupied.len() as u32 * 64;
-        Some(index)
-    }
-
-    fn grow(&mut self, min_capacity: usize) {
-        let new_len = min_capacity.max(self.slots.len().max(8) * 2);
-        self.slots.resize_with(new_len, MaybeUninit::uninit);
-
-        let words_needed = new_len.div_ceil(64);
-        if words_needed > self.occupied.len() {
-            self.occupied.resize(words_needed, 0);
+        if let Some(i) = self.free.pop() {
+            return Some(i);
         }
-    }
-
-    fn is_occupied(&self, index: u32) -> bool {
-        let word = index as usize / 64;
-        let bit = index as usize % 64;
-        word < self.occupied.len() && self.occupied[word] & (1 << bit) != 0
-    }
-
-    fn set_occupied(&mut self, index: u32, is_occ: bool) {
-        let word = index as usize / 64;
-        let bit = index as usize % 64;
-
-        if word >= self.occupied.len() {
-            let new_len = word + 1;
-            self.occupied.resize(new_len, 0);
+        let i = self.slots.len() as u32;
+        self.slots.push(MaybeUninit::uninit());
+        if i < 64 {
+            self.inline_free &= !(1 << i);
         }
+        Some(i)
+    }
 
-        if is_occ {
-            self.occupied[word] |= 1 << bit;
+    fn mark_free(&mut self, index: u32) {
+        if index < 64 {
+            self.inline_free |= 1 << index;
         } else {
-            self.occupied[word] &= !(1 << bit);
+            self.free.push(index);
         }
     }
-}
 
-impl<T> Drop for Slab<T> {
-    fn drop(&mut self) {
-        // UnsafeCell::get_mut gives us safe &mut access during Drop
+    fn mark_occupied(&mut self, index: u32) {
+        if index < 64 {
+            self.inline_free &= !(1 << index);
+        } else {
+            self.free.retain(|&i| i != index);
+        }
+    }
 
-        for (word_idx, &word) in self.occupied.iter().enumerate() {
-            if word == 0 {
-                continue;
-            }
-
-            let mut bits = word;
-            while bits != 0 {
-                // Find index of the lowest set bit
-                let bit = bits.trailing_zeros();
-                let index = word_idx * 64 + bit as usize;
-
-                if index < self.slots.len() {
-                    unsafe {
-                        self.slots[index].assume_init_drop();
-                    }
-                }
-
-                // Clear the bit we just processed
-                bits &= bits - 1;
-            }
+    fn is_free(&self, index: u32) -> bool {
+        if index < 64 {
+            self.inline_free & (1 << index) != 0
+        } else {
+            self.free.contains(&index)
         }
     }
 }
