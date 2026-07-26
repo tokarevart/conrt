@@ -1,13 +1,16 @@
 use core::mem::MaybeUninit;
 
-use crate::runtime::IoBuffers;
+use crate::arena::Arena;
+use crate::arena::ArenaAlloc;
 use crate::runtime::IoState;
+use crate::slab::Slab;
 
 pub struct Task {
     pub index: u32,
     pub ready: bool,
     pub io: IoState,
-    pub buffers: IoBuffers,
+    pub arena: Arena,
+    pub inflight: Slab<ArenaAlloc>,
 }
 
 pub struct TaskSlab<F> {

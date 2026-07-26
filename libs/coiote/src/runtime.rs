@@ -5,15 +5,106 @@ use core::task::Poll;
 use core::task::RawWaker;
 use core::task::RawWakerVTable;
 use core::task::Waker;
+use std::cell::UnsafeCell;
+use std::os::fd::RawFd;
 
 use crate::arena::Arena;
-use crate::arena::ArenaAlloc;
 use crate::slab::Slab;
 use crate::task::Task;
 use crate::task::TaskSlab;
 
+pub static mut RUNTIME: Option<*mut ()> = None;
+pub static mut WAKE_QUEUE: Vec<u32> = Vec::new();
+
+#[repr(C)]
+pub struct IoUserData {
+    pub index: u32,
+    pub io_slot: u32,
+}
+
+impl From<IoUserData> for u64 {
+    fn from(ud: IoUserData) -> u64 {
+        unsafe { core::mem::transmute(ud) }
+    }
+}
+
+impl From<u64> for IoUserData {
+    fn from(raw: u64) -> Self {
+        unsafe { core::mem::transmute(raw) }
+    }
+}
+
+/// # Safety
+/// `sq` must be a valid submission queue. `buf` must point to valid memory of
+/// at least `len` bytes.
+#[allow(dead_code)]
+pub unsafe fn push_read(
+    sq: &mut io_uring::squeue::SubmissionQueue,
+    fd: RawFd,
+    buf: *mut u8,
+    len: u32,
+    user_data: u64,
+) {
+    let entry = io_uring::opcode::Read::new(io_uring::types::Fd(fd), buf, len)
+        .build()
+        .user_data(user_data);
+    unsafe {
+        sq.push(&entry).ok();
+    }
+}
+
+/// # Safety
+/// `sq` must be a valid submission queue. `buf` must point to valid memory of
+/// at least `len` bytes.
+#[allow(dead_code)]
+pub unsafe fn push_write(
+    sq: &mut io_uring::squeue::SubmissionQueue,
+    fd: RawFd,
+    buf: *const u8,
+    len: u32,
+    user_data: u64,
+) {
+    let entry = io_uring::opcode::Write::new(io_uring::types::Fd(fd), buf, len)
+        .build()
+        .user_data(user_data);
+    unsafe {
+        sq.push(&entry).ok();
+    }
+}
+
+pub async fn await_cqe(task: &mut Task, slot: u32) -> i32 {
+    yield_now().await;
+    task.io.result(slot)
+}
+
+pub fn yield_now() -> Yield {
+    Yield { polled: false }
+}
+
+pub struct Yield {
+    polled: bool,
+}
+
+impl Future for Yield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.polled {
+            Poll::Ready(())
+        } else {
+            self.polled = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+pub struct IoState {
+    inner: UnsafeCell<IoStateInner>,
+}
+
 #[allow(clippy::large_enum_variant)]
-pub enum IoState {
+enum IoStateInner {
     Inline {
         submitted: u64,
         results: [i32; 64],
@@ -32,102 +123,141 @@ impl Default for IoState {
 
 impl IoState {
     pub fn new() -> Self {
-        Self::Inline {
-            submitted: 0,
-            results: [0; 64],
+        Self {
+            inner: UnsafeCell::new(IoStateInner::Inline {
+                submitted: 0,
+                results: [0; 64],
+            }),
         }
     }
 
     pub fn is_submitted(&self, bit: u32) -> bool {
-        match self {
-            Self::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
-            Self::Heap { submitted, .. } => {
+        let inner = unsafe { &*self.inner.get() };
+        match inner {
+            IoStateInner::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
+            IoStateInner::Heap { submitted, .. } => {
                 let word = bit as usize / 64;
                 let bit = bit as usize % 64;
-                submitted[word] & (1 << bit) != 0
+                word < submitted.len() && (submitted[word] & (1 << bit)) != 0
             }
         }
     }
 
-    pub fn set_submitted(&mut self, bit: u32, value: bool) {
-        match self {
-            Self::Inline { submitted, .. } => {
+    pub fn set_submitted(&self, bit: u32, value: bool) {
+        let inner = unsafe { &mut *self.inner.get() };
+
+        if bit >= 64 && matches!(inner, IoStateInner::Inline { .. }) {
+            self.promote_to_heap();
+        }
+
+        let inner = unsafe { &mut *self.inner.get() };
+        match inner {
+            IoStateInner::Inline { submitted, .. } => {
                 if value {
                     *submitted |= 1 << bit;
                 } else {
                     *submitted &= !(1 << bit);
                 }
             }
-            Self::Heap { submitted, .. } => {
+            IoStateInner::Heap { submitted, .. } => {
                 let word = bit as usize / 64;
-                let bit = bit as usize % 64;
+                let bit_offset = bit as usize % 64;
+                if word >= submitted.len() {
+                    submitted.resize(word + 1, 0);
+                }
                 if value {
-                    submitted[word] |= 1 << bit;
+                    submitted[word] |= 1 << bit_offset;
                 } else {
-                    submitted[word] &= !(1 << bit);
+                    submitted[word] &= !(1 << bit_offset);
                 }
             }
         }
     }
 
     pub fn result(&self, slot: u32) -> i32 {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize],
-            Self::Heap { results, .. } => results[slot as usize],
+        let inner = unsafe { &*self.inner.get() };
+        match inner {
+            IoStateInner::Inline { results, .. } => results[slot as usize],
+            IoStateInner::Heap { results, .. } => results[slot as usize],
         }
     }
 
-    pub fn set_result(&mut self, slot: u32, value: i32) {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize] = value,
-            Self::Heap { results, .. } => results[slot as usize] = value,
+    pub fn set_result(&self, slot: u32, value: i32) {
+        let inner = unsafe { &mut *self.inner.get() };
+
+        if slot >= 64 && matches!(inner, IoStateInner::Inline { .. }) {
+            self.promote_to_heap();
+        }
+
+        let inner = unsafe { &mut *self.inner.get() };
+        match inner {
+            IoStateInner::Inline { results, .. } => results[slot as usize] = value,
+            IoStateInner::Heap { results, .. } => {
+                let idx = slot as usize;
+                if idx >= results.len() {
+                    results.resize(idx + 1, 0);
+                }
+                results[idx] = value;
+            }
         }
     }
 
     pub fn free_slot(&self) -> Option<u32> {
-        let bits = match self {
-            Self::Inline { submitted, .. } => !submitted,
-            Self::Heap { submitted, .. } => !submitted[0],
-        };
-        if bits == 0 {
-            None
-        } else {
-            Some(bits.trailing_zeros())
+        let inner = unsafe { &*self.inner.get() };
+        match inner {
+            IoStateInner::Inline { submitted, .. } => {
+                let bits = !submitted;
+                if bits == 0 {
+                    None
+                } else {
+                    Some(bits.trailing_zeros())
+                }
+            }
+            IoStateInner::Heap { submitted, .. } => {
+                for (word_idx, &word) in submitted.iter().enumerate() {
+                    if word != u64::MAX {
+                        let bit = (!word).trailing_zeros();
+                        return Some((word_idx * 64) as u32 + bit);
+                    }
+                }
+                Some((submitted.len() * 64) as u32)
+            }
+        }
+    }
+
+    fn promote_to_heap(&self) {
+        let inner = unsafe { &mut *self.inner.get() };
+        if let IoStateInner::Inline { submitted, results } = inner {
+            let heap_submitted = vec![*submitted];
+            let heap_results = results.to_vec();
+
+            unsafe {
+                core::ptr::write(self.inner.get(), IoStateInner::Heap {
+                    submitted: heap_submitted,
+                    results: heap_results,
+                });
+            }
         }
     }
 }
 
-pub struct IoBuffers {
-    pub arena: Arena,
-    pub inflight_arena_guards: Slab<ArenaAlloc<'static>>,
-    pub inflight_vecs: Slab<Vec<u8>>,
-}
-
-impl IoBuffers {
-    pub fn new(arena_capacity: u32) -> Self {
-        Self {
-            arena: Arena::new(arena_capacity),
-            inflight_arena_guards: Slab::new(),
-            inflight_vecs: Slab::new(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub enum BufferInput {
-    Arena(ArenaAlloc<'static>),
-    Vector(Vec<u8>),
-}
-
-pub struct Runtime<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> {
-    tasks: TaskSlab<F>,
-    ready: Vec<u32>,
-    ring: io_uring::IoUring,
+pub struct Runtime<T, F, S>
+where
+    F: Future<Output = ()>,
+    S: Fn(&mut Task, T) -> F,
+{
+    pub tasks: TaskSlab<F>,
+    pub ready: Vec<u32>,
+    pub ring: io_uring::IoUring,
     spawn_fn: S,
     _phantom: core::marker::PhantomData<T>,
 }
 
-impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
+impl<T, F, S> Runtime<T, F, S>
+where
+    F: Future<Output = ()>,
+    S: Fn(&mut Task, T) -> F,
+{
     pub fn new(task_capacity: u32, ring_entries: u32, spawn_fn: S) -> Self {
         Self {
             tasks: TaskSlab::new(task_capacity),
@@ -140,15 +270,14 @@ impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
 
     pub fn spawn(&mut self, user_data: T) -> Option<u32> {
         let index = self.tasks.insert_vacant()?;
-        // Initialize Task — always valid before spawn_fn runs
         let task = Task {
             index,
             ready: true,
             io: IoState::new(),
-            buffers: IoBuffers::new(4096),
+            arena: Arena::new(4096),
+            inflight: Slab::new(),
         };
         self.tasks.init_task(index, task);
-        // spawn_fn receives a valid &mut Task and returns the future
         let future = (self.spawn_fn)(self.tasks.task_mut(index).unwrap(), user_data);
         self.tasks.init_future(index, future);
         self.ready.push(index);
@@ -161,6 +290,16 @@ impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
             for _ in 0..n {
                 let index = self.ready.remove(0);
                 self.poll_one(index);
+            }
+
+            // Drain wake queue from wakers into ready queue
+            unsafe {
+                let queue = &mut *core::ptr::addr_of_mut!(WAKE_QUEUE);
+                for index in queue.drain(..) {
+                    if !self.ready.contains(&index) {
+                        self.ready.push(index);
+                    }
+                }
             }
 
             match self.ring.submit_and_wait(1) {
@@ -201,6 +340,10 @@ impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
             if let Some(task) = self.tasks.task_mut(task_index) {
                 task.io.set_result(io_slot, result);
                 task.io.set_submitted(io_slot, false);
+                let alloc = task.inflight.remove(io_slot);
+                unsafe {
+                    task.arena.dealloc(alloc);
+                }
                 if !task.ready {
                     task.ready = true;
                     self.ready.push(task_index);
@@ -211,8 +354,9 @@ impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
 }
 
 unsafe fn waker(task_index: u32) -> Waker {
-    unsafe fn wake_by_ref(_data: *const ()) {
-        // TODO: push to ready queue
+    unsafe fn wake_by_ref(data: *const ()) {
+        let index = data as u32;
+        unsafe { (*core::ptr::addr_of_mut!(WAKE_QUEUE)).push(index) };
     }
     unsafe fn wake(data: *const ()) {
         unsafe { wake_by_ref(data) };
