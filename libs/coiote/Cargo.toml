@@ -1,0 +1,8 @@
+[package]
+name = "coiote"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+io-uring = "0.7"
+libc = "0.2"

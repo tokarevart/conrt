@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 conrt-cstring = { path = "../cstring" }
 conrt-sys = { path = "../sys" }
+coiote = { path = "../coiote" }
 io-uring = "0.7"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

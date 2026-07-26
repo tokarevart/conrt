@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::os::fd::RawFd;
 
 use io_uring::opcode;

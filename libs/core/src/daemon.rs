@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -181,6 +179,7 @@ impl LogCache {
         }
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.bytes == 0
     }

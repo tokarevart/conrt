@@ -7,7 +7,7 @@
 - Zero extra allocation for IO state tracking (inline u64 submitted bitmap + `[i32; 64]` results, heap-overflow variant for >64 IOs)
 - Fast completion dispatch via `user_data` encoding
 - Per-task bump arena for zero-allocation buffer management — each allocation returns an `ArenaAlloc` guard that deallocates on drop with O(1) pop from the top
-- Zero-cost direct `&mut Task<T>` access passed to tasks on spawn (eliminates Thread-Local Storage TLS lookups during poll)
+- Zero-cost direct `&mut Task` access passed to tasks on spawn (eliminates Thread-Local Storage TLS lookups during poll)
 - Zero-hazard cancellation safety — buffer ownership moves into the task on SQE submission and is retained until CQE completion
 
 ---
@@ -28,43 +28,79 @@ Waker reads `RUNTIME` directly (unsafe, single-threaded, no data race). Caller `
 
 Pre-allocated at runtime, **never reallocated**. Guarantees pinning soundness (task addresses never move). The slab *is* the index allocator — slot position = task index.
 
+Tasks and futures are stored in **parallel arrays** — a `Task` is always fully initialized (no `MaybeUninit<Task>`), while futures live in their own `MaybeUninit<F>` slots. This solves the chicken-and-egg problem: `spawn_fn` needs `&mut Task` to create the future, so `Task` must be valid before the future exists.
+
 ```rust
-struct Runtime<T, F: Future<Output = ()>> {
-    tasks: Slab<Task<T, F>>,
-    ready: Queue<u32>,
+struct Runtime<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> {
+    tasks: TaskSlab<F>,
+    ready: Vec<u32>,
     ring: IoUring,
+    spawn_fn: S,
+    _phantom: core::marker::PhantomData<T>,
 }
 
-struct Slab<T> {
-    slots: Box<[MaybeUninit<T>]>,
-    occupied: Box<[u64]>, // one bit per slot
-    free: Vec<u32>,       // recycled indices (pop from end)
+struct TaskSlab<F> {
+    tasks: Box<[MaybeUninit<Task>]>,   // task data (always valid when occupied)
+    futures: Box<[MaybeUninit<F>]>,    // futures (parallel array, same index)
+    occupied: Box<[u64]>,              // one bit per slot
+    free: Vec<u32>,                     // recycled indices (pop from end)
 }
 ```
 
 - Capacity chosen at construction (e.g. 256). Insertion when full = spawn error / backpressure.
-- All slots pinned in memory — `Box<[T]>` never grows or shrinks.
-- Runtime must read the queue len, then poll that many tasks (they themselves may spawn other tasks after all), then poll completed IO events, repeat.
+- All slots pinned in memory — `Box<[...]>` never grows or shrinks.
+- `Slab<T>` (generic, single-array) is used separately for `IoBuffers` inflight tracking.
 
 ```rust
-struct Task<T, F: Future<Output = ()>> {
+struct Task {
+    index: u32,
     ready: bool,
     io: IoState,
     buffers: IoBuffers,
-    user_data: T,
-    future: F,
 }
 ```
 
-**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. The slot position *is* the task index — no need to store it in the task.
+`Task` has no generic parameter — it is always fully initialized. The future `F` lives in `TaskSlab.futures[index]`, in its own `MaybeUninit<F>` slot.
 
-**Removal**: clear the bit in `occupied`, push index to `free`. Tasks are
-removed only when their future returns `Poll::Ready` — at that point all IOs
-are complete and buffers are safe to drop. External task cancellation is not
-supported by the runtime. IO cancellation (via `IORING_OP_ASYNC_CANCEL`) is
-for internal future use only, e.g. implementing select between multiple IOs.
+**Insertion**: pop free list; if empty, scan `occupied` bitmap for a zero bit. Set bit. Store the index as `task.index` — the task knows its own slot position.
 
-**Access**: `&slots[index]` — O(1), direct, no hashing or version checking.
+**Removal**: clear the bit in `occupied`, push index to `free`. Drop the `Task` and the future separately. Tasks are removed only when their future returns `Poll::Ready` — at that point all IOs are complete and buffers are safe to drop. External task cancellation is not supported by the runtime. IO cancellation (via `IORING_OP_ASYNC_CANCEL`) is for internal future use only, e.g. implementing select between multiple IOs.
+
+**Access**: `&tasks[index]` / `&futures[index]` — O(1), direct, no hashing or version checking.
+
+### TaskSlab methods
+
+```rust
+impl<F> TaskSlab<F> {
+    fn new(capacity: u32) -> Self { ... }
+    fn insert_vacant(&mut self) -> Option<u32> { ... }
+    fn init_task(&mut self, index: u32, task: Task) { ... }
+    fn init_future(&mut self, index: u32, future: F) { ... }
+    fn task_mut(&mut self, index: u32) -> Option<&mut Task> { ... }
+    fn future_mut(&mut self, index: u32) -> Option<&mut F> { ... }
+    fn remove(&mut self, index: u32) -> (Task, F) { ... }
+}
+```
+
+`insert_vacant` marks the slot occupied and returns the index, but does NOT initialize the task or future — the caller (Runtime::spawn) initializes both via `init_task` and `init_future` after calling `insert_vacant`. This keeps `TaskSlab` generic over `F` without requiring `F: Default`.
+
+### Generic Slab
+
+A general-purpose, resizable `Slab<T>` used for small collections within `IoBuffers` (inflight arena guards and inflight vecs) and any other spot that needs indexed, reusable slots. Unlike `TaskSlab`, this slab does NOT require pinned memory — it uses `Vec<MaybeUninit<T>>` and grows on demand.
+
+```rust
+struct Slab<T> {
+    slots: Vec<MaybeUninit<T>>,
+    occupied: Box<[u64]>,
+    free: Vec<u32>,
+}
+```
+
+- **No pre-allocation required** — `new()` starts empty, grows as items are inserted.
+- **Resizes automatically** — when all slots are occupied and the free list is empty, the slots vec doubles in capacity. The occupied bitmap is extended to match.
+- **Not pinned** — addresses may move on resize. Suitable for `IoBuffers` inflight tracking (guards and vecs) where pointers are not stored long-term. NOT suitable for `TaskSlab` (which needs pinning for future pinning soundness).
+
+Methods: `new()`, `insert(value) -> Option<u32>`, `remove(index) -> T`, `get(index) -> Option<&T>`, `get_mut(index) -> Option<&mut T>`, `insert_at(index, value)` (for indexed insertion by io_slot), `contains(index) -> bool`.
 
 ---
 
@@ -81,7 +117,7 @@ pops it and all consecutive deallocated allocations below it until hitting a
 live allocation. If it's not at the top, it just marks it deallocated — the
 space is reclaimed later when upper allocations are dropped.
 
-### TaskArena
+### Arena
 
 ```rust
 const ARENA_MAX: u32 = u32::MAX;
@@ -93,7 +129,7 @@ struct AllocFooter {
     deallocated: u8,  // 0 = live, 1 = dead
 }
 
-struct TaskArena {
+struct Arena {
     base_ptr: *mut u8,
     offset: u32,       // next free byte (end of last footer)
     max_capacity: u32, // arena size in bytes (≤ u32::MAX)
@@ -123,7 +159,7 @@ deallocated and pops from the top of the arena if possible.
 
 ```rust
 struct ArenaAlloc<'a> {
-    arena: &'a mut TaskArena,
+    arena: &'a mut Arena,
     alloc_offset: u32, // where user data starts in the arena buffer
     alloc_size: u32,   // byte count of the allocation (needed to find its footer)
 }
@@ -166,7 +202,7 @@ impl<'a> Drop for ArenaAlloc<'a> {
 ### Allocation methods
 
 ```rust
-impl TaskArena {
+impl Arena {
     fn alloc(&mut self, layout: Layout) -> Option<ArenaAlloc<'_>> {
         let align = layout.align() as u32;
         let size = layout.size() as u32;
@@ -229,11 +265,13 @@ Drop A (now at top):
 
 ## Dual-Mode Buffer Management (`IoBuffers`)
 
-While `TaskArena` provides $O(1)$ stack rewind for task-local IO temporaries, some workloads require buffers that outlive the task or are transferred across tasks. `IoBuffers` encapsulates both bump allocation and owned heap vector tracking under a single zero-cost interface.
+While `Arena` provides $O(1)$ stack rewind for task-local IO temporaries, some workloads require buffers that outlive the task or are transferred across tasks. `IoBuffers` encapsulates both bump allocation and owned heap vector tracking under a single zero-cost interface.
+
+`IoBuffers` uses the **generic `Slab<T>`** (single-array, for small fixed-capacity collections) — NOT `TaskSlab` (which is for task+future storage).
 
 ```rust
 pub struct IoBuffers {
-    pub arena: TaskArena,
+    pub arena: Arena,
     pub inflight_arena_guards: Slab<ArenaAlloc>,
     pub inflight_vecs: Slab<Vec<u8>>,
 }
@@ -241,7 +279,7 @@ pub struct IoBuffers {
 impl IoBuffers {
     pub fn new(arena_capacity: u32) -> Self {
         Self {
-            arena: TaskArena::new(arena_capacity),
+            arena: Arena::new(arena_capacity),
             inflight_arena_guards: Slab::new(),
             inflight_vecs: Slab::new(),
         }
@@ -288,7 +326,7 @@ ownership is moved into the appropriate inflight slab on submission, guaranteein
 it stays alive until the CQE arrives.
 
 ```rust
-impl<T, F: Future<Output = ()>> Task<T, F> {
+impl Task {
     /// Submits a read IO operation accepting either an ArenaAlloc guard or a heap Vec<u8>
     pub fn submit_read(&mut self, fd: RawFd, buf: BufferInput, len: u32) -> u32 {
         let io_slot = (!self.io.submitted).trailing_zeros();
@@ -308,9 +346,10 @@ impl<T, F: Future<Output = ()>> Task<T, F> {
             }
         };
 
-        // Submit SQE to io_uring ring
-        let user_data = IoUserData { task_index: self.id, io_slot }.into();
-        unsafe { push_read(self.ring_sq(), fd, ptr, len, user_data) };
+        // Submit SQE to io_uring ring (accessed via RUNTIME static, single-threaded)
+        let user_data = IoUserData { index: self.index, io_slot }.into();
+        let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_mut().unwrap() };
+        unsafe { push_read(rt.ring.submission(), fd, ptr, len, user_data) };
 
         io_slot
     }
@@ -335,7 +374,7 @@ impl<T, F: Future<Output = ()>> Task<T, F> {
 Usage:
 
 ```rust
-async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
+async fn socket_worker(task: &mut Task, fd: RawFd) {
     loop {
         // Fast path: Zero-allocation Arena Read
         if let Some(alloc) = task.buffers.arena.alloc_bytes(4096) {
@@ -355,31 +394,37 @@ async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd)
 
 ### Spawn integration
 
-The `FnOnce(&mut Task<T, F>, T) -> F` closure is passed to the `Runtime` at
-construction time. `spawn` only accepts user data — it calls the stored closure
-to create the future, since the returned future type `F` is always the same.
+The `Fn(&mut Task, T) -> F` closure is passed to the `Runtime` at
+construction time. `spawn` only accepts user data — it creates a fully
+initialized `Task` (with its `index` set), calls the stored closure
+to get the future, then stores both in `TaskSlab`.
+
+`Task` is always initialized before `spawn_fn` runs — no uninitialized
+memory, no `MaybeUninit`, no UB. The closure receives `&mut Task` with valid
+`ready`, `io`, and `buffers` fields.
 
 ```rust
-struct Runtime<T, F: Future<Output = ()>, S: Fn(&mut Task<T, F>, T) -> F> {
-    tasks: Slab<Task<T, F>>,
-    ready: Queue<u32>,
-    ring: IoUring,
-    spawn_fn: S,
-}
-
-impl<T, F: Future<Output = ()>, S: Fn(&mut Task<T, F>, T) -> F> Runtime<T, F, S> {
-    fn spawn(&mut self, user_data: T) {
-        let index = self.tasks.insert_vacant().expect("slab full");
-        self.tasks.init_at(index, |slot| {
-            let task = &mut slot.task;
-            let future = (self.spawn_fn)(task, user_data);
-            // store future in task
-        });
+impl<T, F: Future<Output = ()>, S: Fn(&mut Task, T) -> F> Runtime<T, F, S> {
+    fn spawn(&mut self, user_data: T) -> Option<u32> {
+        let index = self.tasks.insert_vacant()?;
+        // Initialize Task — always valid before spawn_fn runs
+        let task = Task {
+            index: index,
+            ready: true,
+            io: IoState::new(),
+            buffers: IoBuffers::new(4096),
+        };
+        self.tasks.init_task(index, task);
+        // spawn_fn receives a valid &mut Task and returns the future
+        let future = (self.spawn_fn)(self.tasks.task_mut(index).unwrap(), user_data);
+        self.tasks.init_future(index, future);
+        self.ready.push(index);
+        Some(index)
     }
 }
 ```
 
-Tasks receive `&mut Task<T, F>` which gives direct access to `buffers` (arena + inflight guards),
+Tasks receive `&mut Task` which gives direct access to `buffers` (arena + inflight guards),
 `submit_read()`. No TLS, no `current_arena()` lookup — the task
 reference is passed directly into the future's state via the spawn closure.
 
@@ -423,7 +468,7 @@ transfer, and SQE submission. The future then polls `task.io` to check for
 completion — no `ReadOp`/`ReadFuture` intermediaries needed.
 
 ```rust
-async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd) {
+async fn socket_worker(task: &mut Task, fd: RawFd) {
     loop {
         if let Some(alloc) = task.buffers.arena.alloc_bytes(4096) {
             let io_slot = task.submit_read(fd, BufferInput::Arena(alloc), 4096);
@@ -439,17 +484,6 @@ async fn socket_worker(task: &mut Task<(), impl Future<Output = ()>>, fd: RawFd)
 }
 ```
 
-The submit path:
-
-1. `arena.alloc_bytes(4096)` → returns `ArenaAlloc` guard (marks buffer live)
-2. `task.submit_read(fd, BufferInput::Arena(alloc), 4096)`:
-   - Finds free io_slot via `(!submitted).trailing_zeros()`
-   - Moves `ArenaAlloc` guard into `buffers.inflight_arena_guards[io_slot]`
-   - Pushes SQE with pointer into the arena
-3. CQE arrives → `drain_cqes()` → `task.on_cqe_completion(io_slot, result)`:
-   - Clears `submitted` bit
-   - Drops guard from `inflight_arena_guards` → buffer reclaimed
-
 ---
 
 ## `user_data` Encoding
@@ -459,7 +493,7 @@ A `#[repr(C)]` struct with two `u32` fields, transmuted to/from `u64`:
 ```rust
 #[repr(C)]
 struct IoUserData {
-    task_index: u32,   // slab slot position
+    index: u32,   // slab slot position
     io_slot: u32,      // bit position in IoState.submitted
 }
 
@@ -492,11 +526,11 @@ pushes the index into the ready queue. This is O(1) with no contains check on
 the queue itself.
 
 ```rust
-fn waker(task_index: u32) -> Waker {
+fn waker(index: u32) -> Waker {
     unsafe extern "C" fn wake_by_ref(data: *const ()) {
         let index = data as u32;
         let rt = (*addr_of_mut!(RUNTIME)).as_mut().unwrap();
-        let task = &mut rt.tasks[index];
+        let task = rt.tasks.task_mut(index).unwrap();
         if !task.ready {
             task.ready = true;
             rt.ready.push(index);
@@ -511,11 +545,11 @@ fn waker(task_index: u32) -> Waker {
         wake,
         |_| {},                               // drop
     );
-    let ptr = core::ptr::without_provenance(task_index as usize);
+    let ptr = core::ptr::without_provenance(index as usize);
     unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
 }
 
-fn task_index(cx: &Context) -> u32 {
+fn index(cx: &Context) -> u32 {
     cx.waker().as_raw().data() as u32
 }
 ```
@@ -549,11 +583,12 @@ loop {
 
 ```rust
 fn poll_one(index: u32) {
-    let task = &mut tasks[index];
+    let task = tasks.task_mut(index).unwrap();
     task.ready = false;
     let w = waker(index);
     let mut cx = Context::from_waker(&w);
-    match task.future.poll(cx) {
+    let future = unsafe { Pin::new_unchecked(tasks.future_mut(index).unwrap()) };
+    match future.poll(&mut cx) {
         Poll::Ready(()) => tasks.remove(index),
         Poll::Pending => {}
     }
@@ -595,11 +630,11 @@ deals with CQ management.
 fn drain_cqes() {
     for cqe in ring.completion() {
         let ud = IoUserData::from(cqe.user_data());
-        let task = &mut tasks[ud.task_index];
+        let task = tasks.task_mut(ud.index).unwrap();
         task.on_cqe_completion(ud.io_slot, cqe.result());
         if !task.ready {
             task.ready = true;
-            ready.push(ud.task_index);
+            ready.push(ud.index);
         }
     }
 }
@@ -632,7 +667,7 @@ This is needed for select-style patterns — racing multiple IOs and canceling
 the losers when one wins.
 
 A cancel SQE uses the **same `user_data`** as the original IO (same
-`task_index` + `io_slot`). The `drain_cqes` function processes it
+`index` + `io_slot`). The `drain_cqes` function processes it
 identically to a normal CQE — clears `submitted`, writes the (meaningless)
 cancel result to `results[slot]`, marks the task ready. The future doesn't
 need to distinguish between normal and cancel CQEs. Both mean the same thing:
@@ -677,13 +712,13 @@ impl Future for CancelFuture {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<()> {
-        let ti = task_index(cx);
+        let ti = index(cx);
         let rt = unsafe { (*addr_of_mut!(RUNTIME)).as_ref().unwrap() };
         let task = &rt.tasks[ti];
 
         if !self.submitted {
             let sq = unsafe { &mut *addr_of_mut!(RUNTIME) }.ring.submission();
-            let ud = IoUserData { task_index: ti, io_slot: self.io_slot };
+            let ud = IoUserData { index: ti, io_slot: self.io_slot };
             unsafe { push_cancel(sq, ud.into()) };
             self.submitted = true;
             return Poll::Pending;
