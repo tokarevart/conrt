@@ -5,7 +5,6 @@ use core::task::Poll;
 use core::task::RawWaker;
 use core::task::RawWakerVTable;
 use core::task::Waker;
-use std::cell::UnsafeCell;
 use std::os::fd::RawFd;
 
 use crate::arena::Arena;
@@ -99,18 +98,16 @@ impl Future for Yield {
     }
 }
 
-pub struct IoState {
-    inner: UnsafeCell<IoStateInner>,
-}
-
 #[allow(clippy::large_enum_variant)]
-enum IoStateInner {
+pub enum IoState {
     Inline {
         submitted: u64,
+
         results: [i32; 64],
     },
     Heap {
         submitted: Vec<u64>,
+
         results: Vec<i32>,
     },
 }
@@ -123,120 +120,68 @@ impl Default for IoState {
 
 impl IoState {
     pub fn new() -> Self {
-        Self {
-            inner: UnsafeCell::new(IoStateInner::Inline {
-                submitted: 0,
-                results: [0; 64],
-            }),
+        Self::Inline {
+            submitted: 0,
+            results: [0; 64],
         }
     }
 
     pub fn is_submitted(&self, bit: u32) -> bool {
-        let inner = unsafe { &*self.inner.get() };
-        match inner {
-            IoStateInner::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
-            IoStateInner::Heap { submitted, .. } => {
+        match self {
+            Self::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
+            Self::Heap { submitted, .. } => {
                 let word = bit as usize / 64;
                 let bit = bit as usize % 64;
-                word < submitted.len() && (submitted[word] & (1 << bit)) != 0
+                submitted[word] & (1 << bit) != 0
             }
         }
     }
 
-    pub fn set_submitted(&self, bit: u32, value: bool) {
-        let inner = unsafe { &mut *self.inner.get() };
-
-        if bit >= 64 && matches!(inner, IoStateInner::Inline { .. }) {
-            self.promote_to_heap();
-        }
-
-        let inner = unsafe { &mut *self.inner.get() };
-        match inner {
-            IoStateInner::Inline { submitted, .. } => {
+    pub fn set_submitted(&mut self, bit: u32, value: bool) {
+        match self {
+            Self::Inline { submitted, .. } => {
                 if value {
                     *submitted |= 1 << bit;
                 } else {
                     *submitted &= !(1 << bit);
                 }
             }
-            IoStateInner::Heap { submitted, .. } => {
+            Self::Heap { submitted, .. } => {
                 let word = bit as usize / 64;
-                let bit_offset = bit as usize % 64;
-                if word >= submitted.len() {
-                    submitted.resize(word + 1, 0);
-                }
+                let bit = bit as usize % 64;
                 if value {
-                    submitted[word] |= 1 << bit_offset;
+                    submitted[word] |= 1 << bit;
                 } else {
-                    submitted[word] &= !(1 << bit_offset);
+                    submitted[word] &= !(1 << bit);
                 }
             }
         }
     }
 
     pub fn result(&self, slot: u32) -> i32 {
-        let inner = unsafe { &*self.inner.get() };
-        match inner {
-            IoStateInner::Inline { results, .. } => results[slot as usize],
-            IoStateInner::Heap { results, .. } => results[slot as usize],
+        match self {
+            Self::Inline { results, .. } => results[slot as usize],
+            Self::Heap { results, .. } => results[slot as usize],
         }
     }
 
-    pub fn set_result(&self, slot: u32, value: i32) {
-        let inner = unsafe { &mut *self.inner.get() };
-
-        if slot >= 64 && matches!(inner, IoStateInner::Inline { .. }) {
-            self.promote_to_heap();
-        }
-
-        let inner = unsafe { &mut *self.inner.get() };
-        match inner {
-            IoStateInner::Inline { results, .. } => results[slot as usize] = value,
-            IoStateInner::Heap { results, .. } => {
-                let idx = slot as usize;
-                if idx >= results.len() {
-                    results.resize(idx + 1, 0);
-                }
-                results[idx] = value;
-            }
+    pub fn set_result(&mut self, slot: u32, value: i32) {
+        match self {
+            Self::Inline { results, .. } => results[slot as usize] = value,
+            Self::Heap { results, .. } => results[slot as usize] = value,
         }
     }
 
     pub fn free_slot(&self) -> Option<u32> {
-        let inner = unsafe { &*self.inner.get() };
-        match inner {
-            IoStateInner::Inline { submitted, .. } => {
-                let bits = !submitted;
-                if bits == 0 {
-                    None
-                } else {
-                    Some(bits.trailing_zeros())
-                }
-            }
-            IoStateInner::Heap { submitted, .. } => {
-                for (word_idx, &word) in submitted.iter().enumerate() {
-                    if word != u64::MAX {
-                        let bit = (!word).trailing_zeros();
-                        return Some((word_idx * 64) as u32 + bit);
-                    }
-                }
-                Some((submitted.len() * 64) as u32)
-            }
-        }
-    }
+        let bits = match self {
+            Self::Inline { submitted, .. } => !submitted,
+            Self::Heap { submitted, .. } => !submitted[0],
+        };
 
-    fn promote_to_heap(&self) {
-        let inner = unsafe { &mut *self.inner.get() };
-        if let IoStateInner::Inline { submitted, results } = inner {
-            let heap_submitted = vec![*submitted];
-            let heap_results = results.to_vec();
-
-            unsafe {
-                core::ptr::write(self.inner.get(), IoStateInner::Heap {
-                    submitted: heap_submitted,
-                    results: heap_results,
-                });
-            }
+        if bits == 0 {
+            None
+        } else {
+            Some(bits.trailing_zeros())
         }
     }
 }
