@@ -9,9 +9,34 @@ pub struct Task {
     pub arena: Arena,
 }
 
+pub struct TaskContext {
+    task_index: u32,
+    task: *mut Task,
+    wakeups: *mut Vec<u32>,
+}
+
+impl TaskContext {
+    pub fn new(task_index: u32, task: *mut Task, wakeups: *mut Vec<u32>) -> Self {
+        Self {
+            task_index,
+            task,
+            wakeups,
+        }
+    }
+
+    pub fn with_task<R>(&self, f: impl FnOnce(&mut Task) -> R) -> R {
+        unsafe { f(&mut *self.task) }
+    }
+
+    pub fn wake(&self) {
+        unsafe { (*self.wakeups).push(self.task_index) };
+    }
+}
+
 pub struct TaskSlab<F> {
     tasks: Box<[MaybeUninit<Task>]>,
     futures: Box<[MaybeUninit<F>]>,
+    contexts: Box<[MaybeUninit<TaskContext>]>,
     free: Box<[u64]>,
 }
 
@@ -22,65 +47,92 @@ impl<F> TaskSlab<F> {
         tasks.resize_with(cap, MaybeUninit::uninit);
         let mut futures = Vec::with_capacity(cap);
         futures.resize_with(cap, MaybeUninit::uninit);
+        let mut contexts = Vec::with_capacity(cap);
+        contexts.resize_with(cap, MaybeUninit::uninit);
         let words = cap.div_ceil(64);
         Self {
             tasks: tasks.into_boxed_slice(),
             futures: futures.into_boxed_slice(),
+            contexts: contexts.into_boxed_slice(),
             free: vec![u64::MAX; words].into_boxed_slice(),
         }
     }
 
-    pub fn insert_vacant(&mut self) -> Option<u32> {
-        for (word_idx, word) in self.free.iter().enumerate() {
+    /// # Safety
+    /// `this` must be a valid, aligned pointer to a `TaskSlab`.
+    pub unsafe fn insert_vacant(this: *mut Self) -> Option<u32> {
+        let this = unsafe { &mut *this };
+        for (word_idx, word) in this.free.iter().enumerate() {
             if *word != 0 {
                 let bit = word.trailing_zeros();
                 let index = word_idx as u32 * 64 + bit;
-                if index as usize >= self.tasks.len() {
+                if index as usize >= this.tasks.len() {
                     return None;
                 }
-                self.free[word_idx] &= !(1 << bit);
+                this.free[word_idx] &= !(1 << bit);
                 return Some(index);
             }
         }
         None
     }
 
-    pub fn init_task(&mut self, index: u32, task: Task) {
-        self.tasks[index as usize] = MaybeUninit::new(task);
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn init_task_unchecked(this: *mut Self, index: u32, task: Task) {
+        unsafe { (*this).tasks[index as usize] = MaybeUninit::new(task) };
     }
 
-    pub fn init_future(&mut self, index: u32, future: F) {
-        self.futures[index as usize] = MaybeUninit::new(future);
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn init_future_unchecked(this: *mut Self, index: u32, future: F) {
+        unsafe { (*this).futures[index as usize] = MaybeUninit::new(future) };
     }
 
-    pub fn task_mut(&mut self, index: u32) -> Option<&mut Task> {
-        if self.is_occupied(index) {
-            Some(unsafe { self.tasks[index as usize].assume_init_mut() })
-        } else {
-            None
-        }
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn init_context_unchecked(this: *mut Self, index: u32, ctx: TaskContext) {
+        unsafe { (*this).contexts[index as usize] = MaybeUninit::new(ctx) };
     }
 
-    pub fn future_mut(&mut self, index: u32) -> Option<&mut F> {
-        if self.is_occupied(index) {
-            Some(unsafe { self.futures[index as usize].assume_init_mut() })
-        } else {
-            None
-        }
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn task_ptr_unchecked(this: *mut Self, index: u32) -> *mut Task {
+        unsafe { (*this).tasks[index as usize].as_mut_ptr() }
     }
 
-    pub fn remove(&mut self, index: u32) -> (Task, F) {
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn future_ptr_unchecked(this: *mut Self, index: u32) -> *mut F {
+        unsafe { (*this).futures[index as usize].as_mut_ptr() }
+    }
+
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn context_ptr_unchecked(this: *const Self, index: u32) -> *const TaskContext {
+        unsafe { (*this).contexts[index as usize].as_ptr() }
+    }
+
+    /// # Safety
+    /// `this` must be valid.
+    pub unsafe fn is_occupied(this: *const Self, index: u32) -> bool {
+        let this = unsafe { &*this };
         let word = index as usize / 64;
         let bit = index as usize % 64;
-        self.free[word] |= 1 << bit;
-        let task = unsafe { self.tasks[index as usize].assume_init_read() };
-        let future = unsafe { self.futures[index as usize].assume_init_read() };
-        (task, future)
+        word < this.free.len() && this.free[word] & (1 << bit) == 0
     }
 
-    fn is_occupied(&self, index: u32) -> bool {
+    /// # Safety
+    /// `this` must be valid and `index` must be an in-bounds, initialized slot
+    /// that has not already been removed.
+    pub unsafe fn remove_unchecked(this: *mut Self, index: u32) -> (Task, F) {
+        let this = unsafe { &mut *this };
         let word = index as usize / 64;
         let bit = index as usize % 64;
-        word < self.free.len() && self.free[word] & (1 << bit) == 0
+        this.free[word] |= 1 << bit;
+        unsafe {
+            let task = this.tasks[index as usize].assume_init_read();
+            let future = this.futures[index as usize].assume_init_read();
+            (task, future)
+        }
     }
 }

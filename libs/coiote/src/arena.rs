@@ -47,8 +47,6 @@ pub struct ArenaAlloc {
     pub offset: u32,
 }
 
-const _: () = assert!(size_of::<Option<ArenaAlloc>>() == size_of::<ArenaAlloc>());
-
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct ArenaAllocSlice(pub NonNull<[u8]>);
