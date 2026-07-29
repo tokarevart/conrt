@@ -1,8 +1,6 @@
 # conrt — A Minimal Container Runtime
 
-conrt is a from-scratch, Docker-like container runtime built in Rust. It's a course project
-for learning systems programming: Linux kernel interfaces (namespaces, mounts,
-OverlayFS), process and memory management in Rust, and a few classic data structures.
+conrt is a from-scratch, minimal, Docker-like container runtime built in Rust.
 
 ## Architecture
 
