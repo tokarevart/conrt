@@ -330,6 +330,10 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
         None
     };
 
+    // Self-pipe: reader thread signals main thread on container exit.
+    let mut notify = sys::FdPair { read: 0, write: 0 };
+    sys::pipe2(&mut notify, libc::O_CLOEXEC | libc::O_NONBLOCK).expect("pipe2 failed");
+
     // Reader thread: stream → stdout
     let reader_stream = stream.try_clone().unwrap();
     let reader_fd = reader_stream.as_raw_fd();
@@ -337,6 +341,11 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
     std::mem::forget(reader_stream);
 
     let reader_handle = std::thread::spawn(move || {
+        let done = |code: i32| -> i32 {
+            let _ = sys::write(notify.write, &[1]);
+            unsafe { libc::close(notify.write) };
+            code
+        };
         loop {
             match read_frame(reader_fd) {
                 Ok((0x10, data)) => {
@@ -346,7 +355,7 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
                             Ok(n) => written += n as usize,
                             Err(e) => {
                                 tracing::error!(%e, "stdout write failed");
-                                return 1i32;
+                                return done(1i32);
                             }
                         }
                     }
@@ -357,17 +366,17 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
                         exit_code: i32,
                     }
                     if let Ok(ep) = serde_json::from_slice::<ExitPayload>(&payload) {
-                        return ep.exit_code;
+                        return done(ep.exit_code);
                     }
-                    return 1;
+                    return done(1);
                 }
                 Ok((ty, _)) => {
                     tracing::warn!(%ty, "unexpected frame from daemon");
-                    return 1;
+                    return done(1);
                 }
                 Err(e) => {
                     tracing::error!(%e, "reader: stream read error");
-                    return 1;
+                    return done(1);
                 }
             }
         }
@@ -377,36 +386,63 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
     let mut stdin_buf = [0u8; 4096];
     let stdin_fd = libc::STDIN_FILENO;
     loop {
-        // Check SIGWINCH before each read.
-        if WINCH_PENDING.load(std::sync::atomic::Ordering::Acquire) {
-            WINCH_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
-            let (rows, cols) = get_window_size();
-            let ws_payload = serde_json::json!({"rows": rows, "cols": cols});
-            let _ = send_frame(raw_fd, 0x20, &serde_json::to_vec(&ws_payload).unwrap());
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: notify.read,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                if WINCH_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+                    WINCH_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let (rows, cols) = get_window_size();
+                    let ws_payload = serde_json::json!({"rows": rows, "cols": cols});
+                    let _ = send_frame(raw_fd, 0x20, &serde_json::to_vec(&ws_payload).unwrap());
+                }
+                continue;
+            }
+            break;
         }
 
-        match sys::read(stdin_fd, &mut stdin_buf) {
-            Ok(0) => {
-                // EOF
-                let _ = send_frame(raw_fd, 0x11, &[]);
-                break;
-            }
-            Ok(n) => {
-                if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
-                    tracing::error!(%e, "stdin → stream write failed");
+        if pfds[1].revents & libc::POLLIN != 0 {
+            break;
+        }
+
+        if pfds[0].revents & libc::POLLIN != 0 {
+            match sys::read(stdin_fd, &mut stdin_buf) {
+                Ok(0) => {
+                    let _ = send_frame(raw_fd, 0x11, &[]);
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
+                        tracing::error!(%e, "stdin → stream write failed");
+                        break;
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof
+                        || e.raw_os_error() == Some(libc::EIO)
+                    {
+                        let _ = send_frame(raw_fd, 0x11, &[]);
+                    }
                     break;
                 }
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => {
-                // stdin error (e.g. EOF on a non-TTY)
-                if e.kind() == io::ErrorKind::UnexpectedEof || e.raw_os_error() == Some(libc::EIO) {
-                    let _ = send_frame(raw_fd, 0x11, &[]);
-                }
-                break;
-            }
         }
     }
+
+    unsafe { libc::close(notify.read) };
 
     // Restore terminal before joining thread.
     if let Some(termios) = original_termios {
@@ -472,12 +508,23 @@ fn attach_container(stream_path: PathBuf, pid: i32) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Self-pipe: reader thread signals main thread on container exit.
+    let mut notify = sys::FdPair { read: 0, write: 0 };
+    sys::pipe2(&mut notify, libc::O_CLOEXEC | libc::O_NONBLOCK).expect("pipe2 failed");
+    let notify_r = notify.read;
+    let notify_w = notify.write;
+
     // Reader thread: stream → stdout
     let reader_stream = stream.try_clone().unwrap();
     let reader_fd = reader_stream.as_raw_fd();
     std::mem::forget(reader_stream);
 
     let reader_handle = std::thread::spawn(move || {
+        let done = |code: i32| -> i32 {
+            let _ = sys::write(notify_w, &[1]);
+            unsafe { libc::close(notify_w) };
+            code
+        };
         loop {
             match read_frame(reader_fd) {
                 Ok((0x10, data)) => {
@@ -487,7 +534,7 @@ fn attach_container(stream_path: PathBuf, pid: i32) -> ExitCode {
                             Ok(n) => written += n as usize,
                             Err(e) => {
                                 tracing::error!(%e, "stdout write failed");
-                                return 1i32;
+                                return done(1i32);
                             }
                         }
                     }
@@ -498,17 +545,17 @@ fn attach_container(stream_path: PathBuf, pid: i32) -> ExitCode {
                         exit_code: i32,
                     }
                     if let Ok(ep) = serde_json::from_slice::<ExitPayload>(&payload) {
-                        return ep.exit_code;
+                        return done(ep.exit_code);
                     }
-                    return 1;
+                    return done(1);
                 }
                 Ok((ty, _)) => {
                     tracing::warn!(%ty, "unexpected frame from daemon");
-                    return 1;
+                    return done(1);
                 }
                 Err(e) => {
                     tracing::error!(%e, "reader: stream read error");
-                    return 1;
+                    return done(1);
                 }
             }
         }
@@ -518,26 +565,57 @@ fn attach_container(stream_path: PathBuf, pid: i32) -> ExitCode {
     let mut stdin_buf = [0u8; 4096];
     let stdin_fd = libc::STDIN_FILENO;
     loop {
-        match sys::read(stdin_fd, &mut stdin_buf) {
-            Ok(0) => {
-                let _ = send_frame(raw_fd, 0x11, &[]);
-                break;
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: notify_r,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
             }
-            Ok(n) => {
-                if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
-                    tracing::error!(%e, "stdin → stream write failed");
+            break;
+        }
+
+        if pfds[1].revents & libc::POLLIN != 0 {
+            break;
+        }
+
+        if pfds[0].revents & libc::POLLIN != 0 {
+            match sys::read(stdin_fd, &mut stdin_buf) {
+                Ok(0) => {
+                    let _ = send_frame(raw_fd, 0x11, &[]);
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = send_frame(raw_fd, 0x10, &stdin_buf[..n as usize]) {
+                        tracing::error!(%e, "stdin → stream write failed");
+                        break;
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof
+                        || e.raw_os_error() == Some(libc::EIO)
+                    {
+                        let _ = send_frame(raw_fd, 0x11, &[]);
+                    }
                     break;
                 }
             }
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof || e.raw_os_error() == Some(libc::EIO) {
-                    let _ = send_frame(raw_fd, 0x11, &[]);
-                }
-                break;
-            }
         }
     }
+
+    unsafe { libc::close(notify_r) };
 
     let exit_code = match reader_handle.join() {
         Ok(code) => code as u8,
