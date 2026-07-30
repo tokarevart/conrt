@@ -150,7 +150,168 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity as usize, 16).unwrap();
+        let layout = Layout::from_size_align(self.capacity as usize, ARENA_ALIGN).unwrap();
         unsafe { dealloc(self.buf.as_ptr(), layout) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_success() {
+        let arena = Arena::new(4096);
+        let layout = Layout::from_size_align(64, 1).unwrap();
+        let alloc = arena.alloc(layout).expect("alloc should succeed");
+        assert_eq!(alloc.offset, 0);
+        assert_eq!(alloc.size.get(), 64);
+    }
+
+    #[test]
+    fn alloc_writes_footer_and_advances_offset() {
+        let arena = Arena::new(4096);
+        let layout = Layout::from_size_align(32, 1).unwrap();
+        let alloc = arena.alloc(layout).unwrap();
+
+        // padded = aligned + size = 0 + 32 = 32
+        // total = 32 + FOOTER_SIZE = 36
+        let expected_total = 32 + FOOTER_SIZE;
+        assert_eq!(arena.offset.get(), expected_total);
+        let ptr = arena.ptr_for(&alloc);
+        assert_eq!(alloc.offset, 0);
+
+        // Manually read the footer at offset 32 (after payload)
+        let footer_addr = unsafe { ptr.add(alloc.size.get() as usize).cast::<AllocFooter>() };
+        let footer = unsafe { footer_addr.read_unaligned() };
+        // footer stores padded - prev_offset = 32 - 0 = 32
+        assert_eq!(footer.size(), 32);
+        assert!(!footer.is_deallocated());
+    }
+
+    #[test]
+    fn alloc_exhaustion() {
+        let arena = Arena::new(100);
+        // Alloc most of the capacity
+        let layout = Layout::from_size_align(96, 1).unwrap();
+        let alloc = arena.alloc(layout);
+        assert!(alloc.is_some());
+        // Next alloc should fail (96 + FOOTER_SIZE = 100, exactly at capacity,
+        // but +FOOTER_SIZE for next overflows)
+        let layout2 = Layout::from_size_align(4, 1).unwrap();
+        let alloc2 = arena.alloc(layout2);
+        assert!(alloc2.is_none());
+    }
+
+    #[test]
+    fn alloc_type_and_read_roundtrip() {
+        let arena = Arena::new(4096);
+        let alloc = arena.alloc_write(42u64).expect("alloc_write failed");
+        let value: u64 = arena.read(&alloc);
+        assert_eq!(value, 42u64);
+    }
+
+    #[test]
+    fn alloc_write_vec_roundtrip() {
+        let arena = Arena::new(4096);
+        let v = vec![1u8, 2, 3, 4, 5];
+        let alloc = arena.alloc_write(v).expect("alloc_write Vec failed");
+        // read back — this creates a bitwise copy of Vec (heap-allocated data is
+        // shared)
+        let v2: Vec<u8> = arena.read(&alloc);
+        assert_eq!(v2, vec![1, 2, 3, 4, 5]);
+        // forget v2 to avoid double-free (the arena still holds the bits)
+        core::mem::forget(v2);
+    }
+
+    #[test]
+    fn ptr_for_is_within_bounds() {
+        let arena = Arena::new(4096);
+        let alloc = arena.alloc_write([0u8; 16]).unwrap();
+        let ptr = arena.ptr_for(&alloc);
+        let start = arena.buf.as_ptr() as usize;
+        let end = start + arena.capacity as usize;
+        let ptr_addr = ptr as usize;
+        assert!(ptr_addr >= start);
+        assert!(ptr_addr < end);
+    }
+
+    #[test]
+    fn get_alloc_slice_matches_size() {
+        let arena = Arena::new(4096);
+        let data = [1u8, 2, 3, 4, 5];
+        let alloc = arena.alloc_write(data).unwrap();
+        let slice = arena.get_alloc_slice(&alloc);
+        assert_eq!(slice.0.len(), 5);
+        let read_back = unsafe { core::ptr::read(slice.0.as_ptr() as *const [u8; 5]) };
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn dealloc_reclaims_top() {
+        let arena = Arena::new(4096);
+        let _alloc_a = arena.alloc_write(100u64).unwrap();
+        let alloc_b = arena.alloc_write(200u64).unwrap();
+
+        let offset_before = arena.offset.get();
+        unsafe { arena.dealloc(alloc_b) };
+        // after deallocating the top allocation, offset should shrink
+        assert!(arena.offset.get() < offset_before);
+    }
+
+    #[test]
+    fn dealloc_middle_does_not_reclaim() {
+        let arena = Arena::new(4096);
+        let _alloc_a = arena.alloc_write(10u64).unwrap();
+        let alloc_b = arena.alloc_write(20u64).unwrap();
+        let alloc_c = arena.alloc_write(30u64).unwrap();
+
+        let offset_before = arena.offset.get();
+        unsafe { arena.dealloc(alloc_b) };
+        // B is not at the top, so offset stays unchanged
+        assert_eq!(arena.offset.get(), offset_before);
+
+        // Now deallocate C (top), B should still remain
+        unsafe { arena.dealloc(alloc_c) };
+        assert!(arena.offset.get() < offset_before);
+    }
+
+    #[test]
+    fn dealloc_all_reclaims_everything() {
+        let arena = Arena::new(4096);
+        let alloc_a = arena.alloc_write(10u64).unwrap();
+        let alloc_b = arena.alloc_write(20u64).unwrap();
+        unsafe { arena.dealloc(alloc_b) };
+        unsafe { arena.dealloc(alloc_a) };
+        assert_eq!(arena.offset.get(), 0);
+    }
+
+    #[test]
+    fn alloc_alignment() {
+        let arena = Arena::new(4096);
+        // alloc with 1-byte alignment
+        let a1 = arena.alloc(Layout::from_size_align(1, 1).unwrap()).unwrap();
+        assert_eq!(a1.offset % 1, 0);
+        // alloc with 2-byte alignment
+        let a2 = arena.alloc(Layout::from_size_align(1, 2).unwrap()).unwrap();
+        assert_eq!(a2.offset % 2, 0);
+        // alloc with 8-byte alignment
+        let a3 = arena.alloc(Layout::from_size_align(1, 8).unwrap()).unwrap();
+        assert_eq!(a3.offset % 8, 0);
+        // alloc with 16-byte alignment
+        let a4 = arena
+            .alloc(Layout::from_size_align(1, 16).unwrap())
+            .unwrap();
+        assert_eq!(a4.offset % 16, 0);
+    }
+
+    #[test]
+    fn alloc_alignment_advances_offset_correctly() {
+        let arena = Arena::new(4096);
+        // allocate 1 byte at offset 0
+        let _a1 = arena.alloc(Layout::from_size_align(1, 1).unwrap()).unwrap();
+        // allocate with 8-byte alignment – should skip to next 8-aligned offset
+        let a2 = arena.alloc(Layout::from_size_align(4, 8).unwrap()).unwrap();
+        assert_eq!(a2.offset % 8, 0);
     }
 }

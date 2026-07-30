@@ -94,3 +94,90 @@ impl<T> Slab<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_sequential() {
+        let mut slab = Slab::new();
+        assert_eq!(slab.insert(10), Some(0));
+        assert_eq!(slab.insert(20), Some(1));
+        assert_eq!(slab.insert(30), Some(2));
+    }
+
+    #[test]
+    fn remove_reuses_slot() {
+        let mut slab = Slab::new();
+        slab.insert(100);
+        slab.insert(200);
+        assert_eq!(slab.remove(0), 100);
+        assert!(!slab.contains(0));
+        assert_eq!(slab.insert(300), Some(0));
+        assert!(slab.contains(0));
+    }
+
+    #[test]
+    fn insert_at_and_contains() {
+        let mut slab = Slab::new();
+        slab.insert_at(42, 99);
+        assert!(slab.contains(42));
+        assert_eq!(slab.slots.len(), 43);
+    }
+
+    #[test]
+    fn insert_at_preserves_capacity() {
+        let mut slab = Slab::new();
+        slab.insert(10);
+        slab.insert(20);
+        slab.insert(30);
+        slab.insert_at(99, 999);
+        // remove should still find free slot <64 if one exists
+        slab.remove(0);
+        assert_eq!(slab.insert(555), Some(0));
+    }
+
+    #[test]
+    fn inline_free_overflow() {
+        let mut slab = Slab::new();
+        // fill all 64 inline slots
+        for i in 0..64 {
+            assert_eq!(slab.insert(i as u64), Some(i));
+        }
+        // inline_free should be 0 now
+        assert_eq!(slab.inline_free, 0);
+        // next insertion extends the slab
+        assert_eq!(slab.insert(64), Some(64));
+        // removing index >= 64 pushes to free vec
+        slab.remove(64);
+        assert_eq!(slab.free.len(), 1);
+        // and a new insert reuses that heap slot
+        assert_eq!(slab.insert(65), Some(64));
+    }
+
+    #[test]
+    fn remove_updates_free_list_inline() {
+        let mut slab = Slab::new();
+        for i in 0..10 {
+            slab.insert(i);
+        }
+        slab.remove(0);
+        slab.remove(5);
+        assert!(!slab.contains(0));
+        assert!(!slab.contains(5));
+        // Re-insert reuses smallest free inline slot
+        assert_eq!(slab.insert(100), Some(0));
+        assert_eq!(slab.insert(200), Some(5));
+    }
+
+    #[test]
+    fn remove_frees_slot_and_allows_reuse() {
+        let mut slab = Slab::<u64>::new();
+        slab.insert(10);
+        slab.insert(20);
+        slab.remove(1);
+        assert!(!slab.contains(1));
+        assert_eq!(slab.insert(30), Some(1));
+    }
+}

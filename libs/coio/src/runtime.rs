@@ -415,3 +415,176 @@ impl<T> RuntimeContext<T> {
         unsafe { (self.spawn_fn)(self, user_data) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::num::NonZeroU32;
+    use core::pin::pin;
+    use core::task::Context;
+    use core::task::Poll;
+    use core::task::Waker;
+
+    use super::*;
+    use crate::arena::Arena;
+    use crate::arena::ArenaAlloc;
+    use crate::task::Task;
+    use crate::task::TaskContext;
+
+    // ── IoState (inline) ──────────────────────────────────────────────
+
+    #[test]
+    fn io_state_free_slot_exhaustion() {
+        let mut s = IoState::new();
+        for i in 0..64 {
+            assert_eq!(s.free_slot(), Some(i));
+            s.set_submitted(i, true);
+        }
+        assert_eq!(s.free_slot(), None);
+    }
+
+    #[test]
+    fn io_state_free_slot_reuses_freed() {
+        let mut s = IoState::new();
+        s.set_submitted(0, true);
+        s.set_submitted(1, true);
+        s.set_submitted(2, true);
+        // free slot 1
+        s.set_submitted(1, false);
+        assert_eq!(s.free_slot(), Some(1));
+    }
+
+    // ── IoState (heap variant) ────────────────────────────────────────
+
+    fn make_heap_state(capacity: usize) -> IoState {
+        IoState::Heap {
+            submitted: vec![0; capacity],
+            ready: vec![0; capacity],
+            results: vec![0; capacity * 64],
+            allocs: vec![None; capacity * 64],
+        }
+    }
+
+    #[test]
+    fn io_state_heap_free_slot() {
+        let mut s = make_heap_state(1);
+        assert_eq!(s.free_slot(), Some(0));
+        s.set_submitted(0, true);
+        // After submitting slot 0, '!submitted[0]' has bit 0 cleared => free_slot = 1
+        assert_eq!(s.free_slot(), Some(1));
+    }
+
+    #[test]
+    fn io_state_heap_free_slot_exhausted() {
+        let mut s = make_heap_state(1);
+        for i in 0..64 {
+            s.set_submitted(i, true);
+        }
+        assert_eq!(s.free_slot(), None);
+    }
+
+    #[test]
+    fn io_state_heap_beyond_64() {
+        let mut s = make_heap_state(2);
+        // submitted[0] covers slots 0..63, submitted[1] covers 64..127
+        assert_eq!(s.free_slot(), Some(0));
+        s.set_submitted(64, true);
+        assert!(s.is_submitted(64));
+        assert_eq!(s.free_slot(), Some(0));
+    }
+
+    #[test]
+    fn io_state_heap_ready_and_result() {
+        let mut s = make_heap_state(1);
+        s.set_submitted(10, true);
+        s.set_alloc(10, ArenaAlloc {
+            size: NonZeroU32::new(4).unwrap(),
+            offset: 0,
+        });
+        s.set_result(10, -1);
+        s.set_ready(10, true);
+        assert!(s.is_ready(10));
+        assert_eq!(s.result(10), -1);
+        let alloc = s.take_alloc(10);
+        assert_eq!(alloc.size.get(), 4);
+    }
+
+    // ── IoUserData ────────────────────────────────────────────────────
+
+    #[test]
+    fn io_user_data_u64_roundtrip() {
+        for raw in [0u64, 1, u64::MAX, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0] {
+            let ud: IoUserData = raw.into();
+            let back: u64 = ud.into();
+            assert_eq!(raw, back);
+        }
+    }
+
+    #[test]
+    fn io_user_data_struct_roundtrip() {
+        let ud = IoUserData {
+            index: 42,
+            io_slot: 7,
+        };
+        let raw: u64 = ud.into();
+        let back: IoUserData = raw.into();
+        assert_eq!(back.index, 42);
+        assert_eq!(back.io_slot, 7);
+    }
+
+    // ── Yield ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn yield_first_poll_returns_pending() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(0, &mut task, &mut wakeups);
+        let mut y = yield_now(&ctx);
+        let mut y = pin!(&mut y);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(y.polled);
+    }
+
+    #[test]
+    fn yield_second_poll_returns_ready() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(0, &mut task, &mut wakeups);
+        let mut y = yield_now(&ctx);
+        let mut y = pin!(&mut y);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn yield_calls_wake_on_first_poll() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(7, &mut task, &mut wakeups);
+        let mut y = yield_now(&ctx);
+        let mut y = pin!(&mut y);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        let _ = y.as_mut().poll(&mut cx);
+        // wake should have pushed index 7 into wakeups
+        assert_eq!(wakeups, vec![7]);
+    }
+}

@@ -136,3 +136,199 @@ impl<F> TaskSlab<F> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::future::Ready;
+
+    use super::*;
+    use crate::arena::Arena;
+    use crate::runtime::IoState;
+
+    // ── TaskSlab ──────────────────────────────────────────────────────
+
+    #[test]
+    fn slab_new_large_capacity() {
+        let slab = TaskSlab::<Ready<()>>::new(128);
+        assert_eq!(slab.tasks.len(), 128);
+        assert_eq!(slab.free.len(), 2); // 128 / 64 = 2 words
+        assert_eq!(slab.free[0], u64::MAX);
+        assert_eq!(slab.free[1], u64::MAX);
+    }
+
+    #[test]
+    fn insert_vacant_sequential() {
+        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(0));
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(1));
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(2));
+        }
+    }
+
+    #[test]
+    fn insert_vacant_exhaustion() {
+        let mut slab = TaskSlab::<Ready<()>>::new(3);
+        unsafe {
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(0));
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(1));
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), Some(2));
+            assert_eq!(TaskSlab::insert_vacant(&mut slab), None);
+        }
+    }
+
+    #[test]
+    fn init_and_retrieve_task() {
+        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            let idx = TaskSlab::insert_vacant(&mut slab).unwrap();
+            let task = Task {
+                ready: true,
+                io: IoState::new(),
+                arena: Arena::new(4096),
+            };
+            TaskSlab::init_task_unchecked(&mut slab, idx, task);
+
+            let ptr = TaskSlab::task_ptr_unchecked(&mut slab, idx);
+            assert_eq!((*ptr).ready, true);
+        }
+    }
+
+    #[test]
+    fn init_and_retrieve_context() {
+        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            let idx = TaskSlab::insert_vacant(&mut slab).unwrap();
+            let task = Task {
+                ready: true,
+                io: IoState::new(),
+                arena: Arena::new(4096),
+            };
+            TaskSlab::init_task_unchecked(&mut slab, idx, task);
+            let mut wakeups = Vec::new();
+            let ctx = TaskContext::new(
+                idx,
+                TaskSlab::task_ptr_unchecked(&mut slab, idx),
+                &mut wakeups,
+            );
+            TaskSlab::init_context_unchecked(&mut slab, idx, ctx);
+
+            let cptr = TaskSlab::context_ptr_unchecked(&slab as *const _, idx);
+            assert_eq!((*cptr).task_index, idx);
+        }
+    }
+
+    #[test]
+    fn is_occupied_initially_false() {
+        let slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            assert!(!TaskSlab::is_occupied(&slab as *const _, 0));
+        }
+    }
+
+    #[test]
+    fn is_occupied_after_init() {
+        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            let idx = TaskSlab::insert_vacant(&mut slab).unwrap();
+            let task = Task {
+                ready: true,
+                io: IoState::new(),
+                arena: Arena::new(4096),
+            };
+            TaskSlab::init_task_unchecked(&mut slab, idx, task);
+            TaskSlab::init_future_unchecked(&mut slab, idx, core::future::ready(()));
+            TaskSlab::init_context_unchecked(
+                &mut slab,
+                idx,
+                TaskContext::new(
+                    idx,
+                    TaskSlab::task_ptr_unchecked(&mut slab, idx),
+                    &mut Vec::new(),
+                ),
+            );
+            assert!(TaskSlab::is_occupied(&slab as *const _, idx));
+        }
+    }
+
+    #[test]
+    fn remove_unchecked_returns_values_and_frees_slot() {
+        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        unsafe {
+            let idx = TaskSlab::insert_vacant(&mut slab).unwrap();
+            let task = Task {
+                ready: true,
+                io: IoState::new(),
+                arena: Arena::new(4096),
+            };
+            TaskSlab::init_task_unchecked(&mut slab, idx, task);
+            TaskSlab::init_future_unchecked(&mut slab, idx, core::future::ready(()));
+            let mut wakeups = Vec::new();
+            TaskSlab::init_context_unchecked(
+                &mut slab,
+                idx,
+                TaskContext::new(
+                    idx,
+                    TaskSlab::task_ptr_unchecked(&mut slab, idx),
+                    &mut wakeups,
+                ),
+            );
+
+            let (t, _f) = TaskSlab::remove_unchecked(&mut slab, idx);
+            assert!(t.ready);
+            // future is Ready<()>, dropping it after taking is fine
+
+            // Slot should now be free again
+            assert!(!TaskSlab::is_occupied(&slab as *const _, idx));
+            let next_idx = TaskSlab::insert_vacant(&mut slab).unwrap();
+            assert_eq!(next_idx, idx); // reused
+        }
+    }
+
+    // ── TaskContext ───────────────────────────────────────────────────
+
+    #[test]
+    fn task_context_with_task_reads_correct_task() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(5, &mut task, &mut wakeups);
+
+        let ready = ctx.with_task(|t| t.ready);
+        assert!(!ready);
+    }
+
+    #[test]
+    fn task_context_with_task_modifies() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(5, &mut task, &mut wakeups);
+
+        ctx.with_task(|t| t.ready = true);
+        assert!(task.ready);
+    }
+
+    #[test]
+    fn task_context_wake_pushes_index() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(3, &mut task, &mut wakeups);
+
+        ctx.wake();
+        assert_eq!(wakeups, vec![3]);
+
+        ctx.wake();
+        assert_eq!(wakeups, vec![3, 3]);
+    }
+}
