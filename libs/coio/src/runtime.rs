@@ -294,6 +294,23 @@ impl Future for Yield {
     }
 }
 
+/// Runs a closure exactly once when dropped, even on panic unwind.
+struct DropGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> DropGuard<F> {
+    fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for DropGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f()
+        }
+    }
+}
+
 pub struct Runtime {
     tasks_capacity: u32,
     ring_entries: u32,
@@ -317,21 +334,23 @@ impl Runtime {
     pub fn block_on<S, F, T>(mut self, spawn_fn: S, user_data: T)
     where
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-        F: Future<Output = ()>,
+        F: Future<Output = ()> + 'static,
     {
         let generation = enter_active_gen();
 
         let mut ring = io_uring::IoUring::new(self.ring_entries).unwrap();
         let mut wakeups = Vec::new();
-        let mut tasks = TaskSlab::new(self.tasks_capacity);
-        let tasks_ptr: *mut TaskSlab<F> = &mut tasks;
+        let mut tasks = TaskSlab::new::<F>(self.tasks_capacity);
+        let tasks_ptr: *mut TaskSlab = &mut tasks;
         let wakeups_ptr: *mut Vec<u32> = &mut wakeups;
+        let _drop_guard =
+            DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(tasks_ptr) });
 
         let spawn_fn_ptr: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
 
         let ctx = RuntimeContext {
             generation,
-            tasks: tasks_ptr as *mut (),
+            tasks: tasks_ptr,
             spawn_fn: spawn_fn_ptr,
             wakeups: wakeups_ptr,
             spawn_closure: &spawn_fn as *const S as *const (),
@@ -372,12 +391,12 @@ impl Runtime {
                 unsafe { tasks.task_mut_unchecked(idx).ready = false };
 
                 let mut cx = Context::from_waker(Waker::noop());
-                let future_ptr = tasks.future_ptr_unchecked(idx);
+                let future_ptr = tasks.future_ptr_unchecked::<F>(idx);
                 let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
 
                 match future.poll(&mut cx) {
                     Poll::Ready(()) => {
-                        unsafe { tasks.remove_unchecked(idx) };
+                        unsafe { tasks.remove_unchecked::<F>(idx) };
                     }
                     Poll::Pending => {}
                 }
@@ -402,14 +421,13 @@ impl Runtime {
             }
         }
 
-        drop(tasks);
         exit_active_gen();
     }
 
-    fn drain_cqes<F>(
+    fn drain_cqes(
         &mut self,
         ring: &mut io_uring::IoUring,
-        tasks: &mut TaskSlab<F>,
+        tasks: &mut TaskSlab,
         ready: &mut Vec<u32>,
     ) {
         for cqe in ring.completion() {
@@ -435,9 +453,9 @@ impl Runtime {
     unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
     where
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-        F: Future<Output = ()>,
+        F: Future<Output = ()> + 'static,
     {
-        let tasks = ctx.tasks as *mut TaskSlab<F>;
+        let tasks = ctx.tasks;
         let closure = unsafe { &*(ctx.spawn_closure as *const S) };
 
         let index = unsafe { (*tasks).insert_vacant()? };
@@ -460,10 +478,11 @@ impl Runtime {
     }
 }
 
+#[derive(Debug)]
 pub struct RuntimeContext<T> {
     generation: u64,
     spawn_fn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
-    tasks: *mut (),
+    tasks: *mut TaskSlab,
     wakeups: *mut Vec<u32>,
     spawn_closure: *const (),
     _phantom: PhantomData<T>,
@@ -660,7 +679,7 @@ mod tests {
         task.io.set_result(slot, 42);
         task.io.set_ready(slot, true);
 
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -689,7 +708,7 @@ mod tests {
         task.io.set_submitted(slot, true);
         // NOT setting ready yet
 
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -725,7 +744,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -750,7 +769,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -775,7 +794,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 

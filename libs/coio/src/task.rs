@@ -1,5 +1,10 @@
+use core::any::TypeId;
 use core::fmt;
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+use std::alloc::Layout;
+use std::alloc::alloc;
+use std::alloc::dealloc;
 
 use crate::arena::Arena;
 use crate::runtime;
@@ -83,25 +88,31 @@ impl TaskContext {
     }
 }
 
-pub struct TaskSlab<F> {
+pub struct TaskSlab {
     tasks: Box<[MaybeUninit<Task>]>,
-    futures: Box<[MaybeUninit<F>]>,
+    futures: NonNull<u8>,
+    future_type_id: TypeId,
     free: Box<[u64]>,
     next_id: u64,
 }
 
-impl<F> TaskSlab<F> {
-    pub fn new(capacity: u32) -> Self {
+impl TaskSlab {
+    pub fn new<F: 'static>(capacity: u32) -> Self {
         let cap = capacity as usize;
         let mut tasks = Vec::with_capacity(cap);
         tasks.resize_with(cap, MaybeUninit::uninit);
-        let mut futures = Vec::with_capacity(cap);
-        futures.resize_with(cap, MaybeUninit::uninit);
         let words = cap.div_ceil(64);
+        let free = vec![u64::MAX; words].into_boxed_slice();
+
+        let layout = Layout::array::<F>(cap).unwrap();
+        let futures = unsafe { alloc(layout) };
+        let futures = NonNull::new(futures).expect("future allocation failed");
+
         Self {
             tasks: tasks.into_boxed_slice(),
-            futures: futures.into_boxed_slice(),
-            free: vec![u64::MAX; words].into_boxed_slice(),
+            futures,
+            future_type_id: TypeId::of::<F>(),
+            free,
             next_id: 1,
         }
     }
@@ -166,10 +177,18 @@ impl<F> TaskSlab<F> {
         unsafe { self.tasks[index as usize].assume_init_mut() }
     }
 
+    /// Returns a pointer to the byte slot backing future `index`. The slot is
+    /// only valid for the `F` the slab was created for.
+    fn future_slot<F>(&self, index: u32) -> *mut MaybeUninit<u8> {
+        let base = self.futures.as_ptr().cast::<F>();
+        unsafe { base.add(index as usize) as _ }
+    }
+
     /// # Safety
     /// `index` must be an in-bounds, initialized slot.
-    pub unsafe fn future_mut_unchecked(&mut self, index: u32) -> &mut F {
-        unsafe { self.futures[index as usize].assume_init_mut() }
+    pub unsafe fn future_mut_unchecked<F: 'static>(&mut self, index: u32) -> &mut F {
+        assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        unsafe { &mut *(self.future_slot::<F>(index) as *mut F) }
     }
 
     /// # Safety
@@ -182,16 +201,18 @@ impl<F> TaskSlab<F> {
 
     /// # Safety
     /// `index` must be an in-bounds slot that has not already been initialized.
-    pub unsafe fn init_future_unchecked(&mut self, index: u32, future: F) {
-        self.futures[index as usize] = MaybeUninit::new(future);
+    pub unsafe fn init_future_unchecked<F: 'static>(&mut self, index: u32, future: F) {
+        assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        unsafe { (self.future_slot::<F>(index) as *mut F).write(future) };
     }
 
     pub fn task_ptr_unchecked(&mut self, index: u32) -> *mut Task {
         self.tasks[index as usize].as_mut_ptr()
     }
 
-    pub fn future_ptr_unchecked(&mut self, index: u32) -> *mut F {
-        self.futures[index as usize].as_mut_ptr()
+    pub fn future_ptr_unchecked<F: 'static>(&mut self, index: u32) -> *mut F {
+        assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        self.future_slot::<F>(index) as *mut F
     }
 
     pub fn context_for(&mut self, index: u32, wakeups: *mut Vec<u32>) -> TaskContext {
@@ -213,14 +234,31 @@ impl<F> TaskSlab<F> {
     /// # Safety
     /// `index` must be an in-bounds, initialized slot that has not already
     /// been removed.
-    pub unsafe fn remove_unchecked(&mut self, index: u32) -> (Task, F) {
+    pub unsafe fn remove_unchecked<F: 'static>(&mut self, index: u32) -> Task {
+        assert_eq!(TypeId::of::<F>(), self.future_type_id);
         let word = index as usize / 64;
         let bit = index as usize % 64;
         self.free[word] |= 1 << bit;
         unsafe {
-            let task = self.tasks[index as usize].assume_init_read();
-            let future = self.futures[index as usize].assume_init_read();
-            (task, future)
+            (self.future_slot::<F>(index) as *mut F).drop_in_place();
+            self.tasks[index as usize].assume_init_read()
+        }
+    }
+
+    /// # Safety
+    /// `slab` must point to a live slab that is never used again. `F` must
+    /// match the type the slab was created for.
+    pub unsafe fn drop_futures_raw<F: 'static>(slab: *mut TaskSlab) {
+        let this = unsafe { &*slab };
+        assert_eq!(TypeId::of::<F>(), this.future_type_id);
+        let layout = Layout::array::<F>(this.tasks.len()).unwrap();
+        for index in 0..this.tasks.len() as u32 {
+            if this.is_occupied(index) {
+                unsafe { core::ptr::drop_in_place(this.future_slot::<F>(index).cast::<F>()) };
+            }
+        }
+        if layout.size() > 0 {
+            unsafe { dealloc(this.futures.as_ptr(), layout) };
         }
     }
 }
@@ -238,7 +276,7 @@ mod tests {
 
     #[test]
     fn slab_new_large_capacity() {
-        let slab = TaskSlab::<Ready<()>>::new(128);
+        let slab = TaskSlab::new::<Ready<()>>(128);
         assert_eq!(slab.tasks.len(), 128);
         assert_eq!(slab.free.len(), 2); // 128 / 64 = 2 words
         assert_eq!(slab.free[0], u64::MAX);
@@ -247,7 +285,7 @@ mod tests {
 
     #[test]
     fn insert_vacant_sequential() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         assert_eq!(slab.insert_vacant(), Some(0));
         assert_eq!(slab.insert_vacant(), Some(1));
         assert_eq!(slab.insert_vacant(), Some(2));
@@ -255,7 +293,7 @@ mod tests {
 
     #[test]
     fn insert_vacant_exhaustion() {
-        let mut slab = TaskSlab::<Ready<()>>::new(3);
+        let mut slab = TaskSlab::new::<Ready<()>>(3);
         assert_eq!(slab.insert_vacant(), Some(0));
         assert_eq!(slab.insert_vacant(), Some(1));
         assert_eq!(slab.insert_vacant(), Some(2));
@@ -264,7 +302,7 @@ mod tests {
 
     #[test]
     fn init_and_retrieve_task() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
@@ -282,13 +320,13 @@ mod tests {
 
     #[test]
     fn is_occupied_initially_false() {
-        let slab = TaskSlab::<Ready<()>>::new(10);
+        let slab = TaskSlab::new::<Ready<()>>(10);
         assert!(!slab.is_occupied(0));
     }
 
     #[test]
     fn is_occupied_after_init() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
@@ -305,7 +343,7 @@ mod tests {
 
     #[test]
     fn remove_unchecked_returns_values_and_frees_slot() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
@@ -317,7 +355,7 @@ mod tests {
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
 
-            let (t, _f) = slab.remove_unchecked(idx);
+            let t = slab.remove_unchecked::<Ready<()>>(idx);
             assert!(t.ready);
             // future is Ready<()>, dropping it after taking is fine
 
@@ -328,17 +366,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn future_type_mismatch_panics() {
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = slab.future_ptr_unchecked::<Ready<u8>>(0);
+        }));
+        assert!(result.is_err());
+    }
+
     // ── has_io_in_flight ────────────────────────────────────────────
 
     #[test]
     fn has_io_in_flight_empty_slab() {
-        let slab = TaskSlab::<Ready<()>>::new(10);
+        let slab = TaskSlab::new::<Ready<()>>(10);
         assert!(!slab.has_io_in_flight());
     }
 
     #[test]
     fn has_io_in_flight_occupied_no_io() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
@@ -354,7 +401,7 @@ mod tests {
 
     #[test]
     fn has_io_in_flight_with_pending_io() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let mut io = IoState::new();
@@ -372,7 +419,7 @@ mod tests {
 
     #[test]
     fn has_io_in_flight_completed_io() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
             let mut io = IoState::new();
@@ -391,7 +438,7 @@ mod tests {
 
     #[test]
     fn has_io_in_flight_multi_task() {
-        let mut slab = TaskSlab::<Ready<()>>::new(10);
+        let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx0 = slab.insert_vacant().unwrap();
             let task0 = Task {
@@ -428,7 +475,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -450,7 +497,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -472,7 +519,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
 
@@ -495,7 +542,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task) };
         unsafe { slab.init_future_unchecked(index, core::future::ready(())) };
@@ -505,7 +552,7 @@ mod tests {
         runtime::enter_active_gen();
         let ctx = slab.context_for(index, &mut wakeups);
 
-        let _ = unsafe { slab.remove_unchecked(index) };
+        let _ = unsafe { slab.remove_unchecked::<Ready<()>>(index) };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_task(|_t| ());
@@ -522,7 +569,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index, task_a) };
         unsafe { slab.init_future_unchecked(index, core::future::ready(())) };
@@ -532,7 +579,7 @@ mod tests {
         runtime::enter_active_gen();
         let ctx = slab.context_for(index, &mut wakeups);
 
-        let _ = unsafe { slab.remove_unchecked(index) };
+        let _ = unsafe { slab.remove_unchecked::<Ready<()>>(index) };
 
         let task_b = Task {
             ready: true,
@@ -560,7 +607,7 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let mut slab = TaskSlab::new::<Ready<()>>(64);
         let index_a = slab.insert_vacant().unwrap();
         unsafe { slab.init_task_unchecked(index_a, task_a) };
 
