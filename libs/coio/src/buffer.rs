@@ -101,6 +101,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let data = vec![1u8, 2, 3];
         let slot = data.prepare_read(&mut task).expect("prepare_read failed");
@@ -114,6 +115,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         // fill all 64 slots
         for i in 0..64 {
@@ -131,6 +133,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let data: &[u8] = &[10, 20, 30];
         let slot = data
@@ -147,6 +150,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let mut buf = [0u8; 8];
         let data: &mut [u8] = &mut buf;
@@ -164,6 +168,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         // Simulate a completed read: write a u64 to arena via an IO slot
         let slot = task.io.free_slot().unwrap();
@@ -189,6 +194,7 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let data = vec![1u8, 2, 3, 4];
         let slot = data.prepare_read(&mut task).expect("prepare_read");

@@ -1,3 +1,4 @@
+use core::fmt;
 use core::mem::MaybeUninit;
 
 use crate::arena::Arena;
@@ -8,40 +9,76 @@ pub struct Task {
     pub ready: bool,
     pub io: IoState,
     pub arena: Arena,
+    pub(crate) id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TaskContext {
     generation: u64,
     task_index: u32,
+    task_id: u64,
     task: *mut Task,
+    free: *const [u64],
     wakeups: *mut Vec<u32>,
 }
 
-impl TaskContext {
-    pub fn new(generation: u64, task_index: u32, task: *mut Task, wakeups: *mut Vec<u32>) -> Self {
-        Self {
-            generation,
-            task_index,
-            task,
-            wakeups,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskContextError {
+    InactiveRuntime,
+    SlotOutOfBounds,
+    TaskRemoved,
+    TaskReused,
+}
 
-    fn check_active(&self) {
-        assert!(
-            runtime::active_gen_matches(self.generation),
-            "TaskContext used outside the runtime it belongs to"
-        );
+impl fmt::Display for TaskContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::InactiveRuntime => "TaskContext used outside the runtime it belongs to",
+            Self::SlotOutOfBounds => "TaskContext refers to an out-of-bounds slot",
+            Self::TaskRemoved => "TaskContext refers to a removed task",
+            Self::TaskReused => "TaskContext refers to a slot reused by a different task",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for TaskContextError {}
+
+impl TaskContext {
+    pub fn validate(&self) -> Result<(), TaskContextError> {
+        if !runtime::active_gen_matches(self.generation) {
+            return Err(TaskContextError::InactiveRuntime);
+        }
+
+        let word = self.task_index as usize / 64;
+        let bit = self.task_index as usize % 64;
+        let free = unsafe { &*self.free };
+        if word >= free.len() {
+            return Err(TaskContextError::SlotOutOfBounds);
+        }
+        if free[word] & (1 << bit) != 0 {
+            return Err(TaskContextError::TaskRemoved);
+        }
+
+        unsafe {
+            if (*self.task).id != self.task_id {
+                return Err(TaskContextError::TaskReused);
+            }
+        }
+        Ok(())
     }
 
     pub fn with_task<R>(&self, f: impl FnOnce(&mut Task) -> R) -> R {
-        self.check_active();
+        if let Err(e) = self.validate() {
+            panic!("invalid TaskContext: {e}");
+        }
         unsafe { f(&mut *self.task) }
     }
 
     pub fn wake(&self) {
-        self.check_active();
+        if let Err(e) = self.validate() {
+            panic!("invalid TaskContext: {e}");
+        }
         unsafe { (*self.wakeups).push(self.task_index) };
     }
 }
@@ -50,6 +87,7 @@ pub struct TaskSlab<F> {
     tasks: Box<[MaybeUninit<Task>]>,
     futures: Box<[MaybeUninit<F>]>,
     free: Box<[u64]>,
+    next_id: u64,
 }
 
 impl<F> TaskSlab<F> {
@@ -64,6 +102,7 @@ impl<F> TaskSlab<F> {
             tasks: tasks.into_boxed_slice(),
             futures: futures.into_boxed_slice(),
             free: vec![u64::MAX; words].into_boxed_slice(),
+            next_id: 1,
         }
     }
 
@@ -135,7 +174,9 @@ impl<F> TaskSlab<F> {
 
     /// # Safety
     /// `index` must be an in-bounds slot that has not already been initialized.
-    pub unsafe fn init_task_unchecked(&mut self, index: u32, task: Task) {
+    pub unsafe fn init_task_unchecked(&mut self, index: u32, mut task: Task) {
+        task.id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
         self.tasks[index as usize] = MaybeUninit::new(task);
     }
 
@@ -151,6 +192,22 @@ impl<F> TaskSlab<F> {
 
     pub fn future_ptr_unchecked(&mut self, index: u32) -> *mut F {
         self.futures[index as usize].as_mut_ptr()
+    }
+
+    pub fn context_for(&mut self, index: u32, wakeups: *mut Vec<u32>) -> TaskContext {
+        assert!(
+            self.is_occupied(index),
+            "cannot build a context for an uninitialized slot"
+        );
+        let task = self.task_ptr_unchecked(index);
+        TaskContext {
+            generation: runtime::active_gen().expect("no active generation"),
+            task_index: index,
+            task_id: unsafe { (*task).id },
+            task,
+            free: &*self.free,
+            wakeups,
+        }
     }
 
     /// # Safety
@@ -214,6 +271,7 @@ mod tests {
                 ready: true,
                 io: IoState::new(),
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
 
@@ -237,6 +295,7 @@ mod tests {
                 ready: true,
                 io: IoState::new(),
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
@@ -253,6 +312,7 @@ mod tests {
                 ready: true,
                 io: IoState::new(),
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
@@ -285,6 +345,7 @@ mod tests {
                 ready: true,
                 io: IoState::new(),
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
             assert!(!slab.has_io_in_flight());
@@ -302,6 +363,7 @@ mod tests {
                 ready: true,
                 io,
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
             assert!(slab.has_io_in_flight());
@@ -320,6 +382,7 @@ mod tests {
                 ready: true,
                 io,
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx, task);
             assert!(!slab.has_io_in_flight());
@@ -335,6 +398,7 @@ mod tests {
                 ready: true,
                 io: IoState::new(),
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx0, task0);
 
@@ -345,6 +409,7 @@ mod tests {
                 ready: true,
                 io: io1,
                 arena: Arena::new(4096),
+                id: 0,
             };
             slab.init_task_unchecked(idx1, task1);
 
@@ -357,15 +422,20 @@ mod tests {
 
     #[test]
     fn task_context_with_task_reads_correct_task() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = runtime::enter_active_gen();
-        let ctx = TaskContext::new(generation, 5, &mut task, &mut wakeups);
+        runtime::enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
 
         let ready = ctx.with_task(|t| t.ready);
         runtime::exit_active_gen();
@@ -374,36 +444,147 @@ mod tests {
 
     #[test]
     fn task_context_with_task_modifies() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = runtime::enter_active_gen();
-        let ctx = TaskContext::new(generation, 5, &mut task, &mut wakeups);
+        runtime::enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
 
         ctx.with_task(|t| t.ready = true);
         runtime::exit_active_gen();
-        assert!(task.ready);
+        assert!(unsafe { slab.task_unchecked(index) }.ready);
     }
 
     #[test]
     fn task_context_wake_pushes_index() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = runtime::enter_active_gen();
-        let ctx = TaskContext::new(generation, 3, &mut task, &mut wakeups);
+        runtime::enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
 
         ctx.wake();
         ctx.wake();
         runtime::exit_active_gen();
-        assert_eq!(wakeups, vec![3, 3]);
+        assert_eq!(wakeups, vec![index, index]);
+    }
+
+    #[test]
+    fn task_context_after_removal_panics() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+        unsafe { slab.init_future_unchecked(index, core::future::ready(())) };
+
+        let mut wakeups = Vec::new();
+
+        runtime::enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
+
+        let _ = unsafe { slab.remove_unchecked(index) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_task(|_t| ());
+        }));
+        runtime::exit_active_gen();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_context_after_slot_reuse_panics_without_touching_new_task() {
+        let task_a = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task_a) };
+        unsafe { slab.init_future_unchecked(index, core::future::ready(())) };
+
+        let mut wakeups = Vec::new();
+
+        runtime::enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
+
+        let _ = unsafe { slab.remove_unchecked(index) };
+
+        let task_b = Task {
+            ready: true,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        unsafe { slab.init_task_unchecked(index, task_b) };
+        unsafe { slab.init_future_unchecked(index, core::future::ready(())) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_task(|t| t.ready = false);
+        }));
+        runtime::exit_active_gen();
+
+        assert!(result.is_err());
+        assert!(unsafe { slab.task_unchecked(index) }.ready);
+    }
+
+    #[test]
+    fn task_context_of_live_task_usable_alongside_other_tasks() {
+        let task_a = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index_a = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index_a, task_a) };
+
+        let task_b = Task {
+            ready: true,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let index_b = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index_b, task_b) };
+
+        let mut wakeups = Vec::new();
+
+        runtime::enter_active_gen();
+        let ctx_a = slab.context_for(index_a, &mut wakeups);
+        let _ctx_b = slab.context_for(index_b, &mut wakeups);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx_a.with_task(|t| t.ready = true);
+        }));
+        runtime::exit_active_gen();
+
+        assert!(result.is_ok());
+        assert!(unsafe { slab.task_unchecked(index_a) }.ready);
     }
 }

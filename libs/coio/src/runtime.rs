@@ -19,7 +19,13 @@ thread_local! {
 }
 
 pub(crate) fn active_gen_matches(generation: u64) -> bool {
-    RUNNING.with(|c| c.get()) && ACTIVE_GEN.with(|c| c.get() == generation)
+    active_gen() == Some(generation)
+}
+
+pub(crate) fn active_gen() -> Option<u64> {
+    RUNNING
+        .with(|c| c.get())
+        .then_some(ACTIVE_GEN.with(|c| c.get()))
 }
 
 pub(crate) fn enter_active_gen() -> u64 {
@@ -290,16 +296,21 @@ impl Future for Yield {
 
 pub struct Runtime {
     tasks_capacity: u32,
-    wakeups: Vec<u32>,
-    ring: io_uring::IoUring,
+    ring_entries: u32,
 }
 
 impl Runtime {
-    pub fn new(task_capacity: u32, ring_entries: u32) -> std::io::Result<Self> {
+    pub fn new(tasks_capacity: u32, ring_entries: u32) -> std::io::Result<Self> {
+        if ring_entries == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ring_entries must be greater than 0",
+            ));
+        }
+
         Ok(Self {
-            tasks_capacity: task_capacity,
-            wakeups: Vec::new(),
-            ring: io_uring::IoUring::new(ring_entries)?,
+            tasks_capacity,
+            ring_entries,
         })
     }
 
@@ -310,9 +321,11 @@ impl Runtime {
     {
         let generation = enter_active_gen();
 
+        let mut ring = io_uring::IoUring::new(self.ring_entries).unwrap();
+        let mut wakeups = Vec::new();
         let mut tasks = TaskSlab::new(self.tasks_capacity);
         let tasks_ptr: *mut TaskSlab<F> = &mut tasks;
-        let wakeups_ptr: *mut Vec<u32> = &mut self.wakeups;
+        let wakeups_ptr: *mut Vec<u32> = &mut wakeups;
 
         let spawn_fn_ptr: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
 
@@ -337,27 +350,23 @@ impl Runtime {
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         unsafe { tasks.init_task_unchecked(index, task) };
 
-        let task_ctx = TaskContext::new(
-            generation,
-            index,
-            tasks.task_ptr_unchecked(index),
-            wakeups_ptr,
-        );
+        let task_ctx = tasks.context_for(index, wakeups_ptr);
 
         let future = (spawn_fn)(task_ctx, ctx, user_data);
         unsafe { tasks.init_future_unchecked(index, future) };
-        self.wakeups.push(index);
+        wakeups.push(index);
 
         let mut ready_tasks = Vec::new();
 
         loop {
-            core::mem::swap(&mut self.wakeups, &mut ready_tasks);
-            assert!(self.wakeups.is_empty());
+            core::mem::swap(&mut wakeups, &mut ready_tasks);
+            assert!(wakeups.is_empty());
 
-            self.drain_cqes(&mut tasks, &mut ready_tasks);
+            self.drain_cqes(&mut ring, &mut tasks, &mut ready_tasks);
 
             for &idx in &ready_tasks {
                 unsafe { tasks.task_mut_unchecked(idx).ready = false };
@@ -377,13 +386,13 @@ impl Runtime {
             ready_tasks.clear();
 
             if !tasks.has_io_in_flight() {
-                if self.wakeups.is_empty() {
+                if wakeups.is_empty() {
                     break;
                 }
                 continue;
             }
 
-            match self.ring.submit_and_wait(1) {
+            match ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
                 Err(_) => {
@@ -397,8 +406,13 @@ impl Runtime {
         exit_active_gen();
     }
 
-    fn drain_cqes<F>(&mut self, tasks: &mut TaskSlab<F>, ready: &mut Vec<u32>) {
-        for cqe in self.ring.completion() {
+    fn drain_cqes<F>(
+        &mut self,
+        ring: &mut io_uring::IoUring,
+        tasks: &mut TaskSlab<F>,
+        ready: &mut Vec<u32>,
+    ) {
+        for cqe in ring.completion() {
             let raw = cqe.user_data();
             let task_index = (raw >> 32) as u32;
             let io_slot = raw as u32;
@@ -431,15 +445,11 @@ impl Runtime {
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         unsafe { (*tasks).init_task_unchecked(index, task) };
 
-        let task_ctx = TaskContext::new(
-            ctx.generation,
-            index,
-            unsafe { (*tasks).task_ptr_unchecked(index) },
-            ctx.wakeups,
-        );
+        let task_ctx = unsafe { (*tasks).context_for(index, ctx.wakeups) };
 
         let future = closure(task_ctx, ctx, user_data);
         unsafe {
@@ -479,6 +489,7 @@ impl<T> RuntimeContext<T> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Ready;
     use core::num::NonZeroU32;
     use core::pin::pin;
     use core::task::Context;
@@ -489,7 +500,7 @@ mod tests {
     use crate::arena::Arena;
     use crate::arena::ArenaAlloc;
     use crate::task::Task;
-    use crate::task::TaskContext;
+    use crate::task::TaskSlab;
 
     // ── IoState (inline) ──────────────────────────────────────────────
 
@@ -642,16 +653,21 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let slot = task.io.free_slot().unwrap();
         task.io.set_submitted(slot, true);
         task.io.set_result(slot, 42);
         task.io.set_ready(slot, true);
 
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = enter_active_gen();
-        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
+        enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
@@ -667,15 +683,20 @@ mod tests {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
         let slot = task.io.free_slot().unwrap();
         task.io.set_submitted(slot, true);
         // NOT setting ready yet
 
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = enter_active_gen();
-        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
+        enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
@@ -685,6 +706,7 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
         // Now set ready externally
+        let task = unsafe { slab.task_mut_unchecked(index) };
         task.io.set_ready(slot, true);
         task.io.set_result(slot, 99);
 
@@ -697,15 +719,20 @@ mod tests {
 
     #[test]
     fn yield_first_poll_returns_pending() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = enter_active_gen();
-        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
+        enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
@@ -717,15 +744,20 @@ mod tests {
 
     #[test]
     fn yield_second_poll_returns_ready() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = enter_active_gen();
-        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
+        enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
@@ -737,22 +769,27 @@ mod tests {
 
     #[test]
     fn yield_calls_wake_on_first_poll() {
-        let mut task = Task {
+        let task = Task {
             ready: false,
             io: IoState::new(),
             arena: Arena::new(4096),
+            id: 0,
         };
+        let mut slab = TaskSlab::<Ready<()>>::new(64);
+        let index = slab.insert_vacant().unwrap();
+        unsafe { slab.init_task_unchecked(index, task) };
+
         let mut wakeups = Vec::new();
 
-        let generation = enter_active_gen();
-        let ctx = TaskContext::new(generation, 7, &mut task, &mut wakeups);
+        enter_active_gen();
+        let ctx = slab.context_for(index, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
 
         let _ = y.as_mut().poll(&mut cx);
-        // wake should have pushed index 7 into wakeups
-        assert_eq!(wakeups, vec![7]);
+        // wake should have pushed index into wakeups
+        assert_eq!(wakeups, vec![index]);
         exit_active_gen();
     }
 }
