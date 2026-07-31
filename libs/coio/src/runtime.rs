@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
@@ -11,6 +12,49 @@ use crate::arena::ArenaAlloc;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
+
+thread_local! {
+    static ACTIVE_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(crate) fn active_gen_matches(generation: u64) -> bool {
+    ACTIVE_GEN.with(|c| c.get() == generation)
+}
+
+struct ActiveGuard {
+    prev: u64,
+}
+
+impl ActiveGuard {
+    fn enter(generation: u64) -> Self {
+        let prev = ACTIVE_GEN.with(|c| c.replace(generation));
+        Self { prev }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_GEN.with(|c| c.set(self.prev));
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestActiveGen {
+    prev: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn enter_active_gen(generation: u64) -> TestActiveGen {
+    let prev = ACTIVE_GEN.with(|c| c.replace(generation));
+    TestActiveGen { prev }
+}
+
+#[cfg(test)]
+impl Drop for TestActiveGen {
+    fn drop(&mut self) {
+        ACTIVE_GEN.with(|c| c.set(self.prev));
+    }
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum IoState {
@@ -155,6 +199,24 @@ impl IoState {
             Some(bits.trailing_zeros())
         }
     }
+
+    pub fn has_io_in_flight(&self) -> bool {
+        match self {
+            Self::Inline {
+                submitted, ready, ..
+            } => *submitted & !*ready != 0,
+            Self::Heap {
+                submitted, ready, ..
+            } => {
+                for (s, r) in submitted.iter().zip(ready.iter()) {
+                    if s & !r != 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -213,7 +275,7 @@ pub unsafe fn push_write(
     }
 }
 
-pub async fn await_cqe(ctx: &TaskContext, slot: u32) -> i32 {
+pub async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
     loop {
         let ready = ctx.with_task(|task| task.io.is_ready(slot));
         if ready {
@@ -223,15 +285,12 @@ pub async fn await_cqe(ctx: &TaskContext, slot: u32) -> i32 {
     }
 }
 
-pub fn yield_now(ctx: &TaskContext) -> Yield {
-    Yield {
-        ctx: ctx as *const TaskContext,
-        polled: false,
-    }
+pub fn yield_now(ctx: TaskContext) -> Yield {
+    Yield { ctx, polled: false }
 }
 
 pub struct Yield {
-    ctx: *const TaskContext,
+    ctx: TaskContext,
     polled: bool,
 }
 
@@ -243,54 +302,51 @@ impl Future for Yield {
             Poll::Ready(())
         } else {
             self.polled = true;
-            unsafe { (*self.ctx).wake() };
+            self.ctx.wake();
             Poll::Pending
         }
     }
 }
 
-pub struct Runtime<T, F, S>
-where
-    F: Future<Output = ()>,
-    S: Fn(&TaskContext, &RuntimeContext<T>, T) -> F,
-{
-    tasks: TaskSlab<F>,
+pub struct Runtime {
+    tasks_capacity: u32,
     wakeups: Vec<u32>,
     ring: io_uring::IoUring,
-    spawn_fn: S,
-    _phantom: PhantomData<T>,
 }
 
-impl<T, F, S> Runtime<T, F, S>
-where
-    F: Future<Output = ()>,
-    S: Fn(&TaskContext, &RuntimeContext<T>, T) -> F,
-{
-    pub fn new(task_capacity: u32, ring_entries: u32, spawn_fn: S) -> std::io::Result<Self> {
+impl Runtime {
+    pub fn new(task_capacity: u32, ring_entries: u32) -> std::io::Result<Self> {
         Ok(Self {
-            tasks: TaskSlab::new(task_capacity),
+            tasks_capacity: task_capacity,
             wakeups: Vec::new(),
             ring: io_uring::IoUring::new(ring_entries)?,
-            spawn_fn,
-            _phantom: PhantomData,
         })
     }
 
-    pub fn block_on(mut self, user_data: T) {
-        let tasks_ptr: *mut TaskSlab<F> = &mut self.tasks;
+    pub fn block_on<S, F, T>(mut self, spawn_fn: S, user_data: T)
+    where
+        S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
+        F: Future<Output = ()>,
+    {
+        let generation = ACTIVE_GEN.with(|c| c.get().wrapping_add(1));
+        let _guard = ActiveGuard::enter(generation);
+
+        let mut tasks = TaskSlab::new(self.tasks_capacity);
+        let tasks_ptr: *mut TaskSlab<F> = &mut tasks;
         let wakeups_ptr: *mut Vec<u32> = &mut self.wakeups;
 
-        let spawn_fn_ptr: unsafe fn(*const RuntimeContext<T>, T) -> Option<u32> = Self::spawn;
+        let spawn_fn_ptr: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
 
         let ctx = RuntimeContext {
+            generation,
             tasks: tasks_ptr as *mut (),
             spawn_fn: spawn_fn_ptr,
             wakeups: wakeups_ptr,
-            spawn_closure: &self.spawn_fn as *const S as *const (),
+            spawn_closure: &spawn_fn as *const S as *const (),
             _phantom: PhantomData,
         };
 
-        let index = match unsafe { TaskSlab::insert_vacant(tasks_ptr) } {
+        let index = match tasks.insert_vacant() {
             Some(i) => i,
             None => return,
         };
@@ -300,39 +356,37 @@ where
             io: IoState::new(),
             arena: Arena::new(4096),
         };
-        unsafe { TaskSlab::init_task_unchecked(tasks_ptr, index, task) };
+        unsafe { tasks.init_task_unchecked(index, task) };
 
         let task_ctx = TaskContext::new(
+            generation,
             index,
-            unsafe { TaskSlab::task_ptr_unchecked(tasks_ptr, index) },
+            tasks.task_ptr_unchecked(index),
             wakeups_ptr,
         );
-        unsafe { TaskSlab::init_context_unchecked(tasks_ptr, index, task_ctx) };
-        let task_ctx_ref =
-            unsafe { &*TaskSlab::context_ptr_unchecked(tasks_ptr as *const _, index) };
 
-        let future = (self.spawn_fn)(task_ctx_ref, &ctx, user_data);
-        unsafe { TaskSlab::init_future_unchecked(tasks_ptr, index, future) };
+        let future = (spawn_fn)(task_ctx, ctx, user_data);
+        unsafe { tasks.init_future_unchecked(index, future) };
         self.wakeups.push(index);
 
         let mut ready_tasks = Vec::new();
 
         loop {
             core::mem::swap(&mut self.wakeups, &mut ready_tasks);
+            assert!(self.wakeups.is_empty());
 
-            self.drain_cqes(&mut ready_tasks);
+            self.drain_cqes(&mut tasks, &mut ready_tasks);
 
             for &idx in &ready_tasks {
-                let task_ptr = unsafe { TaskSlab::task_ptr_unchecked(tasks_ptr, idx) };
-                unsafe { (*task_ptr).ready = false };
+                unsafe { tasks.task_mut_unchecked(idx).ready = false };
 
                 let mut cx = Context::from_waker(Waker::noop());
-                let future_ptr = unsafe { TaskSlab::future_ptr_unchecked(tasks_ptr, idx) };
+                let future_ptr = tasks.future_ptr_unchecked(idx);
                 let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
 
                 match future.poll(&mut cx) {
                     Poll::Ready(()) => {
-                        unsafe { TaskSlab::remove_unchecked(tasks_ptr, idx) };
+                        unsafe { tasks.remove_unchecked(idx) };
                     }
                     Poll::Pending => {}
                 }
@@ -340,15 +394,24 @@ where
 
             ready_tasks.clear();
 
+            if !tasks.has_io_in_flight() {
+                if self.wakeups.is_empty() {
+                    break;
+                }
+                continue;
+            }
+
             match self.ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
                 Err(_) => return,
             }
         }
+
+        drop(tasks);
     }
 
-    fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
+    fn drain_cqes<F>(&mut self, tasks: &mut TaskSlab<F>, ready: &mut Vec<u32>) {
         for cqe in self.ring.completion() {
             let raw = cqe.user_data();
             let task_index = (raw >> 32) as u32;
@@ -356,46 +419,45 @@ where
             let result = cqe.result();
 
             unsafe {
-                if TaskSlab::is_occupied(&self.tasks as *const TaskSlab<F>, task_index) {
-                    let task_ptr = TaskSlab::task_ptr_unchecked(
-                        &mut self.tasks as *mut TaskSlab<F>,
-                        task_index,
-                    );
-                    (*task_ptr).io.set_result(io_slot, result);
-                    (*task_ptr).io.set_ready(io_slot, true);
-                    if !(*task_ptr).ready {
-                        (*task_ptr).ready = true;
-                        (*ready).push(task_index);
+                if tasks.is_occupied(task_index) {
+                    let task = tasks.task_mut_unchecked(task_index);
+                    task.io.set_result(io_slot, result);
+                    task.io.set_ready(io_slot, true);
+                    if !task.ready {
+                        task.ready = true;
+                        ready.push(task_index);
                     }
                 }
             }
         }
     }
 
-    unsafe fn spawn(ctx: *const RuntimeContext<T>, user_data: T) -> Option<u32> {
-        let ctx = unsafe { &*ctx };
+    unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
+    where
+        S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
+        F: Future<Output = ()>,
+    {
         let tasks = ctx.tasks as *mut TaskSlab<F>;
         let closure = unsafe { &*(ctx.spawn_closure as *const S) };
 
-        let index = unsafe { TaskSlab::insert_vacant(tasks)? };
+        let index = unsafe { (*tasks).insert_vacant()? };
         let task = Task {
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
         };
-        unsafe { TaskSlab::init_task_unchecked(tasks, index, task) };
+        unsafe { (*tasks).init_task_unchecked(index, task) };
 
         let task_ctx = TaskContext::new(
+            ctx.generation,
             index,
-            unsafe { TaskSlab::task_ptr_unchecked(tasks, index) },
+            unsafe { (*tasks).task_ptr_unchecked(index) },
             ctx.wakeups,
         );
-        unsafe { TaskSlab::init_context_unchecked(tasks, index, task_ctx) };
-        let task_ctx_ref = unsafe { &*TaskSlab::context_ptr_unchecked(tasks as *const _, index) };
 
-        let future = closure(task_ctx_ref, ctx, user_data);
+        let future = closure(task_ctx, ctx, user_data);
         unsafe {
-            TaskSlab::init_future_unchecked(tasks, index, future);
+            (*tasks).init_future_unchecked(index, future);
             (*ctx.wakeups).push(index);
         }
         Some(index)
@@ -403,16 +465,29 @@ where
 }
 
 pub struct RuntimeContext<T> {
-    spawn_fn: unsafe fn(*const RuntimeContext<T>, T) -> Option<u32>,
+    generation: u64,
+    spawn_fn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
     tasks: *mut (),
     wakeups: *mut Vec<u32>,
     spawn_closure: *const (),
     _phantom: PhantomData<T>,
 }
 
+impl<T> Clone for RuntimeContext<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for RuntimeContext<T> {}
+
 impl<T> RuntimeContext<T> {
     pub fn spawn(&self, user_data: T) -> Option<u32> {
-        unsafe { (self.spawn_fn)(self, user_data) }
+        assert!(
+            active_gen_matches(self.generation),
+            "RuntimeContext used outside the runtime it belongs to"
+        );
+        unsafe { (self.spawn_fn)(*self, user_data) }
     }
 }
 
@@ -531,6 +606,103 @@ mod tests {
         assert_eq!(back.io_slot, 7);
     }
 
+    // ── IoState::has_io_in_flight ─────────────────────────────────────
+
+    #[test]
+    fn io_state_no_io_in_flight_when_empty() {
+        let s = IoState::new();
+        assert!(!s.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_state_has_io_in_flight_when_submitted_not_ready() {
+        let mut s = IoState::new();
+        s.set_submitted(3, true);
+        // submitted=3, ready=0 => submitted & !ready != 0
+        assert!(s.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_state_no_io_in_flight_when_submitted_and_ready() {
+        let mut s = IoState::new();
+        s.set_submitted(3, true);
+        s.set_ready(3, true);
+        // submitted=3, ready=3 => submitted & !ready == 0
+        assert!(!s.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_state_no_io_in_flight_after_clearing_submitted() {
+        let mut s = IoState::new();
+        s.set_submitted(3, true);
+        s.set_submitted(3, false);
+        assert!(!s.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_state_heap_has_io_in_flight() {
+        let mut s = make_heap_state(2);
+        s.set_submitted(64, true);
+        assert!(s.has_io_in_flight());
+        s.set_ready(64, true);
+        assert!(!s.has_io_in_flight());
+    }
+
+    // ── await_cqe ─────────────────────────────────────────────────────
+
+    #[test]
+    fn await_cqe_immediate_ready() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let slot = task.io.free_slot().unwrap();
+        task.io.set_submitted(slot, true);
+        task.io.set_result(slot, 42);
+        task.io.set_ready(slot, true);
+
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let fut = await_cqe(ctx, slot);
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let _g = enter_active_gen(1);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(42));
+    }
+
+    #[test]
+    fn await_cqe_delayed_ready() {
+        let mut task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+        };
+        let slot = task.io.free_slot().unwrap();
+        task.io.set_submitted(slot, true);
+        // NOT setting ready yet
+
+        let mut wakeups = Vec::new();
+        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let fut = await_cqe(ctx, slot);
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let _g = enter_active_gen(1);
+        // First poll: not ready → Yield's first poll → Pending
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
+
+        // Now set ready externally
+        task.io.set_ready(slot, true);
+        task.io.set_result(slot, 99);
+
+        // Second poll: Yield's second poll → Ready, loop sees ready → Ready(99)
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(99));
+    }
+
     // ── Yield ─────────────────────────────────────────────────────────
 
     #[test]
@@ -541,12 +713,12 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(0, &mut task, &mut wakeups);
-        let mut y = yield_now(&ctx);
+        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+        let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
+        let _g = enter_active_gen(1);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert!(y.polled);
     }
@@ -559,12 +731,12 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(0, &mut task, &mut wakeups);
-        let mut y = yield_now(&ctx);
+        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+        let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
+        let _g = enter_active_gen(1);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
     }
@@ -577,12 +749,12 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(7, &mut task, &mut wakeups);
-        let mut y = yield_now(&ctx);
+        let ctx = TaskContext::new(1, 7, &mut task, &mut wakeups);
+        let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
+        let _g = enter_active_gen(1);
         let _ = y.as_mut().poll(&mut cx);
         // wake should have pushed index 7 into wakeups
         assert_eq!(wakeups, vec![7]);

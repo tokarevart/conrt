@@ -289,9 +289,8 @@ mod tests {
     #[test]
     fn alloc_alignment() {
         let arena = Arena::new(4096);
-        // alloc with 1-byte alignment
-        let a1 = arena.alloc(Layout::from_size_align(1, 1).unwrap()).unwrap();
-        assert_eq!(a1.offset % 1, 0);
+        // alloc with 1-byte alignment (trivially true, skip modulo check)
+        let _a1 = arena.alloc(Layout::from_size_align(1, 1).unwrap()).unwrap();
         // alloc with 2-byte alignment
         let a2 = arena.alloc(Layout::from_size_align(1, 2).unwrap()).unwrap();
         assert_eq!(a2.offset % 2, 0);
