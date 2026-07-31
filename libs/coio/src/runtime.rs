@@ -311,6 +311,44 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
     }
 }
 
+pub(crate) struct RuntimeData {
+    pub(crate) tasks: TaskSlab,
+    pub(crate) wakeups: Vec<u32>,
+    pub(crate) ring: io_uring::IoUring,
+}
+
+impl RuntimeData {
+    pub(crate) fn context_for(&mut self, index: u32) -> TaskContext {
+        assert!(
+            self.tasks.is_occupied(index),
+            "cannot build a context for an uninitialized slot"
+        );
+        let task_id = unsafe { self.tasks.task_unchecked(index) }.id;
+        TaskContext::new(self as *mut RuntimeData, index, task_id)
+    }
+
+    pub(crate) fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
+        for cqe in self.ring.completion() {
+            let raw = cqe.user_data();
+            let task_index = (raw >> 32) as u32;
+            let io_slot = raw as u32;
+            let result = cqe.result();
+
+            unsafe {
+                if self.tasks.is_occupied(task_index) {
+                    let task = self.tasks.task_mut_unchecked(task_index);
+                    task.io.set_result(io_slot, result);
+                    task.io.set_ready(io_slot, true);
+                    if !task.ready {
+                        task.ready = true;
+                        ready.push(task_index);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct Runtime {
     tasks_capacity: u32,
     ring_entries: u32,
@@ -331,33 +369,35 @@ impl Runtime {
         })
     }
 
-    pub fn block_on<S, F, T>(mut self, spawn_fn: S, user_data: T)
+    pub fn block_on<S, F, T>(self, spawn_fn: S, user_data: T)
     where
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
         F: Future<Output = ()> + 'static,
     {
         let generation = enter_active_gen();
 
-        let mut ring = io_uring::IoUring::new(self.ring_entries).unwrap();
-        let mut wakeups = Vec::new();
-        let mut tasks = TaskSlab::new::<F>(self.tasks_capacity);
-        let tasks_ptr: *mut TaskSlab = &mut tasks;
-        let wakeups_ptr: *mut Vec<u32> = &mut wakeups;
-        let _drop_guard =
-            DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(tasks_ptr) });
+        let mut data = RuntimeData {
+            tasks: TaskSlab::new::<F>(self.tasks_capacity),
+            wakeups: Vec::new(),
+            ring: io_uring::IoUring::new(self.ring_entries).unwrap(),
+        };
+
+        let data_ptr: *mut RuntimeData = &mut data;
+        let _drop_guard = DropGuard::new(move || unsafe {
+            TaskSlab::drop_futures_raw::<F>(&mut (*data_ptr).tasks)
+        });
 
         let spawn_fn_ptr: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
 
         let ctx = RuntimeContext {
             generation,
-            tasks: tasks_ptr,
+            data: data_ptr,
             spawn_fn: spawn_fn_ptr,
-            wakeups: wakeups_ptr,
             spawn_closure: &spawn_fn as *const S as *const (),
             _phantom: PhantomData,
         };
 
-        let index = match tasks.insert_vacant() {
+        let index = match data.tasks.insert_vacant() {
             Some(i) => i,
             None => {
                 exit_active_gen();
@@ -371,32 +411,32 @@ impl Runtime {
             arena: Arena::new(4096),
             id: 0,
         };
-        unsafe { tasks.init_task_unchecked(index, task) };
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        let task_ctx = tasks.context_for(index, wakeups_ptr);
+        let task_ctx = data.context_for(index);
 
         let future = (spawn_fn)(task_ctx, ctx, user_data);
-        unsafe { tasks.init_future_unchecked(index, future) };
-        wakeups.push(index);
+        unsafe { data.tasks.init_future_unchecked(index, future) };
+        data.wakeups.push(index);
 
         let mut ready_tasks = Vec::new();
 
         loop {
-            core::mem::swap(&mut wakeups, &mut ready_tasks);
-            assert!(wakeups.is_empty());
+            core::mem::swap(&mut data.wakeups, &mut ready_tasks);
+            assert!(data.wakeups.is_empty());
 
-            self.drain_cqes(&mut ring, &mut tasks, &mut ready_tasks);
+            data.drain_cqes(&mut ready_tasks);
 
             for &idx in &ready_tasks {
-                unsafe { tasks.task_mut_unchecked(idx).ready = false };
+                unsafe { data.tasks.task_mut_unchecked(idx).ready = false };
 
                 let mut cx = Context::from_waker(Waker::noop());
-                let future_ptr = tasks.future_ptr_unchecked::<F>(idx);
+                let future_ptr = data.tasks.future_ptr_unchecked::<F>(idx);
                 let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
 
                 match future.poll(&mut cx) {
                     Poll::Ready(()) => {
-                        unsafe { tasks.remove_unchecked::<F>(idx) };
+                        unsafe { data.tasks.remove_unchecked::<F>(idx) };
                     }
                     Poll::Pending => {}
                 }
@@ -404,14 +444,14 @@ impl Runtime {
 
             ready_tasks.clear();
 
-            if !tasks.has_io_in_flight() {
-                if wakeups.is_empty() {
+            if !data.tasks.has_io_in_flight() {
+                if data.wakeups.is_empty() {
                     break;
                 }
                 continue;
             }
 
-            match ring.submit_and_wait(1) {
+            match data.ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
                 Err(_) => {
@@ -424,55 +464,29 @@ impl Runtime {
         exit_active_gen();
     }
 
-    fn drain_cqes(
-        &mut self,
-        ring: &mut io_uring::IoUring,
-        tasks: &mut TaskSlab,
-        ready: &mut Vec<u32>,
-    ) {
-        for cqe in ring.completion() {
-            let raw = cqe.user_data();
-            let task_index = (raw >> 32) as u32;
-            let io_slot = raw as u32;
-            let result = cqe.result();
-
-            unsafe {
-                if tasks.is_occupied(task_index) {
-                    let task = tasks.task_mut_unchecked(task_index);
-                    task.io.set_result(io_slot, result);
-                    task.io.set_ready(io_slot, true);
-                    if !task.ready {
-                        task.ready = true;
-                        ready.push(task_index);
-                    }
-                }
-            }
-        }
-    }
-
     unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
     where
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
         F: Future<Output = ()> + 'static,
     {
-        let tasks = ctx.tasks;
+        let data = ctx.data;
         let closure = unsafe { &*(ctx.spawn_closure as *const S) };
 
-        let index = unsafe { (*tasks).insert_vacant()? };
+        let index = unsafe { (*data).tasks.insert_vacant()? };
         let task = Task {
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
             id: 0,
         };
-        unsafe { (*tasks).init_task_unchecked(index, task) };
+        unsafe { (*data).tasks.init_task_unchecked(index, task) };
 
-        let task_ctx = unsafe { (*tasks).context_for(index, ctx.wakeups) };
+        let task_ctx = unsafe { (*data).context_for(index) };
 
         let future = closure(task_ctx, ctx, user_data);
         unsafe {
-            (*tasks).init_future_unchecked(index, future);
-            (*ctx.wakeups).push(index);
+            (*data).tasks.init_future_unchecked(index, future);
+            (*data).wakeups.push(index);
         }
         Some(index)
     }
@@ -482,8 +496,7 @@ impl Runtime {
 pub struct RuntimeContext<T> {
     generation: u64,
     spawn_fn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
-    tasks: *mut TaskSlab,
-    wakeups: *mut Vec<u32>,
+    data: *mut RuntimeData,
     spawn_closure: *const (),
     _phantom: PhantomData<T>,
 }
@@ -520,6 +533,14 @@ mod tests {
     use crate::arena::ArenaAlloc;
     use crate::task::Task;
     use crate::task::TaskSlab;
+
+    fn test_runtime_data(capacity: u32) -> RuntimeData {
+        RuntimeData {
+            tasks: TaskSlab::new::<Ready<()>>(capacity),
+            wakeups: Vec::new(),
+            ring: io_uring::IoUring::new(8).unwrap(),
+        }
+    }
 
     // ── IoState (inline) ──────────────────────────────────────────────
 
@@ -679,14 +700,12 @@ mod tests {
         task.io.set_result(slot, 42);
         task.io.set_ready(slot, true);
 
-        let mut slab = TaskSlab::new::<Ready<()>>(64);
-        let index = slab.insert_vacant().unwrap();
-        unsafe { slab.init_task_unchecked(index, task) };
-
-        let mut wakeups = Vec::new();
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
         enter_active_gen();
-        let ctx = slab.context_for(index, &mut wakeups);
+        let ctx = data.context_for(index);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
@@ -708,14 +727,12 @@ mod tests {
         task.io.set_submitted(slot, true);
         // NOT setting ready yet
 
-        let mut slab = TaskSlab::new::<Ready<()>>(64);
-        let index = slab.insert_vacant().unwrap();
-        unsafe { slab.init_task_unchecked(index, task) };
-
-        let mut wakeups = Vec::new();
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
         enter_active_gen();
-        let ctx = slab.context_for(index, &mut wakeups);
+        let ctx = data.context_for(index);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
@@ -725,7 +742,7 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
         // Now set ready externally
-        let task = unsafe { slab.task_mut_unchecked(index) };
+        let task = unsafe { data.tasks.task_mut_unchecked(index) };
         task.io.set_ready(slot, true);
         task.io.set_result(slot, 99);
 
@@ -744,14 +761,12 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::new::<Ready<()>>(64);
-        let index = slab.insert_vacant().unwrap();
-        unsafe { slab.init_task_unchecked(index, task) };
-
-        let mut wakeups = Vec::new();
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
         enter_active_gen();
-        let ctx = slab.context_for(index, &mut wakeups);
+        let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
@@ -769,14 +784,12 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::new::<Ready<()>>(64);
-        let index = slab.insert_vacant().unwrap();
-        unsafe { slab.init_task_unchecked(index, task) };
-
-        let mut wakeups = Vec::new();
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
         enter_active_gen();
-        let ctx = slab.context_for(index, &mut wakeups);
+        let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
@@ -794,21 +807,186 @@ mod tests {
             arena: Arena::new(4096),
             id: 0,
         };
-        let mut slab = TaskSlab::new::<Ready<()>>(64);
-        let index = slab.insert_vacant().unwrap();
-        unsafe { slab.init_task_unchecked(index, task) };
-
-        let mut wakeups = Vec::new();
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
         enter_active_gen();
-        let ctx = slab.context_for(index, &mut wakeups);
+        let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
 
         let _ = y.as_mut().poll(&mut cx);
         // wake should have pushed index into wakeups
-        assert_eq!(wakeups, vec![index]);
+        assert_eq!(data.wakeups, vec![index]);
         exit_active_gen();
+    }
+
+    // ── TaskContext ───────────────────────────────────────────────────
+
+    #[test]
+    fn task_context_with_task_reads_correct_task() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let ready = ctx.with_task(|t| t.ready);
+        exit_active_gen();
+        assert!(!ready);
+    }
+
+    #[test]
+    fn task_context_with_task_modifies() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        ctx.with_task(|t| t.ready = true);
+        exit_active_gen();
+        assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
+    }
+
+    #[test]
+    fn task_context_wake_pushes_index() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        ctx.wake();
+        ctx.wake();
+        exit_active_gen();
+        assert_eq!(data.wakeups, vec![index, index]);
+    }
+
+    #[test]
+    fn task_context_after_removal_panics() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+        unsafe {
+            data.tasks
+                .init_future_unchecked(index, core::future::ready(()))
+        };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_task(|_t| ());
+        }));
+        exit_active_gen();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_context_after_slot_reuse_panics_without_touching_new_task() {
+        let task_a = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task_a) };
+        unsafe {
+            data.tasks
+                .init_future_unchecked(index, core::future::ready(()))
+        };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+
+        let task_b = Task {
+            ready: true,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        unsafe { data.tasks.init_task_unchecked(index, task_b) };
+        unsafe {
+            data.tasks
+                .init_future_unchecked(index, core::future::ready(()))
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_task(|t| t.ready = false);
+        }));
+        exit_active_gen();
+
+        assert!(result.is_err());
+        assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
+    }
+
+    #[test]
+    fn task_context_of_live_task_usable_alongside_other_tasks() {
+        let task_a = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index_a = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index_a, task_a) };
+
+        let task_b = Task {
+            ready: true,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let index_b = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index_b, task_b) };
+
+        enter_active_gen();
+        let ctx_a = data.context_for(index_a);
+        let _ctx_b = data.context_for(index_b);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx_a.with_task(|t| t.ready = true);
+        }));
+        exit_active_gen();
+
+        assert!(result.is_ok());
+        assert!(unsafe { data.tasks.task_unchecked(index_a) }.ready);
     }
 }
