@@ -101,3 +101,40 @@ fn stale_task_context_panics_outside_block_on() {
     }));
     assert!(result.is_err());
 }
+
+#[test]
+fn stale_runtime_context_from_previous_run_panics() {
+    use std::cell::RefCell;
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+
+    thread_local! {
+        static STASH: RefCell<Option<RuntimeContext<u32>>> = const { RefCell::new(None) };
+    }
+
+    let rt = Runtime::new(4, 8).unwrap();
+    rt.block_on(
+        |_, rt: RuntimeContext<u32>, _data: u32| async move {
+            STASH.with(|s| *s.borrow_mut() = Some(rt));
+        },
+        0,
+    );
+
+    let rt2 = Runtime::new(4, 8).unwrap();
+    rt2.block_on(
+        |_, _rt: RuntimeContext<u32>, _data: u32| async move {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                STASH.with(|s| {
+                    if let Some(ctx) = s.borrow().as_ref() {
+                        ctx.spawn(1);
+                    }
+                });
+            }));
+            assert!(
+                result.is_err(),
+                "stale context from a previous run must panic"
+            );
+        },
+        0,
+    );
+}

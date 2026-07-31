@@ -14,46 +14,26 @@ use crate::task::TaskContext;
 use crate::task::TaskSlab;
 
 thread_local! {
+    static RUNNING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_GEN: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn active_gen_matches(generation: u64) -> bool {
-    ACTIVE_GEN.with(|c| c.get() == generation)
+    RUNNING.with(|c| c.get()) && ACTIVE_GEN.with(|c| c.get() == generation)
 }
 
-struct ActiveGuard {
-    prev: u64,
+pub(crate) fn enter_active_gen() -> u64 {
+    assert!(!RUNNING.with(|c| c.get()));
+    RUNNING.with(|c| c.set(true));
+    ACTIVE_GEN.with(|c| {
+        let g = c.get().wrapping_add(1);
+        c.set(g);
+        g
+    })
 }
 
-impl ActiveGuard {
-    fn enter(generation: u64) -> Self {
-        let prev = ACTIVE_GEN.with(|c| c.replace(generation));
-        Self { prev }
-    }
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        ACTIVE_GEN.with(|c| c.set(self.prev));
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct TestActiveGen {
-    prev: u64,
-}
-
-#[cfg(test)]
-pub(crate) fn enter_active_gen(generation: u64) -> TestActiveGen {
-    let prev = ACTIVE_GEN.with(|c| c.replace(generation));
-    TestActiveGen { prev }
-}
-
-#[cfg(test)]
-impl Drop for TestActiveGen {
-    fn drop(&mut self) {
-        ACTIVE_GEN.with(|c| c.set(self.prev));
-    }
+pub(crate) fn exit_active_gen() {
+    RUNNING.with(|c| c.set(false));
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -328,8 +308,7 @@ impl Runtime {
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
         F: Future<Output = ()>,
     {
-        let generation = ACTIVE_GEN.with(|c| c.get().wrapping_add(1));
-        let _guard = ActiveGuard::enter(generation);
+        let generation = enter_active_gen();
 
         let mut tasks = TaskSlab::new(self.tasks_capacity);
         let tasks_ptr: *mut TaskSlab<F> = &mut tasks;
@@ -348,7 +327,10 @@ impl Runtime {
 
         let index = match tasks.insert_vacant() {
             Some(i) => i,
-            None => return,
+            None => {
+                exit_active_gen();
+                return;
+            }
         };
 
         let task = Task {
@@ -404,11 +386,15 @@ impl Runtime {
             match self.ring.submit_and_wait(1) {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                Err(_) => return,
+                Err(_) => {
+                    exit_active_gen();
+                    return;
+                }
             }
         }
 
         drop(tasks);
+        exit_active_gen();
     }
 
     fn drain_cqes<F>(&mut self, tasks: &mut TaskSlab<F>, ready: &mut Vec<u32>) {
@@ -663,14 +649,16 @@ mod tests {
         task.io.set_ready(slot, true);
 
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let generation = enter_active_gen();
+        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let _g = enter_active_gen(1);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(42));
+        exit_active_gen();
     }
 
     #[test]
@@ -685,13 +673,14 @@ mod tests {
         // NOT setting ready yet
 
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let generation = enter_active_gen();
+        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
 
         let fut = await_cqe(ctx, slot);
         let mut fut = pin!(fut);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let _g = enter_active_gen(1);
         // First poll: not ready → Yield's first poll → Pending
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
@@ -701,6 +690,7 @@ mod tests {
 
         // Second poll: Yield's second poll → Ready, loop sees ready → Ready(99)
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(99));
+        exit_active_gen();
     }
 
     // ── Yield ─────────────────────────────────────────────────────────
@@ -713,14 +703,16 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let generation = enter_active_gen();
+        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let _g = enter_active_gen(1);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert!(y.polled);
+        exit_active_gen();
     }
 
     #[test]
@@ -731,14 +723,16 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 0, &mut task, &mut wakeups);
+
+        let generation = enter_active_gen();
+        let ctx = TaskContext::new(generation, 0, &mut task, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let _g = enter_active_gen(1);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
+        exit_active_gen();
     }
 
     #[test]
@@ -749,14 +743,16 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 7, &mut task, &mut wakeups);
+
+        let generation = enter_active_gen();
+        let ctx = TaskContext::new(generation, 7, &mut task, &mut wakeups);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
         let mut cx = Context::from_waker(Waker::noop());
 
-        let _g = enter_active_gen(1);
         let _ = y.as_mut().poll(&mut cx);
         // wake should have pushed index 7 into wakeups
         assert_eq!(wakeups, vec![7]);
+        exit_active_gen();
     }
 }

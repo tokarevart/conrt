@@ -363,12 +363,12 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 5, &mut task, &mut wakeups);
 
-        let ready = {
-            let _g = runtime::enter_active_gen(1);
-            ctx.with_task(|t| t.ready)
-        };
+        let generation = runtime::enter_active_gen();
+        let ctx = TaskContext::new(generation, 5, &mut task, &mut wakeups);
+
+        let ready = ctx.with_task(|t| t.ready);
+        runtime::exit_active_gen();
         assert!(!ready);
     }
 
@@ -380,10 +380,12 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 5, &mut task, &mut wakeups);
 
-        let _g = runtime::enter_active_gen(1);
+        let generation = runtime::enter_active_gen();
+        let ctx = TaskContext::new(generation, 5, &mut task, &mut wakeups);
+
         ctx.with_task(|t| t.ready = true);
+        runtime::exit_active_gen();
         assert!(task.ready);
     }
 
@@ -395,13 +397,13 @@ mod tests {
             arena: Arena::new(4096),
         };
         let mut wakeups = Vec::new();
-        let ctx = TaskContext::new(1, 3, &mut task, &mut wakeups);
 
-        let _g = runtime::enter_active_gen(1);
-        ctx.wake();
-        assert_eq!(wakeups, vec![3]);
+        let generation = runtime::enter_active_gen();
+        let ctx = TaskContext::new(generation, 3, &mut task, &mut wakeups);
 
         ctx.wake();
+        ctx.wake();
+        runtime::exit_active_gen();
         assert_eq!(wakeups, vec![3, 3]);
     }
 }
