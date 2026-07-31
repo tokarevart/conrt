@@ -14,7 +14,15 @@ use libc::pid_t;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::cleanup_overlay;
+use crate::clone3_container;
+use crate::create_overlay_tempdir;
+use crate::execvp;
 use crate::interprocess;
+use crate::pty;
+use crate::setup_container_root;
+use crate::setup_overlay_rootfs;
+use crate::setup_userns_maps;
 use crate::uring;
 
 const CACHE_CAPACITY: usize = 65536;
@@ -956,7 +964,7 @@ impl Daemon {
         }
 
         let (pty_master, pty_slave) = if use_pty {
-            match crate::pty::open_pty() {
+            match pty::open_pty() {
                 Ok((m, s)) => (Some(m), Some(s)),
                 Err(e) => {
                     err(&format!("pty allocation failed: {e}"));
@@ -976,7 +984,7 @@ impl Daemon {
             return;
         }
 
-        let clone_result = crate::clone3_container(prep.clone_flags);
+        let clone_result = clone3_container(prep.clone_flags);
         match clone_result {
             Err(e) => {
                 sys::close(pipe_fds.read);
@@ -1635,7 +1643,7 @@ impl Daemon {
         };
 
         let (master, mut slave) = if use_pty {
-            match crate::pty::open_pty() {
+            match pty::open_pty() {
                 Ok((m, s)) => (Some(m), Some(s)),
                 Err(e) => {
                     err(&format!("pty allocation failed: {e}"));
@@ -1655,7 +1663,7 @@ impl Daemon {
             return;
         }
 
-        let clone_result = crate::clone3_container(prep.clone_flags);
+        let clone_result = clone3_container(prep.clone_flags);
         match clone_result {
             Err(e) => {
                 if pipe_fds.read >= 0 {
@@ -1979,7 +1987,7 @@ impl Daemon {
                             if let Some(ref overlay) = info.overlay_dir
                                 && !info.save
                             {
-                                crate::cleanup_overlay(overlay);
+                                cleanup_overlay(overlay);
                             }
                         }
                     } else {
@@ -2001,7 +2009,7 @@ impl Daemon {
                             if let Some(ref overlay) = info.overlay_dir
                                 && !info.save
                             {
-                                crate::cleanup_overlay(overlay);
+                                cleanup_overlay(overlay);
                             }
                         }
                     }
@@ -2114,7 +2122,7 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
     };
 
     let overlay_dir = match rootfs {
-        Some(_) => match crate::create_overlay_tempdir() {
+        Some(_) => match create_overlay_tempdir() {
             Ok(dir) => Some(dir),
             Err(e) => return Err(format!("cannot create overlay tempdir: {e}")),
         },
@@ -2173,7 +2181,7 @@ fn parent_setup_maps_and_signal(
     signal: interprocess::OneshotSignal,
 ) -> Result<(), String> {
     if needs_userns_maps {
-        crate::setup_userns_maps(pid).map_err(|e| format!("uid_map write failed: {e}"))?;
+        setup_userns_maps(pid).map_err(|e| format!("uid_map write failed: {e}"))?;
     }
     signal.signal();
     Ok(())
@@ -2201,7 +2209,7 @@ fn child_init_environment(
             .as_ref()
             .expect("overlay_dir is always created when rootfs is provided");
 
-        let container_root = match crate::setup_overlay_rootfs(rootfs_path, overlay) {
+        let container_root = match setup_overlay_rootfs(rootfs_path, overlay) {
             Ok(merged) => merged,
             Err(e) => {
                 tracing::error!(%e, "overlay setup failed");
@@ -2209,14 +2217,14 @@ fn child_init_environment(
             }
         };
 
-        if let Err(e) = crate::setup_container_root(&container_root) {
+        if let Err(e) = setup_container_root(&container_root) {
             tracing::error!(%e, "container root setup failed");
             std::process::exit(1);
         }
     }
 
     let argv = sys::Argv::new(command);
-    let errno = crate::execvp(argv.as_slice());
+    let errno = execvp(argv.as_slice());
     tracing::error!(%errno, "execvp failed");
     std::process::exit(1)
 }

@@ -1,6 +1,7 @@
 use core::mem::MaybeUninit;
 
 use crate::arena::Arena;
+use crate::runtime;
 use crate::runtime::IoState;
 
 pub struct Task {
@@ -29,7 +30,7 @@ impl TaskContext {
 
     fn check_active(&self) {
         assert!(
-            crate::runtime::active_gen_matches(self.generation),
+            runtime::active_gen_matches(self.generation),
             "TaskContext used outside the runtime it belongs to"
         );
     }
@@ -173,6 +174,7 @@ mod tests {
 
     use super::*;
     use crate::arena::Arena;
+    use crate::runtime;
     use crate::runtime::IoState;
 
     // ── TaskSlab ──────────────────────────────────────────────────────
@@ -364,7 +366,7 @@ mod tests {
         let ctx = TaskContext::new(1, 5, &mut task, &mut wakeups);
 
         let ready = {
-            let _g = crate::runtime::enter_active_gen(1);
+            let _g = runtime::enter_active_gen(1);
             ctx.with_task(|t| t.ready)
         };
         assert!(!ready);
@@ -380,7 +382,7 @@ mod tests {
         let mut wakeups = Vec::new();
         let ctx = TaskContext::new(1, 5, &mut task, &mut wakeups);
 
-        let _g = crate::runtime::enter_active_gen(1);
+        let _g = runtime::enter_active_gen(1);
         ctx.with_task(|t| t.ready = true);
         assert!(task.ready);
     }
@@ -395,7 +397,7 @@ mod tests {
         let mut wakeups = Vec::new();
         let ctx = TaskContext::new(1, 3, &mut task, &mut wakeups);
 
-        let _g = crate::runtime::enter_active_gen(1);
+        let _g = runtime::enter_active_gen(1);
         ctx.wake();
         assert_eq!(wakeups, vec![3]);
 
