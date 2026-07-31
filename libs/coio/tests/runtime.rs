@@ -1,6 +1,17 @@
 use coio::runtime::Runtime;
 use coio::runtime::RuntimeContext;
 
+fn tmpfile() -> std::fs::File {
+    use std::os::fd::FromRawFd;
+
+    let path = b"/tmp\0";
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_TMPFILE | libc::O_RDWR, 0o600) };
+    if fd < 0 {
+        panic!("O_TMPFILE open failed: {}", std::io::Error::last_os_error());
+    }
+    unsafe { std::fs::File::from_raw_fd(fd) }
+}
+
 #[test]
 fn runtime_new_success() {
     let rt = Runtime::new(4, 8);
@@ -137,4 +148,55 @@ fn stale_runtime_context_from_previous_run_panics() {
         },
         0,
     );
+}
+
+#[test]
+fn block_on_read_from_file() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::read;
+
+    let mut file = tmpfile();
+    file.write_all(b"hello world").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = Runtime::new(4, 8).unwrap();
+    rt.block_on(
+        |ctx, _rt, fd| async move {
+            let data = read(ctx, fd, vec![0u8; 5]).await.unwrap();
+            assert_eq!(data, b"hello");
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_write_to_file() {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::write;
+
+    let mut file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = Runtime::new(4, 8).unwrap();
+    rt.block_on(
+        |ctx, _rt, fd| async move {
+            let n = write(ctx, fd, b"hello".to_vec()).await.unwrap();
+            assert_eq!(n, 5);
+        },
+        fd,
+    );
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello");
 }

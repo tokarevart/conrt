@@ -5,24 +5,20 @@ use core::ptr::NonNull;
 use std::alloc::Layout;
 use std::alloc::alloc;
 use std::alloc::dealloc;
+use std::io;
+
+use io_uring::squeue;
 
 use crate::arena::Arena;
 use crate::runtime;
 use crate::runtime::IoState;
+use crate::runtime::IoUserData;
 
 pub struct Task {
     pub ready: bool,
     pub io: IoState,
     pub arena: Arena,
     pub(crate) id: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TaskContext {
-    generation: u64,
-    task_index: u32,
-    task_id: u64,
-    runtime: *mut runtime::RuntimeData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +42,14 @@ impl fmt::Display for TaskContextError {
 }
 
 impl std::error::Error for TaskContextError {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TaskContext {
+    generation: u64,
+    task_index: u32,
+    task_id: u64,
+    runtime: *mut runtime::RuntimeData,
+}
 
 impl TaskContext {
     pub(crate) fn new(runtime: *mut runtime::RuntimeData, task_index: u32, task_id: u64) -> Self {
@@ -92,6 +96,16 @@ impl TaskContext {
             panic!("invalid TaskContext: {e}");
         }
         unsafe { (*self.runtime).wakeups.push(self.task_index) };
+    }
+
+    pub fn push_io(&self, entry: squeue::Entry, io_slot: u32) -> io::Result<()> {
+        let mut sq = unsafe { (*self.runtime).ring.submission() };
+        let user_data = IoUserData {
+            index: self.task_index,
+            io_slot,
+        };
+        let entry = entry.user_data(user_data.into());
+        unsafe { sq.push(&entry) }.map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
     }
 }
 

@@ -40,7 +40,13 @@ impl IoReadBuffer for Vec<u8> {
     fn prepare_read(self, task: &mut Task) -> Option<u32> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
-        let alloc = task.arena.alloc_write(self)?;
+        let alloc = match task.arena.alloc_write(self) {
+            Some(a) => a,
+            None => {
+                task.io.set_submitted(slot, false);
+                return None;
+            }
+        };
         task.io.set_alloc(slot, alloc);
         Some(slot)
     }
@@ -50,7 +56,13 @@ impl IoWriteBuffer for Vec<u8> {
     fn prepare_write(self, task: &mut Task) -> Option<u32> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
-        let alloc = task.arena.alloc_write(self)?;
+        let alloc = match task.arena.alloc_write(self) {
+            Some(a) => a,
+            None => {
+                task.io.set_submitted(slot, false);
+                return None;
+            }
+        };
         task.io.set_alloc(slot, alloc);
         Some(slot)
     }
@@ -60,7 +72,13 @@ impl IoWriteBuffer for &[u8] {
     fn prepare_write(self, task: &mut Task) -> Option<u32> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
-        let alloc = task.arena.alloc_write(self)?;
+        let alloc = match task.arena.alloc_write(self) {
+            Some(a) => a,
+            None => {
+                task.io.set_submitted(slot, false);
+                return None;
+            }
+        };
         task.io.set_alloc(slot, alloc);
         Some(slot)
     }
@@ -70,7 +88,13 @@ impl IoReadBuffer for &mut [u8] {
     fn prepare_read(self, task: &mut Task) -> Option<u32> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
-        let alloc = task.arena.alloc_write(self)?;
+        let alloc = match task.arena.alloc_write(self) {
+            Some(a) => a,
+            None => {
+                task.io.set_submitted(slot, false);
+                return None;
+            }
+        };
         task.io.set_alloc(slot, alloc);
         Some(slot)
     }
@@ -80,7 +104,13 @@ impl IoWriteBuffer for &mut [u8] {
     fn prepare_write(self, task: &mut Task) -> Option<u32> {
         let slot = task.io.free_slot()?;
         task.io.set_submitted(slot, true);
-        let alloc = task.arena.alloc_write(self)?;
+        let alloc = match task.arena.alloc_write(self) {
+            Some(a) => a,
+            None => {
+                task.io.set_submitted(slot, false);
+                return None;
+            }
+        };
         task.io.set_alloc(slot, alloc);
         Some(slot)
     }

@@ -5,10 +5,15 @@ use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
+use std::io;
 use std::os::fd::RawFd;
 
 use crate::arena::Arena;
 use crate::arena::ArenaAlloc;
+use crate::buffer::IoReadBuffer;
+use crate::buffer::IoWriteBuffer;
+use crate::buffer::complete_read;
+use crate::buffer::complete_write;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
@@ -173,6 +178,13 @@ impl IoState {
         }
     }
 
+    pub fn alloc(&self, slot: u32) -> ArenaAlloc {
+        match self {
+            Self::Inline { allocs, .. } => allocs[slot as usize].unwrap(),
+            Self::Heap { allocs, .. } => allocs[slot as usize].unwrap(),
+        }
+    }
+
     pub fn free_slot(&self) -> Option<u32> {
         let bits = match self {
             Self::Inline { submitted, .. } => !submitted,
@@ -223,42 +235,61 @@ impl From<u64> for IoUserData {
     }
 }
 
-/// # Safety
-/// `sq` must be a valid submission queue. `buf` must point to valid memory of
-/// at least `len` bytes.
-#[allow(dead_code)]
-pub unsafe fn push_read(
-    sq: &mut io_uring::squeue::SubmissionQueue,
-    fd: RawFd,
-    buf: *mut u8,
-    len: u32,
-    user_data: u64,
-) {
-    let entry = io_uring::opcode::Read::new(io_uring::types::Fd(fd), buf, len)
-        .build()
-        .user_data(user_data);
-    unsafe {
-        sq.push(&entry).ok();
+pub async fn read(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<Vec<u8>> {
+    let slot = ctx
+        .with_task(|task| buf.prepare_read(task))
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+
+    let (ptr, len) = ctx.with_task(|task| {
+        let alloc = task.io.alloc(slot);
+        let vec: Vec<u8> = task.arena.read(&alloc);
+        let (ptr, len, _) = vec.into_raw_parts();
+        (ptr, len as u32)
+    });
+
+    let entry = io_uring::opcode::Read::new(io_uring::types::Fd(fd), ptr, len).build();
+    if let Err(e) = ctx.push_io(entry, slot) {
+        let _ = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) };
+        return Err(e);
     }
+
+    let result = await_cqe(ctx, slot).await;
+    if result < 0 {
+        let _ = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) };
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+
+    let mut out = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) }.unwrap();
+    out.truncate(result.min(out.len() as i32) as usize);
+    Ok(out)
 }
 
-/// # Safety
-/// `sq` must be a valid submission queue. `buf` must point to valid memory of
-/// at least `len` bytes.
-#[allow(dead_code)]
-pub unsafe fn push_write(
-    sq: &mut io_uring::squeue::SubmissionQueue,
-    fd: RawFd,
-    buf: *const u8,
-    len: u32,
-    user_data: u64,
-) {
-    let entry = io_uring::opcode::Write::new(io_uring::types::Fd(fd), buf, len)
-        .build()
-        .user_data(user_data);
-    unsafe {
-        sq.push(&entry).ok();
+pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usize> {
+    let slot = ctx
+        .with_task(|task| buf.prepare_write(task))
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+
+    let (ptr, len) = ctx.with_task(|task| {
+        let alloc = task.io.alloc(slot);
+        let vec: Vec<u8> = task.arena.read(&alloc);
+        let (ptr, len, _) = vec.into_raw_parts();
+        (ptr as *const _, len as u32)
+    });
+
+    let entry = io_uring::opcode::Write::new(io_uring::types::Fd(fd), ptr, len).build();
+    if let Err(e) = ctx.push_io(entry, slot) {
+        let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+        return Err(e);
     }
+
+    let result = await_cqe(ctx, slot).await;
+    if result < 0 {
+        let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+
+    let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+    Ok(result as usize)
 }
 
 pub async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
@@ -428,6 +459,10 @@ impl Runtime {
             data.drain_cqes(&mut ready_tasks);
 
             for &idx in &ready_tasks {
+                if !data.tasks.is_occupied(idx) {
+                    continue;
+                }
+
                 unsafe { data.tasks.task_mut_unchecked(idx).ready = false };
 
                 let mut cx = Context::from_waker(Waker::noop());
