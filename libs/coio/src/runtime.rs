@@ -1,6 +1,5 @@
 use core::cell::Cell;
 use core::future::Future;
-use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
@@ -400,7 +399,7 @@ impl Runtime {
         })
     }
 
-    pub fn block_on<S, F, T>(self, spawn_fn: S, user_data: T)
+    pub fn block_on<S, F, T>(self, make_fut: S, user_data: T)
     where
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
         F: Future<Output = ()> + 'static,
@@ -418,14 +417,13 @@ impl Runtime {
             TaskSlab::drop_futures_raw::<F>(&mut (*data_ptr).tasks)
         });
 
-        let spawn_fn_ptr: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
+        let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
 
         let ctx = RuntimeContext {
             generation,
             data: data_ptr,
-            spawn_fn: spawn_fn_ptr,
-            spawn_closure: &spawn_fn as *const S as *const (),
-            _phantom: PhantomData,
+            spawn,
+            make_fut: &raw const make_fut as *const (),
         };
 
         let index = match data.tasks.insert_vacant() {
@@ -446,7 +444,7 @@ impl Runtime {
 
         let task_ctx = data.context_for(index);
 
-        let future = (spawn_fn)(task_ctx, ctx, user_data);
+        let future = (make_fut)(task_ctx, ctx, user_data);
         unsafe { data.tasks.init_future_unchecked(index, future) };
         data.wakeups.push(index);
 
@@ -504,25 +502,27 @@ impl Runtime {
         S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
         F: Future<Output = ()> + 'static,
     {
-        let data = ctx.data;
-        let closure = unsafe { &*(ctx.spawn_closure as *const S) };
+        let data = unsafe { &mut *ctx.data };
+        let closure = unsafe { &*(ctx.make_fut as *const S) };
 
-        let index = unsafe { (*data).tasks.insert_vacant()? };
+        let index = data.tasks.insert_vacant()?;
         let task = Task {
             ready: true,
             io: IoState::new(),
             arena: Arena::new(4096),
             id: 0,
         };
-        unsafe { (*data).tasks.init_task_unchecked(index, task) };
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        let task_ctx = unsafe { (*data).context_for(index) };
+        let task_ctx = data.context_for(index);
 
         let future = closure(task_ctx, ctx, user_data);
         unsafe {
-            (*data).tasks.init_future_unchecked(index, future);
-            (*data).wakeups.push(index);
+            data.tasks.init_future_unchecked(index, future);
         }
+
+        data.wakeups.push(index);
+
         Some(index)
     }
 }
@@ -530,10 +530,9 @@ impl Runtime {
 #[derive(Debug)]
 pub struct RuntimeContext<T> {
     generation: u64,
-    spawn_fn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
+    spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
     data: *mut RuntimeData,
-    spawn_closure: *const (),
-    _phantom: PhantomData<T>,
+    make_fut: *const (),
 }
 
 impl<T> Clone for RuntimeContext<T> {
@@ -550,7 +549,7 @@ impl<T> RuntimeContext<T> {
             active_gen_matches(self.generation),
             "RuntimeContext used outside the runtime it belongs to"
         );
-        unsafe { (self.spawn_fn)(*self, user_data) }
+        unsafe { (self.spawn)(*self, user_data) }
     }
 }
 
