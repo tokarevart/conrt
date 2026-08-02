@@ -125,7 +125,7 @@ impl ProvidedBufferPool {
         ring.submitter().unregister_buf_ring(BGID)
     }
 
-    pub(crate) fn bgid(&self) -> u16 {
+    pub fn bgid(&self) -> u16 {
         BGID
     }
 
@@ -204,14 +204,10 @@ mod tests {
         pool.register(&ring).unwrap();
 
         let read_entry = || {
-            io_uring::opcode::Read::new(
-                io_uring::types::Fd(fd),
-                std::ptr::null_mut(),
-                BUF_SIZE as u32,
-            )
-            .buf_group(BGID)
-            .build()
-            .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+            io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), BUF_SIZE)
+                .buf_group(BGID)
+                .build()
+                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
         };
 
         // More reads than the ring holds, to exercise the tail wrap.

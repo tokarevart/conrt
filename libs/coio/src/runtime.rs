@@ -7,14 +7,12 @@ use core::task::Waker;
 use std::io;
 use std::os::fd::RawFd;
 
-use crate::arena::Arena;
-use crate::arena::ArenaAlloc;
-use crate::buffer::IoWriteBuffer;
-use crate::buffer::complete_write;
 use crate::pbuf::ProvidedBufferPool;
+use crate::task::IoState;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
+use crate::wbuf::WriteBufferPool;
 
 thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
@@ -82,224 +80,6 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
     unsafe { f(&mut *ptr) }
 }
 
-#[allow(clippy::large_enum_variant)]
-pub enum IoState {
-    Inline {
-        submitted: u64,
-        ready: u64,
-        results: [i32; 64],
-        bids: [Option<u16>; 64],
-        allocs: [Option<ArenaAlloc>; 64],
-    },
-    Heap {
-        submitted: Vec<u64>,
-        ready: Vec<u64>,
-        results: Vec<i32>,
-        bids: Vec<Option<u16>>,
-        allocs: Vec<Option<ArenaAlloc>>,
-    },
-}
-
-impl Default for IoState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IoState {
-    pub fn new() -> Self {
-        const NONE_ALLOC: Option<ArenaAlloc> = None;
-        const NONE_BID: Option<u16> = None;
-        Self::Inline {
-            submitted: 0,
-            ready: 0,
-            results: [0; 64],
-            bids: [NONE_BID; 64],
-            allocs: [NONE_ALLOC; 64],
-        }
-    }
-
-    pub fn is_submitted(&self, bit: u32) -> bool {
-        match self {
-            Self::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
-            Self::Heap { submitted, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                submitted[word] & (1 << bit) != 0
-            }
-        }
-    }
-
-    pub fn set_submitted(&mut self, bit: u32, value: bool) {
-        match self {
-            Self::Inline { submitted, .. } => {
-                if value {
-                    *submitted |= 1 << bit;
-                } else {
-                    *submitted &= !(1 << bit);
-                }
-            }
-            Self::Heap { submitted, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                if value {
-                    submitted[word] |= 1 << bit;
-                } else {
-                    submitted[word] &= !(1 << bit);
-                }
-            }
-        }
-    }
-
-    pub fn is_ready(&self, bit: u32) -> bool {
-        match self {
-            Self::Inline { ready, .. } => *ready & (1 << bit) != 0,
-            Self::Heap { ready, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                word < ready.len() && ready[word] & (1 << bit) != 0
-            }
-        }
-    }
-
-    pub fn set_ready(&mut self, bit: u32, value: bool) {
-        match self {
-            Self::Inline { ready, .. } => {
-                if value {
-                    *ready |= 1 << bit;
-                } else {
-                    *ready &= !(1 << bit);
-                }
-            }
-            Self::Heap { ready, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                if value {
-                    ready[word] |= 1 << bit;
-                } else {
-                    ready[word] &= !(1 << bit);
-                }
-            }
-        }
-    }
-
-    pub fn result(&self, slot: u32) -> i32 {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize],
-            Self::Heap { results, .. } => results[slot as usize],
-        }
-    }
-
-    pub fn set_result(&mut self, slot: u32, value: i32) {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize] = value,
-            Self::Heap { results, .. } => results[slot as usize] = value,
-        }
-    }
-
-    pub fn set_bid(&mut self, slot: u32, value: Option<u16>) {
-        match self {
-            Self::Inline { bids, .. } => bids[slot as usize] = value,
-            Self::Heap { bids, .. } => {
-                let idx = slot as usize;
-                if idx >= bids.len() {
-                    bids.resize(idx + 1, None);
-                }
-                bids[idx] = value;
-            }
-        }
-    }
-
-    pub fn bid(&self, slot: u32) -> Option<u16> {
-        match self {
-            Self::Inline { bids, .. } => bids[slot as usize],
-            Self::Heap { bids, .. } => bids[slot as usize],
-        }
-    }
-
-    pub fn reset_slot(&mut self, slot: u32) {
-        self.set_submitted(slot, false);
-        self.set_ready(slot, false);
-        self.set_bid(slot, None);
-    }
-
-    pub fn set_alloc(&mut self, slot: u32, alloc: ArenaAlloc) {
-        match self {
-            Self::Inline { allocs, .. } => allocs[slot as usize] = Some(alloc),
-            Self::Heap { allocs, .. } => {
-                let idx = slot as usize;
-                if idx >= allocs.len() {
-                    allocs.resize(idx + 1, None);
-                }
-                allocs[idx] = Some(alloc);
-            }
-        }
-    }
-
-    pub fn take_alloc(&mut self, slot: u32) -> ArenaAlloc {
-        match self {
-            Self::Inline { allocs, .. } => allocs[slot as usize].take().unwrap(),
-            Self::Heap { allocs, .. } => allocs[slot as usize].take().unwrap(),
-        }
-    }
-
-    pub fn alloc(&self, slot: u32) -> ArenaAlloc {
-        match self {
-            Self::Inline { allocs, .. } => allocs[slot as usize].unwrap(),
-            Self::Heap { allocs, .. } => allocs[slot as usize].unwrap(),
-        }
-    }
-
-    pub fn free_slot(&self) -> Option<u32> {
-        let bits = match self {
-            Self::Inline { submitted, .. } => !submitted,
-            Self::Heap { submitted, .. } => !submitted[0],
-        };
-
-        if bits == 0 {
-            None
-        } else {
-            Some(bits.trailing_zeros())
-        }
-    }
-
-    pub fn has_io_in_flight(&self) -> bool {
-        match self {
-            Self::Inline {
-                submitted, ready, ..
-            } => *submitted & !*ready != 0,
-            Self::Heap {
-                submitted, ready, ..
-            } => {
-                for (s, r) in submitted.iter().zip(ready.iter()) {
-                    if s & !r != 0 {
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
-}
-
-#[repr(C)]
-pub struct IoUserData {
-    pub index: u32,
-    pub io_slot: u32,
-}
-
-impl From<IoUserData> for u64 {
-    fn from(ud: IoUserData) -> u64 {
-        unsafe { core::mem::transmute(ud) }
-    }
-}
-
-impl From<u64> for IoUserData {
-    fn from(raw: u64) -> Self {
-        unsafe { core::mem::transmute(raw) }
-    }
-}
-
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
 /// runtime's provided buffer pool. Returns at most `buf_size` bytes (the
 /// kernel caps the transfer at the selected buffer's size).
@@ -333,9 +113,7 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Vec
         return Err(io::Error::from_raw_os_error(-result));
     }
 
-    let bid = ctx
-        .with_task(|task| task.io.bid(slot))
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+    let bid = ctx.with_task(|task| task.io.bid(slot));
 
     let data = ctx.with_runtime(|r| r.buffer_pool.get_slice(bid, result as usize).to_vec());
     ctx.with_runtime(|r| r.buffer_pool.recycle_buffer(bid));
@@ -345,29 +123,50 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Vec
 
 pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usize> {
     let slot = ctx
-        .with_task(|task| buf.prepare_write(task))
+        .with_task(|task| task.io.free_slot())
         .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
 
-    let (ptr, len) = ctx.with_task(|task| {
-        let alloc = task.io.alloc(slot);
-        let vec: Vec<u8> = task.arena.read(&alloc);
-        let (ptr, len, _) = vec.into_raw_parts();
-        (ptr as *const _, len as u32)
+    let wslot = ctx
+        .with_runtime(|r| r.write_pool.acquire())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+
+    let len = buf.len();
+    if len > ctx.with_runtime(|r| r.write_pool.slot_size()) as usize {
+        ctx.with_runtime(|r| r.write_pool.release(wslot));
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+
+    let ptr = ctx.with_runtime(|r| {
+        let slot_mem = r.write_pool.get_slice_mut(wslot);
+        slot_mem[..len].copy_from_slice(&buf);
+        slot_mem.as_ptr()
     });
 
-    let entry = io_uring::opcode::Write::new(io_uring::types::Fd(fd), ptr, len).build();
+    ctx.with_task(|task| task.io.set_submitted(slot, true));
+    ctx.with_task(|task| task.io.set_bid(slot, wslot));
+
+    let entry = io_uring::opcode::WriteFixed::new(
+        io_uring::types::Fd(fd),
+        ptr,
+        len as u32,
+        0, // the whole slab is registered as fixed buffer index 0
+    )
+    .build();
     if let Err(e) = ctx.push_io(entry, slot) {
-        let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.write_pool.release(wslot));
         return Err(e);
     }
 
     let result = await_cqe(ctx, slot).await;
     if result < 0 {
-        let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.write_pool.release(wslot));
         return Err(io::Error::from_raw_os_error(-result));
     }
 
-    let _ = unsafe { ctx.with_task(|task| complete_write::<Vec<u8>>(task, slot)) };
+    ctx.with_runtime(|r| r.write_pool.release(wslot));
+    ctx.with_task(|task| task.io.reset_slot(slot));
     Ok(result as usize)
 }
 
@@ -425,15 +224,18 @@ pub(crate) struct Runtime {
     pub tasks: TaskSlab,
     pub wakeups: Vec<u32>,
     pub buffer_pool: ProvidedBufferPool,
+    pub write_pool: WriteBufferPool,
     pub ring: io_uring::IoUring,
     pub make_fut: *const (),
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // Unregister the provided buffer ring while the io_uring fd is still
-        // open; the pool is dropped afterwards along with the other fields.
+        // Unregister the provided buffer ring and the fixed write buffer slab
+        // while the io_uring fd is still open; the pools are dropped
+        // afterwards along with the other fields.
         let _ = self.buffer_pool.unregister(&self.ring);
+        let _ = self.write_pool.unregister(&self.ring);
     }
 }
 
@@ -459,8 +261,12 @@ impl Runtime {
                 if self.tasks.is_occupied(task_index) {
                     let task = self.tasks.task_mut_unchecked(task_index);
                     task.io.set_result(io_slot, result);
-                    task.io
-                        .set_bid(io_slot, io_uring::cqueue::buffer_select(cqe.flags()));
+                    // Only reads report a selected buffer via the CQE flags;
+                    // writes store their own slot id in `bids`, so leave it
+                    // untouched when no buffer flag is present.
+                    if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
+                        task.io.set_bid(io_slot, bid);
+                    }
                     task.io.set_ready(io_slot, true);
                     if !task.ready {
                         task.ready = true;
@@ -516,11 +322,13 @@ where
         });
 
     let pool = ProvidedBufferPool::new(params.buf_count, params.buf_size);
+    let write_pool = WriteBufferPool::new(params.buf_count, params.buf_size);
 
     let mut rt = Runtime {
         tasks: TaskSlab::new::<F>(params.tasks_capacity),
         wakeups: Vec::new(),
         buffer_pool: pool,
+        write_pool,
         ring,
         make_fut: &raw const make_fut as *const (),
     };
@@ -528,6 +336,9 @@ where
     rt.buffer_pool
         .register(&rt.ring)
         .expect("failed to register the provided buffer pool");
+    rt.write_pool
+        .register(&rt.ring)
+        .expect("failed to register the write buffer pool");
 
     let rt_ptr: *mut Runtime = &mut rt;
     let _drop_guard =
@@ -548,7 +359,6 @@ where
     let task = Task {
         ready: true,
         io: IoState::new(),
-        arena: Arena::new(4096),
         id: 0,
     };
     unsafe { rt.tasks.init_task_unchecked(index, task) };
@@ -617,7 +427,6 @@ where
         let task = Task {
             ready: true,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -662,15 +471,13 @@ impl<T> RuntimeContext<T> {
 #[cfg(test)]
 mod tests {
     use core::future::Ready;
-    use core::num::NonZeroU32;
     use core::pin::pin;
     use core::task::Context;
     use core::task::Poll;
     use core::task::Waker;
 
     use super::*;
-    use crate::arena::Arena;
-    use crate::arena::ArenaAlloc;
+    use crate::task::IoUserData;
     use crate::task::Task;
     use crate::task::TaskSlab;
 
@@ -678,10 +485,13 @@ mod tests {
         let ring = io_uring::IoUring::new(8).unwrap();
         let pool = ProvidedBufferPool::new(4, 16);
         pool.register(&ring).unwrap();
+        let write_pool = WriteBufferPool::new(4, 16);
+        write_pool.register(&ring).unwrap();
         Runtime {
             tasks: TaskSlab::new::<Ready<()>>(capacity),
             wakeups: Vec::new(),
             buffer_pool: pool,
+            write_pool,
             ring,
             make_fut: core::ptr::null(),
         }
@@ -717,8 +527,7 @@ mod tests {
             submitted: vec![0; capacity],
             ready: vec![0; capacity],
             results: vec![0; capacity * 64],
-            bids: vec![None; capacity * 64],
-            allocs: vec![None; capacity * 64],
+            bids: vec![0; capacity * 64],
         }
     }
 
@@ -754,16 +563,10 @@ mod tests {
     fn io_state_heap_ready_and_result() {
         let mut s = make_heap_state(1);
         s.set_submitted(10, true);
-        s.set_alloc(10, ArenaAlloc {
-            size: NonZeroU32::new(4).unwrap(),
-            offset: 0,
-        });
         s.set_result(10, -1);
         s.set_ready(10, true);
         assert!(s.is_ready(10));
         assert_eq!(s.result(10), -1);
-        let alloc = s.take_alloc(10);
-        assert_eq!(alloc.size.get(), 4);
     }
 
     // ── IoState bid storage ───────────────────────────────────────────
@@ -771,19 +574,21 @@ mod tests {
     #[test]
     fn io_state_bid_inline_roundtrip() {
         let mut s = IoState::new();
-        s.set_bid(0, Some(3));
-        assert_eq!(s.bid(0), Some(3));
-        s.set_bid(0, None);
-        assert_eq!(s.bid(0), None);
+        assert_eq!(s.bid(0), 0);
+        s.set_bid(0, 3);
+        assert_eq!(s.bid(0), 3);
+        s.set_bid(0, 5);
+        assert_eq!(s.bid(0), 5);
     }
 
     #[test]
     fn io_state_bid_heap_roundtrip() {
         let mut s = make_heap_state(2);
-        s.set_bid(64, Some(7));
-        assert_eq!(s.bid(64), Some(7));
-        s.set_bid(64, None);
-        assert_eq!(s.bid(64), None);
+        assert_eq!(s.bid(64), 0);
+        s.set_bid(64, 7);
+        assert_eq!(s.bid(64), 7);
+        s.set_bid(64, 9);
+        assert_eq!(s.bid(64), 9);
     }
 
     #[test]
@@ -791,11 +596,13 @@ mod tests {
         let mut s = IoState::new();
         s.set_submitted(5, true);
         s.set_ready(5, true);
-        s.set_bid(5, Some(2));
+        s.set_bid(5, 2);
         s.reset_slot(5);
         assert!(!s.is_submitted(5));
         assert!(!s.is_ready(5));
-        assert_eq!(s.bid(5), None);
+        // bids is not cleared: like `results`, it is only read once `ready`
+        // is set and is overwritten before the next use of the slot.
+        assert_eq!(s.bid(5), 2);
     }
 
     // ── IoUserData ────────────────────────────────────────────────────
@@ -870,7 +677,6 @@ mod tests {
         let mut task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let slot = task.io.free_slot().unwrap();
@@ -897,7 +703,6 @@ mod tests {
         let mut task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let slot = task.io.free_slot().unwrap();
@@ -934,7 +739,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -956,7 +760,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -978,7 +781,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1003,7 +805,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1022,7 +823,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1041,7 +841,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1060,7 +859,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1087,7 +885,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1107,7 +904,6 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1134,7 +930,6 @@ mod tests {
         let task_a = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1153,7 +948,6 @@ mod tests {
         let task_b = Task {
             ready: true,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         unsafe { data.tasks.init_task_unchecked(index, task_b) };
@@ -1175,7 +969,6 @@ mod tests {
         let task_a = Task {
             ready: false,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1185,7 +978,6 @@ mod tests {
         let task_b = Task {
             ready: true,
             io: IoState::new(),
-            arena: Arena::new(4096),
             id: 0,
         };
         let index_b = data.tasks.insert_vacant().unwrap();

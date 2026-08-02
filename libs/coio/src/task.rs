@@ -10,20 +10,202 @@ use std::io;
 
 use io_uring::squeue;
 
-use crate::arena::Arena;
 use crate::runtime;
-use crate::runtime::IoState;
-use crate::runtime::IoUserData;
 use crate::runtime::Runtime;
 
 thread_local! {
     static NEXT_TASK_ID: Cell<u64> = const { Cell::new(1) };
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum IoState {
+    Inline {
+        submitted: u64,
+        ready: u64,
+        results: [i32; 64],
+        bids: [u16; 64],
+    },
+    Heap {
+        submitted: Vec<u64>,
+        ready: Vec<u64>,
+        results: Vec<i32>,
+        bids: Vec<u16>,
+    },
+}
+
+impl Default for IoState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IoState {
+    pub fn new() -> Self {
+        Self::Inline {
+            submitted: 0,
+            ready: 0,
+            results: [0; 64],
+            bids: [0; 64],
+        }
+    }
+
+    pub fn is_submitted(&self, bit: u32) -> bool {
+        match self {
+            Self::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
+            Self::Heap { submitted, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                submitted[word] & (1 << bit) != 0
+            }
+        }
+    }
+
+    pub fn set_submitted(&mut self, bit: u32, value: bool) {
+        match self {
+            Self::Inline { submitted, .. } => {
+                if value {
+                    *submitted |= 1 << bit;
+                } else {
+                    *submitted &= !(1 << bit);
+                }
+            }
+            Self::Heap { submitted, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                if value {
+                    submitted[word] |= 1 << bit;
+                } else {
+                    submitted[word] &= !(1 << bit);
+                }
+            }
+        }
+    }
+
+    pub fn is_ready(&self, bit: u32) -> bool {
+        match self {
+            Self::Inline { ready, .. } => *ready & (1 << bit) != 0,
+            Self::Heap { ready, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                word < ready.len() && ready[word] & (1 << bit) != 0
+            }
+        }
+    }
+
+    pub fn set_ready(&mut self, bit: u32, value: bool) {
+        match self {
+            Self::Inline { ready, .. } => {
+                if value {
+                    *ready |= 1 << bit;
+                } else {
+                    *ready &= !(1 << bit);
+                }
+            }
+            Self::Heap { ready, .. } => {
+                let word = bit as usize / 64;
+                let bit = bit as usize % 64;
+                if value {
+                    ready[word] |= 1 << bit;
+                } else {
+                    ready[word] &= !(1 << bit);
+                }
+            }
+        }
+    }
+
+    pub fn result(&self, slot: u32) -> i32 {
+        match self {
+            Self::Inline { results, .. } => results[slot as usize],
+            Self::Heap { results, .. } => results[slot as usize],
+        }
+    }
+
+    pub fn set_result(&mut self, slot: u32, value: i32) {
+        match self {
+            Self::Inline { results, .. } => results[slot as usize] = value,
+            Self::Heap { results, .. } => results[slot as usize] = value,
+        }
+    }
+
+    pub fn set_bid(&mut self, slot: u32, value: u16) {
+        match self {
+            Self::Inline { bids, .. } => bids[slot as usize] = value,
+            Self::Heap { bids, .. } => {
+                let idx = slot as usize;
+                if idx >= bids.len() {
+                    bids.resize(idx + 1, 0);
+                }
+                bids[idx] = value;
+            }
+        }
+    }
+
+    pub fn bid(&self, slot: u32) -> u16 {
+        match self {
+            Self::Inline { bids, .. } => bids[slot as usize],
+            Self::Heap { bids, .. } => bids[slot as usize],
+        }
+    }
+
+    pub fn reset_slot(&mut self, slot: u32) {
+        self.set_submitted(slot, false);
+        self.set_ready(slot, false);
+    }
+
+    pub fn free_slot(&self) -> Option<u32> {
+        let bits = match self {
+            Self::Inline { submitted, .. } => !submitted,
+            Self::Heap { submitted, .. } => !submitted[0],
+        };
+
+        if bits == 0 {
+            None
+        } else {
+            Some(bits.trailing_zeros())
+        }
+    }
+
+    pub fn has_io_in_flight(&self) -> bool {
+        match self {
+            Self::Inline {
+                submitted, ready, ..
+            } => *submitted & !*ready != 0,
+            Self::Heap {
+                submitted, ready, ..
+            } => {
+                for (s, r) in submitted.iter().zip(ready.iter()) {
+                    if s & !r != 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+#[repr(C)]
+pub struct IoUserData {
+    pub index: u32,
+    pub io_slot: u32,
+}
+
+impl From<IoUserData> for u64 {
+    fn from(ud: IoUserData) -> u64 {
+        unsafe { core::mem::transmute(ud) }
+    }
+}
+
+impl From<u64> for IoUserData {
+    fn from(raw: u64) -> Self {
+        unsafe { core::mem::transmute(raw) }
+    }
+}
+
 pub struct Task {
     pub ready: bool,
     pub io: IoState,
-    pub arena: Arena,
     pub(crate) id: u64,
 }
 
@@ -286,8 +468,6 @@ mod tests {
     use core::future::Ready;
 
     use super::*;
-    use crate::arena::Arena;
-    use crate::runtime::IoState;
 
     // ── TaskSlab ──────────────────────────────────────────────────────
 
@@ -325,7 +505,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoState::new(),
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -349,7 +528,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoState::new(),
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -366,7 +544,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoState::new(),
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -408,7 +585,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoState::new(),
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -426,7 +602,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io,
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -445,7 +620,6 @@ mod tests {
             let task = Task {
                 ready: true,
                 io,
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -461,7 +635,6 @@ mod tests {
             let task0 = Task {
                 ready: true,
                 io: IoState::new(),
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx0, task0);
@@ -472,7 +645,6 @@ mod tests {
             let task1 = Task {
                 ready: true,
                 io: io1,
-                arena: Arena::new(4096),
                 id: 0,
             };
             slab.init_task_unchecked(idx1, task1);
