@@ -1,4 +1,5 @@
 use core::any::TypeId;
+use core::cell::Cell;
 use core::fmt;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
@@ -14,6 +15,10 @@ use crate::runtime;
 use crate::runtime::IoState;
 use crate::runtime::IoUserData;
 use crate::runtime::Runtime;
+
+thread_local! {
+    static NEXT_TASK_ID: Cell<u64> = const { Cell::new(1) };
+}
 
 pub struct Task {
     pub ready: bool,
@@ -46,74 +51,73 @@ impl std::error::Error for TaskContextError {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct TaskContext {
-    generation: u64,
     task_index: u32,
     task_id: u64,
-    runtime: *mut Runtime,
 }
 
 impl TaskContext {
-    pub(crate) fn new(runtime: *mut Runtime, task_index: u32, task_id: u64) -> Self {
+    pub(crate) fn new(task_index: u32, task_id: u64) -> Self {
         Self {
-            generation: runtime::active_gen().expect("no active generation"),
             task_index,
             task_id,
-            runtime,
         }
     }
 
     pub fn validate(&self) -> Result<(), TaskContextError> {
-        if !runtime::active_gen_matches(self.generation) {
+        if !runtime::is_running() {
             return Err(TaskContextError::InactiveRuntime);
         }
 
-        let word = self.task_index as usize / 64;
-        let bit = self.task_index as usize % 64;
-        let tasks = unsafe { &(*self.runtime).tasks };
-        if word >= tasks.free.len() {
-            return Err(TaskContextError::SlotOutOfBounds);
-        }
-        if tasks.free[word] & (1 << bit) != 0 {
-            return Err(TaskContextError::TaskRemoved);
-        }
-
-        unsafe {
-            if tasks.task_unchecked(self.task_index).id != self.task_id {
-                return Err(TaskContextError::TaskReused);
+        runtime::with_runtime(|rt| {
+            let word = self.task_index as usize / 64;
+            let bit = self.task_index as usize % 64;
+            if word >= rt.tasks.free.len() {
+                return Err(TaskContextError::SlotOutOfBounds);
             }
-        }
-        Ok(())
+            if rt.tasks.free[word] & (1 << bit) != 0 {
+                return Err(TaskContextError::TaskRemoved);
+            }
+
+            unsafe {
+                if rt.tasks.task_unchecked(self.task_index).id != self.task_id {
+                    return Err(TaskContextError::TaskReused);
+                }
+            }
+            Ok(())
+        })
     }
 
     pub fn with_task<R>(&self, f: impl FnOnce(&mut Task) -> R) -> R {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");
         }
-        unsafe { f((*self.runtime).tasks.task_mut_unchecked(self.task_index)) }
+        runtime::with_runtime(|rt| unsafe { f(rt.tasks.task_mut_unchecked(self.task_index)) })
     }
 
     pub(crate) fn with_runtime<R>(&self, f: impl FnOnce(&mut Runtime) -> R) -> R {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");
         }
-        unsafe { f(&mut *self.runtime) }
+        runtime::with_runtime(f)
     }
 
     pub fn wake(&self) {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");
         }
-        unsafe { (*self.runtime).wakeups.push(self.task_index) };
+        runtime::with_runtime(|rt| rt.wakeups.push(self.task_index));
     }
 
     pub fn push_io(&self, entry: squeue::Entry, io_slot: u32) -> io::Result<()> {
-        let mut sq = unsafe { (*self.runtime).ring.submission() };
-        let user_data = IoUserData {
-            index: self.task_index,
-            io_slot,
-        };
-        let entry = entry.user_data(user_data.into());
-        unsafe { sq.push(&entry) }.map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
+        runtime::with_runtime(|rt| {
+            let mut sq = rt.ring.submission();
+            let user_data = IoUserData {
+                index: self.task_index,
+                io_slot,
+            };
+            let entry = entry.user_data(user_data.into());
+            unsafe { sq.push(&entry) }.map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))
+        })
     }
 }
 
@@ -122,7 +126,6 @@ pub struct TaskSlab {
     futures: NonNull<u8>,
     future_type_id: TypeId,
     free: Box<[u64]>,
-    next_id: u64,
 }
 
 impl TaskSlab {
@@ -142,7 +145,6 @@ impl TaskSlab {
             futures,
             future_type_id: TypeId::of::<F>(),
             free,
-            next_id: 1,
         }
     }
 
@@ -223,8 +225,11 @@ impl TaskSlab {
     /// # Safety
     /// `index` must be an in-bounds slot that has not already been initialized.
     pub unsafe fn init_task_unchecked(&mut self, index: u32, mut task: Task) {
-        task.id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        task.id = NEXT_TASK_ID.with(|c| {
+            let id = c.get();
+            c.set(id.wrapping_add(1));
+            id
+        });
         self.tasks[index as usize] = MaybeUninit::new(task);
     }
 

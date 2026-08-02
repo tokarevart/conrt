@@ -19,6 +19,11 @@ use crate::task::TaskSlab;
 thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_GEN: Cell<u64> = const { Cell::new(0) };
+    static CURRENT_RUNTIME: Cell<*mut Runtime> = const { Cell::new(core::ptr::null_mut()) };
+}
+
+pub(crate) fn is_running() -> bool {
+    RUNNING.with(|c| c.get())
 }
 
 pub(crate) fn active_gen_matches(generation: u64) -> bool {
@@ -31,18 +36,50 @@ pub(crate) fn active_gen() -> Option<u64> {
         .then_some(ACTIVE_GEN.with(|c| c.get()))
 }
 
-pub(crate) fn enter_active_gen() -> u64 {
+pub(crate) fn enter_active_gen() -> ActiveGenGuard {
     assert!(!RUNNING.with(|c| c.get()));
     RUNNING.with(|c| c.set(true));
     ACTIVE_GEN.with(|c| {
         let g = c.get().wrapping_add(1);
         c.set(g);
-        g
+        ActiveGenGuard(g)
     })
 }
 
 pub(crate) fn exit_active_gen() {
     RUNNING.with(|c| c.set(false));
+}
+
+pub(crate) struct ActiveGenGuard(u64);
+
+impl ActiveGenGuard {
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for ActiveGenGuard {
+    fn drop(&mut self) {
+        exit_active_gen();
+    }
+}
+
+pub(crate) fn set_current_runtime(rt: *mut Runtime) {
+    CURRENT_RUNTIME.with(|c| c.set(rt));
+}
+
+pub(crate) fn clear_current_runtime() {
+    CURRENT_RUNTIME.with(|c| c.set(core::ptr::null_mut()));
+}
+
+pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
+    assert!(
+        is_running(),
+        "with_runtime called outside an active runtime"
+    );
+    let ptr = CURRENT_RUNTIME.with(|c| c.get());
+    assert!(!ptr.is_null(), "no active runtime");
+    unsafe { f(&mut *ptr) }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -385,10 +422,11 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
 }
 
 pub(crate) struct Runtime {
-    pub(crate) tasks: TaskSlab,
-    pub(crate) wakeups: Vec<u32>,
-    pub(crate) buffer_pool: ProvidedBufferPool,
-    pub(crate) ring: io_uring::IoUring,
+    pub tasks: TaskSlab,
+    pub wakeups: Vec<u32>,
+    pub buffer_pool: ProvidedBufferPool,
+    pub ring: io_uring::IoUring,
+    pub make_fut: *const (),
 }
 
 impl Drop for Runtime {
@@ -400,16 +438,17 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
-    pub(crate) fn context_for(&mut self, index: u32) -> TaskContext {
+    fn context_for(&mut self, index: u32) -> TaskContext {
         assert!(
             self.tasks.is_occupied(index),
             "cannot build a context for an uninitialized slot"
         );
         let task_id = unsafe { self.tasks.task_unchecked(index) }.id;
-        TaskContext::new(self as *mut Runtime, index, task_id)
+        set_current_runtime(self as *mut Runtime);
+        TaskContext::new(index, task_id)
     }
 
-    pub(crate) fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
+    fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
         for cqe in self.ring.completion() {
             let raw = cqe.user_data();
             let task_index = (raw >> 32) as u32;
@@ -465,7 +504,8 @@ where
     S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
     F: Future<Output = ()> + 'static,
 {
-    let generation = enter_active_gen();
+    let _gen_guard = enter_active_gen();
+    let generation = _gen_guard.get();
 
     let ring = io_uring::IoUring::builder()
         .setup_single_issuer()
@@ -476,36 +516,34 @@ where
         });
 
     let pool = ProvidedBufferPool::new(params.buf_count, params.buf_size);
-    pool.register(&ring)
-        .expect("failed to register the provided buffer pool");
 
     let mut rt = Runtime {
         tasks: TaskSlab::new::<F>(params.tasks_capacity),
         wakeups: Vec::new(),
         buffer_pool: pool,
         ring,
+        make_fut: &raw const make_fut as *const (),
     };
+
+    rt.buffer_pool
+        .register(&rt.ring)
+        .expect("failed to register the provided buffer pool");
 
     let rt_ptr: *mut Runtime = &mut rt;
     let _drop_guard =
         DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
 
+    set_current_runtime(rt_ptr);
+    let _rt_guard = DropGuard::new(clear_current_runtime);
+
     let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = spawn::<S, F, T>;
 
-    let ctx = RuntimeContext {
-        generation,
-        runtime: rt_ptr,
-        spawn,
-        make_fut: &raw const make_fut as *const (),
-    };
+    let ctx = RuntimeContext { generation, spawn };
 
-    let index = match rt.tasks.insert_vacant() {
-        Some(i) => i,
-        None => {
-            exit_active_gen();
-            return;
-        }
-    };
+    let index = rt
+        .tasks
+        .insert_vacant()
+        .expect("failed to insert vacant task");
 
     let task = Task {
         ready: true,
@@ -561,13 +599,10 @@ where
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
             Err(_) => {
-                exit_active_gen();
                 return;
             }
         }
     }
-
-    exit_active_gen();
 }
 
 unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
@@ -575,36 +610,35 @@ where
     S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
     F: Future<Output = ()> + 'static,
 {
-    let data = unsafe { &mut *ctx.runtime };
-    let closure = unsafe { &*(ctx.make_fut as *const S) };
+    with_runtime(|data| {
+        let closure = unsafe { &*(data.make_fut as *const S) };
 
-    let index = data.tasks.insert_vacant()?;
-    let task = Task {
-        ready: true,
-        io: IoState::new(),
-        arena: Arena::new(4096),
-        id: 0,
-    };
-    unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data.tasks.insert_vacant()?;
+        let task = Task {
+            ready: true,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        unsafe { data.tasks.init_task_unchecked(index, task) };
 
-    let task_ctx = data.context_for(index);
+        let task_ctx = data.context_for(index);
 
-    let future = closure(task_ctx, ctx, user_data);
-    unsafe {
-        data.tasks.init_future_unchecked(index, future);
-    }
+        let future = closure(task_ctx, ctx, user_data);
+        unsafe {
+            data.tasks.init_future_unchecked(index, future);
+        }
 
-    data.wakeups.push(index);
+        data.wakeups.push(index);
 
-    Some(index)
+        Some(index)
+    })
 }
 
 #[derive(Debug)]
 pub struct RuntimeContext<T> {
     generation: u64,
     spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
-    runtime: *mut Runtime,
-    make_fut: *const (),
 }
 
 impl<T> Clone for RuntimeContext<T> {
@@ -649,6 +683,7 @@ mod tests {
             wakeups: Vec::new(),
             buffer_pool: pool,
             ring,
+            make_fut: core::ptr::null(),
         }
     }
 
@@ -847,7 +882,7 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let fut = await_cqe(ctx, slot);
@@ -855,7 +890,6 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
 
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(42));
-        exit_active_gen();
     }
 
     #[test]
@@ -874,7 +908,7 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let fut = await_cqe(ctx, slot);
@@ -891,7 +925,6 @@ mod tests {
 
         // Second poll: Yield's second poll → Ready, loop sees ready → Ready(99)
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(99));
-        exit_active_gen();
     }
 
     // ── Yield ─────────────────────────────────────────────────────────
@@ -908,7 +941,7 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
@@ -916,7 +949,6 @@ mod tests {
 
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert!(y.polled);
-        exit_active_gen();
     }
 
     #[test]
@@ -931,7 +963,7 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
@@ -939,7 +971,6 @@ mod tests {
 
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
         assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
-        exit_active_gen();
     }
 
     #[test]
@@ -954,7 +985,7 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
         let mut y = yield_now(ctx);
         let mut y = pin!(&mut y);
@@ -963,7 +994,6 @@ mod tests {
         let _ = y.as_mut().poll(&mut cx);
         // wake should have pushed index into wakeups
         assert_eq!(data.wakeups, vec![index]);
-        exit_active_gen();
     }
 
     // ── TaskContext ───────────────────────────────────────────────────
@@ -980,11 +1010,10 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let ready = ctx.with_task(|t| t.ready);
-        exit_active_gen();
         assert!(!ready);
     }
 
@@ -1000,11 +1029,10 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         ctx.with_task(|t| t.ready = true);
-        exit_active_gen();
         assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
     }
 
@@ -1020,11 +1048,10 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
-        exit_active_gen();
         assert_eq!(bgid, 0);
     }
 
@@ -1044,7 +1071,7 @@ mod tests {
                 .init_future_unchecked(index, core::future::ready(()))
         };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
@@ -1052,7 +1079,6 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_runtime(|_r| ());
         }));
-        exit_active_gen();
         assert!(result.is_err());
     }
 
@@ -1068,12 +1094,11 @@ mod tests {
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         ctx.wake();
         ctx.wake();
-        exit_active_gen();
         assert_eq!(data.wakeups, vec![index, index]);
     }
 
@@ -1093,7 +1118,7 @@ mod tests {
                 .init_future_unchecked(index, core::future::ready(()))
         };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
@@ -1101,7 +1126,6 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_task(|_t| ());
         }));
-        exit_active_gen();
         assert!(result.is_err());
     }
 
@@ -1121,7 +1145,7 @@ mod tests {
                 .init_future_unchecked(index, core::future::ready(()))
         };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
@@ -1141,7 +1165,6 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_task(|t| t.ready = false);
         }));
-        exit_active_gen();
 
         assert!(result.is_err());
         assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
@@ -1168,14 +1191,13 @@ mod tests {
         let index_b = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index_b, task_b) };
 
-        enter_active_gen();
+        let _gen = enter_active_gen();
         let ctx_a = data.context_for(index_a);
         let _ctx_b = data.context_for(index_b);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx_a.with_task(|t| t.ready = true);
         }));
-        exit_active_gen();
 
         assert!(result.is_ok());
         assert!(unsafe { data.tasks.task_unchecked(index_a) }.ready);
