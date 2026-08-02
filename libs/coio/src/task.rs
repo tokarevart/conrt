@@ -91,6 +91,13 @@ impl TaskContext {
         unsafe { f((*self.runtime).tasks.task_mut_unchecked(self.task_index)) }
     }
 
+    pub(crate) fn with_runtime<R>(&self, f: impl FnOnce(&mut runtime::RuntimeData) -> R) -> R {
+        if let Err(e) = self.validate() {
+            panic!("invalid TaskContext: {e}");
+        }
+        unsafe { f(&mut *self.runtime) }
+    }
+
     pub fn wake(&self) {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");

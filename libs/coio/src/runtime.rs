@@ -9,10 +9,9 @@ use std::os::fd::RawFd;
 
 use crate::arena::Arena;
 use crate::arena::ArenaAlloc;
-use crate::buffer::IoReadBuffer;
 use crate::buffer::IoWriteBuffer;
-use crate::buffer::complete_read;
 use crate::buffer::complete_write;
+use crate::pbuf::ProvidedBufferPool;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
@@ -52,12 +51,14 @@ pub enum IoState {
         submitted: u64,
         ready: u64,
         results: [i32; 64],
+        bids: [Option<u16>; 64],
         allocs: [Option<ArenaAlloc>; 64],
     },
     Heap {
         submitted: Vec<u64>,
         ready: Vec<u64>,
         results: Vec<i32>,
+        bids: Vec<Option<u16>>,
         allocs: Vec<Option<ArenaAlloc>>,
     },
 }
@@ -71,10 +72,12 @@ impl Default for IoState {
 impl IoState {
     pub fn new() -> Self {
         const NONE_ALLOC: Option<ArenaAlloc> = None;
+        const NONE_BID: Option<u16> = None;
         Self::Inline {
             submitted: 0,
             ready: 0,
             results: [0; 64],
+            bids: [NONE_BID; 64],
             allocs: [NONE_ALLOC; 64],
         }
     }
@@ -157,6 +160,32 @@ impl IoState {
         }
     }
 
+    pub fn set_bid(&mut self, slot: u32, value: Option<u16>) {
+        match self {
+            Self::Inline { bids, .. } => bids[slot as usize] = value,
+            Self::Heap { bids, .. } => {
+                let idx = slot as usize;
+                if idx >= bids.len() {
+                    bids.resize(idx + 1, None);
+                }
+                bids[idx] = value;
+            }
+        }
+    }
+
+    pub fn bid(&self, slot: u32) -> Option<u16> {
+        match self {
+            Self::Inline { bids, .. } => bids[slot as usize],
+            Self::Heap { bids, .. } => bids[slot as usize],
+        }
+    }
+
+    pub fn reset_slot(&mut self, slot: u32) {
+        self.set_submitted(slot, false);
+        self.set_ready(slot, false);
+        self.set_bid(slot, None);
+    }
+
     pub fn set_alloc(&mut self, slot: u32, alloc: ArenaAlloc) {
         match self {
             Self::Inline { allocs, .. } => allocs[slot as usize] = Some(alloc),
@@ -234,33 +263,47 @@ impl From<u64> for IoUserData {
     }
 }
 
-pub async fn read(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<Vec<u8>> {
+/// Reads up to `max_len` bytes from `fd` into a buffer selected from the
+/// runtime's provided buffer pool. Returns at most `buf_size` bytes (the
+/// kernel caps the transfer at the selected buffer's size).
+pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Vec<u8>> {
+    let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
+
     let slot = ctx
-        .with_task(|task| buf.prepare_read(task))
+        .with_task(|task| {
+            let slot = task.io.free_slot()?;
+            task.io.set_submitted(slot, true);
+            Some(slot)
+        })
         .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
 
-    let (ptr, len) = ctx.with_task(|task| {
-        let alloc = task.io.alloc(slot);
-        let vec: Vec<u8> = task.arena.read(&alloc);
-        let (ptr, len, _) = vec.into_raw_parts();
-        (ptr, len as u32)
-    });
-
-    let entry = io_uring::opcode::Read::new(io_uring::types::Fd(fd), ptr, len).build();
+    let entry = io_uring::opcode::Read::new(
+        io_uring::types::Fd(fd),
+        std::ptr::null_mut(),
+        max_len as u32,
+    )
+    .buf_group(bgid)
+    .build()
+    .flags(io_uring::squeue::Flags::BUFFER_SELECT);
     if let Err(e) = ctx.push_io(entry, slot) {
-        let _ = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) };
+        ctx.with_task(|task| task.io.reset_slot(slot));
         return Err(e);
     }
 
     let result = await_cqe(ctx, slot).await;
     if result < 0 {
-        let _ = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) };
+        ctx.with_task(|task| task.io.reset_slot(slot));
         return Err(io::Error::from_raw_os_error(-result));
     }
 
-    let mut out = unsafe { ctx.with_task(|task| complete_read::<Vec<u8>>(task, slot)) }.unwrap();
-    out.truncate(result.min(out.len() as i32) as usize);
-    Ok(out)
+    let bid = ctx
+        .with_task(|task| task.io.bid(slot))
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+
+    let data = ctx.with_runtime(|r| r.buffer_pool.get_slice(bid, result as usize).to_vec());
+    ctx.with_runtime(|r| r.buffer_pool.recycle_buffer(bid));
+    ctx.with_task(|task| task.io.reset_slot(slot));
+    Ok(data)
 }
 
 pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usize> {
@@ -344,7 +387,16 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
 pub(crate) struct RuntimeData {
     pub(crate) tasks: TaskSlab,
     pub(crate) wakeups: Vec<u32>,
+    pub(crate) buffer_pool: ProvidedBufferPool,
     pub(crate) ring: io_uring::IoUring,
+}
+
+impl Drop for RuntimeData {
+    fn drop(&mut self) {
+        // Unregister the provided buffer ring while the io_uring fd is still
+        // open; the pool is dropped afterwards along with the other fields.
+        let _ = self.buffer_pool.unregister(&self.ring);
+    }
 }
 
 impl RuntimeData {
@@ -368,6 +420,8 @@ impl RuntimeData {
                 if self.tasks.is_occupied(task_index) {
                     let task = self.tasks.task_mut_unchecked(task_index);
                     task.io.set_result(io_slot, result);
+                    task.io
+                        .set_bid(io_slot, io_uring::cqueue::buffer_select(cqe.flags()));
                     task.io.set_ready(io_slot, true);
                     if !task.ready {
                         task.ready = true;
@@ -382,20 +436,32 @@ impl RuntimeData {
 pub struct Runtime {
     tasks_capacity: u32,
     ring_entries: u32,
+    buf_count: u16,
+    buf_size: u32,
 }
 
 impl Runtime {
-    pub fn new(tasks_capacity: u32, ring_entries: u32) -> std::io::Result<Self> {
+    pub fn new(
+        tasks_capacity: u32,
+        ring_entries: u32,
+        buf_count: u16,
+        buf_size: u32,
+    ) -> std::io::Result<Self> {
         if ring_entries == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "ring_entries must be greater than 0",
             ));
         }
+        assert!(buf_count.is_power_of_two());
+        assert!(buf_count > 0 && buf_count <= 32768);
+        assert!(buf_size > 0);
 
         Ok(Self {
             tasks_capacity,
             ring_entries,
+            buf_count,
+            buf_size,
         })
     }
 
@@ -410,11 +476,18 @@ impl Runtime {
             .setup_single_issuer()
             .setup_defer_taskrun()
             .build(self.ring_entries)
-            .unwrap_or_else(|_| io_uring::IoUring::new(self.ring_entries).unwrap());
+            .unwrap_or_else(|_| {
+                io_uring::IoUring::new(self.ring_entries).expect("failed to create io_uring")
+            });
+
+        let pool = ProvidedBufferPool::new(self.buf_count, self.buf_size);
+        pool.register(&ring)
+            .expect("failed to register the provided buffer pool");
 
         let mut data = RuntimeData {
             tasks: TaskSlab::new::<F>(self.tasks_capacity),
             wakeups: Vec::new(),
+            buffer_pool: pool,
             ring,
         };
 
@@ -575,10 +648,14 @@ mod tests {
     use crate::task::TaskSlab;
 
     fn test_runtime_data(capacity: u32) -> RuntimeData {
+        let ring = io_uring::IoUring::new(8).unwrap();
+        let pool = ProvidedBufferPool::new(4, 16);
+        pool.register(&ring).unwrap();
         RuntimeData {
             tasks: TaskSlab::new::<Ready<()>>(capacity),
             wakeups: Vec::new(),
-            ring: io_uring::IoUring::new(8).unwrap(),
+            buffer_pool: pool,
+            ring,
         }
     }
 
@@ -612,6 +689,7 @@ mod tests {
             submitted: vec![0; capacity],
             ready: vec![0; capacity],
             results: vec![0; capacity * 64],
+            bids: vec![None; capacity * 64],
             allocs: vec![None; capacity * 64],
         }
     }
@@ -658,6 +736,38 @@ mod tests {
         assert_eq!(s.result(10), -1);
         let alloc = s.take_alloc(10);
         assert_eq!(alloc.size.get(), 4);
+    }
+
+    // ── IoState bid storage ───────────────────────────────────────────
+
+    #[test]
+    fn io_state_bid_inline_roundtrip() {
+        let mut s = IoState::new();
+        s.set_bid(0, Some(3));
+        assert_eq!(s.bid(0), Some(3));
+        s.set_bid(0, None);
+        assert_eq!(s.bid(0), None);
+    }
+
+    #[test]
+    fn io_state_bid_heap_roundtrip() {
+        let mut s = make_heap_state(2);
+        s.set_bid(64, Some(7));
+        assert_eq!(s.bid(64), Some(7));
+        s.set_bid(64, None);
+        assert_eq!(s.bid(64), None);
+    }
+
+    #[test]
+    fn io_state_reset_slot_clears_state() {
+        let mut s = IoState::new();
+        s.set_submitted(5, true);
+        s.set_ready(5, true);
+        s.set_bid(5, Some(2));
+        s.reset_slot(5);
+        assert!(!s.is_submitted(5));
+        assert!(!s.is_ready(5));
+        assert_eq!(s.bid(5), None);
     }
 
     // ── IoUserData ────────────────────────────────────────────────────
@@ -903,6 +1013,54 @@ mod tests {
         ctx.with_task(|t| t.ready = true);
         exit_active_gen();
         assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
+    }
+
+    #[test]
+    fn task_context_with_runtime_reads_buffer_pool() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
+        exit_active_gen();
+        assert_eq!(bgid, 0);
+    }
+
+    #[test]
+    fn task_context_with_runtime_after_removal_panics() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            arena: Arena::new(4096),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+        unsafe {
+            data.tasks
+                .init_future_unchecked(index, core::future::ready(()))
+        };
+
+        enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.with_runtime(|_r| ());
+        }));
+        exit_active_gen();
+        assert!(result.is_err());
     }
 
     #[test]
