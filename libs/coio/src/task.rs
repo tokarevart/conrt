@@ -13,6 +13,7 @@ use crate::arena::Arena;
 use crate::runtime;
 use crate::runtime::IoState;
 use crate::runtime::IoUserData;
+use crate::runtime::Runtime;
 
 pub struct Task {
     pub ready: bool,
@@ -48,11 +49,11 @@ pub struct TaskContext {
     generation: u64,
     task_index: u32,
     task_id: u64,
-    runtime: *mut runtime::RuntimeData,
+    runtime: *mut Runtime,
 }
 
 impl TaskContext {
-    pub(crate) fn new(runtime: *mut runtime::RuntimeData, task_index: u32, task_id: u64) -> Self {
+    pub(crate) fn new(runtime: *mut Runtime, task_index: u32, task_id: u64) -> Self {
         Self {
             generation: runtime::active_gen().expect("no active generation"),
             task_index,
@@ -91,7 +92,7 @@ impl TaskContext {
         unsafe { f((*self.runtime).tasks.task_mut_unchecked(self.task_index)) }
     }
 
-    pub(crate) fn with_runtime<R>(&self, f: impl FnOnce(&mut runtime::RuntimeData) -> R) -> R {
+    pub(crate) fn with_runtime<R>(&self, f: impl FnOnce(&mut Runtime) -> R) -> R {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");
         }

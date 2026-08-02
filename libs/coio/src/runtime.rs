@@ -384,14 +384,14 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
     }
 }
 
-pub(crate) struct RuntimeData {
+pub(crate) struct Runtime {
     pub(crate) tasks: TaskSlab,
     pub(crate) wakeups: Vec<u32>,
     pub(crate) buffer_pool: ProvidedBufferPool,
     pub(crate) ring: io_uring::IoUring,
 }
 
-impl Drop for RuntimeData {
+impl Drop for Runtime {
     fn drop(&mut self) {
         // Unregister the provided buffer ring while the io_uring fd is still
         // open; the pool is dropped afterwards along with the other fields.
@@ -399,14 +399,14 @@ impl Drop for RuntimeData {
     }
 }
 
-impl RuntimeData {
+impl Runtime {
     pub(crate) fn context_for(&mut self, index: u32) -> TaskContext {
         assert!(
             self.tasks.is_occupied(index),
             "cannot build a context for an uninitialized slot"
         );
         let task_id = unsafe { self.tasks.task_unchecked(index) }.id;
-        TaskContext::new(self as *mut RuntimeData, index, task_id)
+        TaskContext::new(self as *mut Runtime, index, task_id)
     }
 
     pub(crate) fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
@@ -433,184 +433,177 @@ impl RuntimeData {
     }
 }
 
-pub struct Runtime {
-    tasks_capacity: u32,
-    ring_entries: u32,
-    buf_count: u16,
-    buf_size: u32,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RuntimeParams {
+    pub tasks_capacity: u32,
+    pub ring_entries: u32,
+    pub buf_count: u16,
+    pub buf_size: u32,
 }
 
-impl Runtime {
-    pub fn new(
-        tasks_capacity: u32,
-        ring_entries: u32,
-        buf_count: u16,
-        buf_size: u32,
-    ) -> std::io::Result<Self> {
-        if ring_entries == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "ring_entries must be greater than 0",
-            ));
+impl Default for RuntimeParams {
+    fn default() -> Self {
+        Self {
+            tasks_capacity: 1024,
+            ring_entries: 1024,
+            buf_count: 1024,
+            buf_size: 4096,
         }
-        assert!(buf_count.is_power_of_two());
-        assert!(buf_count > 0 && buf_count <= 32768);
-        assert!(buf_size > 0);
-
-        Ok(Self {
-            tasks_capacity,
-            ring_entries,
-            buf_count,
-            buf_size,
-        })
     }
+}
 
-    pub fn block_on<S, F, T>(self, make_fut: S, user_data: T)
-    where
-        S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-        F: Future<Output = ()> + 'static,
-    {
-        let generation = enter_active_gen();
+pub fn block_on_default<S, F, T>(make_fut: S, user_data: T)
+where
+    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
+    F: Future<Output = ()> + 'static,
+{
+    block_on(RuntimeParams::default(), make_fut, user_data)
+}
 
-        let ring = io_uring::IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            .build(self.ring_entries)
-            .unwrap_or_else(|_| {
-                io_uring::IoUring::new(self.ring_entries).expect("failed to create io_uring")
-            });
+pub fn block_on<S, F, T>(params: RuntimeParams, make_fut: S, user_data: T)
+where
+    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
+    F: Future<Output = ()> + 'static,
+{
+    let generation = enter_active_gen();
 
-        let pool = ProvidedBufferPool::new(self.buf_count, self.buf_size);
-        pool.register(&ring)
-            .expect("failed to register the provided buffer pool");
-
-        let mut data = RuntimeData {
-            tasks: TaskSlab::new::<F>(self.tasks_capacity),
-            wakeups: Vec::new(),
-            buffer_pool: pool,
-            ring,
-        };
-
-        let data_ptr: *mut RuntimeData = &mut data;
-        let _drop_guard = DropGuard::new(move || unsafe {
-            TaskSlab::drop_futures_raw::<F>(&mut (*data_ptr).tasks)
+    let ring = io_uring::IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .build(params.ring_entries)
+        .unwrap_or_else(|_| {
+            io_uring::IoUring::new(params.ring_entries).expect("failed to create io_uring")
         });
 
-        let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = Self::spawn::<S, F, T>;
+    let pool = ProvidedBufferPool::new(params.buf_count, params.buf_size);
+    pool.register(&ring)
+        .expect("failed to register the provided buffer pool");
 
-        let ctx = RuntimeContext {
-            generation,
-            data: data_ptr,
-            spawn,
-            make_fut: &raw const make_fut as *const (),
-        };
+    let mut rt = Runtime {
+        tasks: TaskSlab::new::<F>(params.tasks_capacity),
+        wakeups: Vec::new(),
+        buffer_pool: pool,
+        ring,
+    };
 
-        let index = match data.tasks.insert_vacant() {
-            Some(i) => i,
-            None => {
-                exit_active_gen();
-                return;
-            }
-        };
+    let rt_ptr: *mut Runtime = &mut rt;
+    let _drop_guard =
+        DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
 
-        let task = Task {
-            ready: true,
-            io: IoState::new(),
-            arena: Arena::new(4096),
-            id: 0,
-        };
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+    let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = spawn::<S, F, T>;
 
-        let task_ctx = data.context_for(index);
+    let ctx = RuntimeContext {
+        generation,
+        runtime: rt_ptr,
+        spawn,
+        make_fut: &raw const make_fut as *const (),
+    };
 
-        let future = (make_fut)(task_ctx, ctx, user_data);
-        unsafe { data.tasks.init_future_unchecked(index, future) };
-        data.wakeups.push(index);
+    let index = match rt.tasks.insert_vacant() {
+        Some(i) => i,
+        None => {
+            exit_active_gen();
+            return;
+        }
+    };
 
-        let mut ready_tasks = Vec::new();
+    let task = Task {
+        ready: true,
+        io: IoState::new(),
+        arena: Arena::new(4096),
+        id: 0,
+    };
+    unsafe { rt.tasks.init_task_unchecked(index, task) };
 
-        loop {
-            core::mem::swap(&mut data.wakeups, &mut ready_tasks);
-            assert!(data.wakeups.is_empty());
+    let task_ctx = rt.context_for(index);
 
-            data.drain_cqes(&mut ready_tasks);
+    let future = (make_fut)(task_ctx, ctx, user_data);
+    unsafe { rt.tasks.init_future_unchecked(index, future) };
+    rt.wakeups.push(index);
 
-            for &idx in &ready_tasks {
-                if !data.tasks.is_occupied(idx) {
-                    continue;
-                }
+    let mut ready_tasks = Vec::new();
 
-                unsafe { data.tasks.task_mut_unchecked(idx).ready = false };
+    loop {
+        core::mem::swap(&mut rt.wakeups, &mut ready_tasks);
+        assert!(rt.wakeups.is_empty());
 
-                let mut cx = Context::from_waker(Waker::noop());
-                let future_ptr = data.tasks.future_ptr_unchecked::<F>(idx);
-                let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
+        rt.drain_cqes(&mut ready_tasks);
 
-                match future.poll(&mut cx) {
-                    Poll::Ready(()) => {
-                        unsafe { data.tasks.remove_unchecked::<F>(idx) };
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            ready_tasks.clear();
-
-            if !data.tasks.has_io_in_flight() {
-                if data.wakeups.is_empty() {
-                    break;
-                }
+        for &idx in &ready_tasks {
+            if !rt.tasks.is_occupied(idx) {
                 continue;
             }
 
-            match data.ring.submit_and_wait(1) {
-                Ok(_) => {}
-                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                Err(_) => {
-                    exit_active_gen();
-                    return;
+            unsafe { rt.tasks.task_mut_unchecked(idx).ready = false };
+
+            let mut cx = Context::from_waker(Waker::noop());
+            let future_ptr = rt.tasks.future_ptr_unchecked::<F>(idx);
+            let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
+
+            match future.poll(&mut cx) {
+                Poll::Ready(()) => {
+                    unsafe { rt.tasks.remove_unchecked::<F>(idx) };
                 }
+                Poll::Pending => {}
             }
         }
 
-        exit_active_gen();
-    }
+        ready_tasks.clear();
 
-    unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
-    where
-        S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-        F: Future<Output = ()> + 'static,
-    {
-        let data = unsafe { &mut *ctx.data };
-        let closure = unsafe { &*(ctx.make_fut as *const S) };
-
-        let index = data.tasks.insert_vacant()?;
-        let task = Task {
-            ready: true,
-            io: IoState::new(),
-            arena: Arena::new(4096),
-            id: 0,
-        };
-        unsafe { data.tasks.init_task_unchecked(index, task) };
-
-        let task_ctx = data.context_for(index);
-
-        let future = closure(task_ctx, ctx, user_data);
-        unsafe {
-            data.tasks.init_future_unchecked(index, future);
+        if !rt.tasks.has_io_in_flight() {
+            if rt.wakeups.is_empty() {
+                break;
+            }
+            continue;
         }
 
-        data.wakeups.push(index);
-
-        Some(index)
+        match rt.ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(_) => {
+                exit_active_gen();
+                return;
+            }
+        }
     }
+
+    exit_active_gen();
+}
+
+unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
+where
+    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
+    F: Future<Output = ()> + 'static,
+{
+    let data = unsafe { &mut *ctx.runtime };
+    let closure = unsafe { &*(ctx.make_fut as *const S) };
+
+    let index = data.tasks.insert_vacant()?;
+    let task = Task {
+        ready: true,
+        io: IoState::new(),
+        arena: Arena::new(4096),
+        id: 0,
+    };
+    unsafe { data.tasks.init_task_unchecked(index, task) };
+
+    let task_ctx = data.context_for(index);
+
+    let future = closure(task_ctx, ctx, user_data);
+    unsafe {
+        data.tasks.init_future_unchecked(index, future);
+    }
+
+    data.wakeups.push(index);
+
+    Some(index)
 }
 
 #[derive(Debug)]
 pub struct RuntimeContext<T> {
     generation: u64,
     spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
-    data: *mut RuntimeData,
+    runtime: *mut Runtime,
     make_fut: *const (),
 }
 
@@ -647,11 +640,11 @@ mod tests {
     use crate::task::Task;
     use crate::task::TaskSlab;
 
-    fn test_runtime_data(capacity: u32) -> RuntimeData {
+    fn test_runtime_data(capacity: u32) -> Runtime {
         let ring = io_uring::IoUring::new(8).unwrap();
         let pool = ProvidedBufferPool::new(4, 16);
         pool.register(&ring).unwrap();
-        RuntimeData {
+        Runtime {
             tasks: TaskSlab::new::<Ready<()>>(capacity),
             wakeups: Vec::new(),
             buffer_pool: pool,

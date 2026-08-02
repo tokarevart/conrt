@@ -1,5 +1,6 @@
-use coio::runtime::Runtime;
 use coio::runtime::RuntimeContext;
+use coio::runtime::RuntimeParams;
+use coio::runtime::block_on;
 
 fn tmpfile() -> std::fs::File {
     use std::os::fd::FromRawFd;
@@ -13,27 +14,26 @@ fn tmpfile() -> std::fs::File {
 }
 
 #[test]
-fn runtime_new_success() {
-    let rt = Runtime::new(4, 8, 4, 16);
-    assert!(rt.is_ok());
-}
-
-#[test]
-fn runtime_new_zero_entries_fails() {
-    let rt = Runtime::new(4, 0, 4, 16);
-    assert!(rt.is_err());
-}
-
-#[test]
 fn block_on_trivial() {
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(|_, _, _data: ()| async move {}, ());
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(rt, |_, _, _data: ()| async move {}, ());
 }
 
 #[test]
 fn block_on_with_spawn() {
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |_, rt: RuntimeContext<u32>, data: u32| async move {
             if data < 3 {
                 rt.spawn(data + 1);
@@ -45,8 +45,14 @@ fn block_on_with_spawn() {
 
 #[test]
 fn block_on_spawn_chain() {
-    let rt = Runtime::new(16, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 16,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |_, rt: RuntimeContext<u32>, data: u32| async move {
             if data < 3 {
                 rt.spawn(data + 1);
@@ -67,8 +73,14 @@ fn stale_runtime_context_panics_outside_block_on() {
         static STASH: RefCell<Option<RuntimeContext<u32>>> = const { RefCell::new(None) };
     }
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |_, rt: RuntimeContext<u32>, _data: u32| async move {
             STASH.with(|s| *s.borrow_mut() = Some(rt));
         },
@@ -95,8 +107,14 @@ fn stale_task_context_panics_outside_block_on() {
         static STASH: RefCell<Option<coio::task::TaskContext>> = const { RefCell::new(None) };
     }
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |ctx: coio::task::TaskContext, _rt, _data: u32| async move {
             STASH.with(|s| *s.borrow_mut() = Some(ctx));
         },
@@ -123,16 +141,28 @@ fn stale_runtime_context_from_previous_run_panics() {
         static STASH: RefCell<Option<RuntimeContext<u32>>> = const { RefCell::new(None) };
     }
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |_, rt: RuntimeContext<u32>, _data: u32| async move {
             STASH.with(|s| *s.borrow_mut() = Some(rt));
         },
         0,
     );
 
-    let rt2 = Runtime::new(4, 8, 4, 16).unwrap();
-    rt2.block_on(
+    let rt2 = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt2,
         |_, _rt: RuntimeContext<u32>, _data: u32| async move {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 STASH.with(|s| {
@@ -164,8 +194,14 @@ fn block_on_read_from_file() {
     file.seek(SeekFrom::Start(0)).unwrap();
     let fd = file.as_raw_fd();
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |ctx, _rt, fd| async move {
             let data = read(ctx, fd, 5).await.unwrap();
             assert_eq!(data, b"hello");
@@ -188,8 +224,14 @@ fn block_on_read_full_buffer() {
     file.seek(SeekFrom::Start(0)).unwrap();
     let fd = file.as_raw_fd();
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |ctx, _rt, fd| async move {
             let data = read(ctx, fd, 16).await.unwrap();
             assert_eq!(data, b"hello world");
@@ -214,8 +256,14 @@ fn block_on_read_many_recycles() {
     file.seek(SeekFrom::Start(0)).unwrap();
     let fd = file.as_raw_fd();
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |ctx, _rt, fd| async move {
             for _ in 0..8 {
                 let data = read(ctx, fd, 16).await.unwrap();
@@ -238,8 +286,14 @@ fn block_on_write_to_file() {
     let mut file = tmpfile();
     let fd = file.as_raw_fd();
 
-    let rt = Runtime::new(4, 8, 4, 16).unwrap();
-    rt.block_on(
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
         |ctx, _rt, fd| async move {
             let n = write(ctx, fd, b"hello".to_vec()).await.unwrap();
             assert_eq!(n, 5);
