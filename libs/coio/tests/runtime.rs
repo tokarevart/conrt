@@ -204,7 +204,7 @@ fn block_on_read_from_file() {
         rt,
         |ctx, _rt, fd| async move {
             let data = read(ctx, fd, 5).await.unwrap();
-            assert_eq!(data, b"hello");
+            assert_eq!(data.as_ref(), b"hello");
         },
         fd,
     );
@@ -234,7 +234,7 @@ fn block_on_read_full_buffer() {
         rt,
         |ctx, _rt, fd| async move {
             let data = read(ctx, fd, 16).await.unwrap();
-            assert_eq!(data, b"hello world");
+            assert_eq!(data.as_ref(), b"hello world");
         },
         fd,
     );
@@ -267,8 +267,39 @@ fn block_on_read_many_recycles() {
         |ctx, _rt, fd| async move {
             for _ in 0..8 {
                 let data = read(ctx, fd, 16).await.unwrap();
-                assert_eq!(data, b"hello world");
+                assert_eq!(data.as_ref(), b"hello world");
             }
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_read_into_vec() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::read;
+
+    let mut file = tmpfile();
+    file.write_all(b"hello world").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let buf = read(ctx, fd, 16).await.unwrap();
+            let data = buf.into_vec();
+            assert_eq!(data, b"hello world");
         },
         fd,
     );

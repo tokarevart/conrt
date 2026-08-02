@@ -8,6 +8,7 @@ use std::io;
 use std::os::fd::RawFd;
 
 use crate::pbuf::ProvidedBufferPool;
+use crate::pbuf::ReadBuffer;
 use crate::task::IoState;
 use crate::task::Task;
 use crate::task::TaskContext;
@@ -83,7 +84,11 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
 /// runtime's provided buffer pool. Returns at most `buf_size` bytes (the
 /// kernel caps the transfer at the selected buffer's size).
-pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Vec<u8>> {
+///
+/// The returned [`ReadBuffer`] borrows memory from the pool: its slot is
+/// recycled when the buffer is dropped, so the runtime must still be alive
+/// while the buffer is in use.
+pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<ReadBuffer> {
     let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
 
     let slot = ctx
@@ -113,12 +118,12 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Vec
         return Err(io::Error::from_raw_os_error(-result));
     }
 
+    let generation = active_gen().expect("read called outside an active runtime");
     let bid = ctx.with_task(|task| task.io.bid(slot));
-
-    let data = ctx.with_runtime(|r| r.buffer_pool.get_slice(bid, result as usize).to_vec());
-    ctx.with_runtime(|r| r.buffer_pool.recycle_buffer(bid));
+    let ptr = ctx.with_runtime(|r| r.buffer_pool.slot_ptr(bid));
     ctx.with_task(|task| task.io.reset_slot(slot));
-    Ok(data)
+
+    Ok(ReadBuffer::new(ptr, result as usize, bid, generation))
 }
 
 pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usize> {
@@ -341,11 +346,10 @@ where
         .expect("failed to register the write buffer pool");
 
     let rt_ptr: *mut Runtime = &mut rt;
-    let _drop_guard =
-        DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
-
     set_current_runtime(rt_ptr);
     let _rt_guard = DropGuard::new(clear_current_runtime);
+    let _drop_guard =
+        DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
 
     let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = spawn::<S, F, T>;
 
@@ -603,6 +607,78 @@ mod tests {
         // bids is not cleared: like `results`, it is only read once `ready`
         // is set and is overwritten before the next use of the slot.
         assert_eq!(s.bid(5), 2);
+    }
+
+    // ── ReadBuffer ────────────────────────────────────────────────────
+
+    #[test]
+    fn read_buffer_drop_recycles_slot() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let ptr = data.buffer_pool.slot_ptr(1);
+        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+
+        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        drop(buf);
+        assert_eq!(data.buffer_pool.ring_tail(), 5);
+    }
+
+    #[test]
+    fn read_buffer_stale_generation_skips_recycle() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get() + 1;
+        let ptr = data.buffer_pool.slot_ptr(1);
+        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+
+        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        drop(buf);
+        assert_eq!(data.buffer_pool.ring_tail(), 4);
+    }
+
+    #[test]
+    fn read_buffer_into_vec_recycles_slot() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let ptr = data.buffer_pool.slot_ptr(1);
+        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+
+        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        let bytes = buf.into_vec();
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(data.buffer_pool.ring_tail(), 5);
     }
 
     // ── IoUserData ────────────────────────────────────────────────────
