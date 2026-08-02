@@ -406,10 +406,16 @@ impl Runtime {
     {
         let generation = enter_active_gen();
 
+        let ring = io_uring::IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .build(self.ring_entries)
+            .unwrap_or_else(|_| io_uring::IoUring::new(self.ring_entries).unwrap());
+
         let mut data = RuntimeData {
             tasks: TaskSlab::new::<F>(self.tasks_capacity),
             wakeups: Vec::new(),
-            ring: io_uring::IoUring::new(self.ring_entries).unwrap(),
+            ring,
         };
 
         let data_ptr: *mut RuntimeData = &mut data;
