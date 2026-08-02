@@ -206,13 +206,13 @@ impl Drop for ProvidedBufferPool {
 /// the runtime is gone.
 pub struct ReadBuffer {
     ptr: NonNull<u8>,
-    len: usize,
+    len: u32,
     bid: u16,
     generation: u64,
 }
 
 impl ReadBuffer {
-    pub(crate) fn new(ptr: NonNull<u8>, len: usize, bid: u16, generation: u64) -> Self {
+    pub(crate) fn new(ptr: NonNull<u8>, len: u32, bid: u16, generation: u64) -> Self {
         Self {
             ptr,
             len,
@@ -223,7 +223,8 @@ impl ReadBuffer {
 
     /// Copies the buffer into an owned `Vec` and recycles the pool slot.
     pub fn into_vec(mut self) -> Vec<u8> {
-        let data = unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }.to_vec();
+        let data =
+            unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }.to_vec();
         self.recycle();
         core::mem::forget(self);
         data
@@ -246,7 +247,7 @@ impl Deref for ReadBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 }
 

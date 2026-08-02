@@ -13,6 +13,7 @@ use crate::task::IoState;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
+use crate::wbuf::WriteBuffer;
 use crate::wbuf::WriteBufferPool;
 
 thread_local! {
@@ -123,32 +124,35 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Rea
     let ptr = ctx.with_runtime(|r| r.buffer_pool.slot_ptr(bid));
     ctx.with_task(|task| task.io.reset_slot(slot));
 
-    Ok(ReadBuffer::new(ptr, result as usize, bid, generation))
+    Ok(ReadBuffer::new(ptr, result as _, bid, generation))
 }
 
-pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usize> {
+/// Acquires a zero-copy write buffer backed by a slot from the runtime's fixed
+/// write buffer slab. The buffer's [`WriteBuffer::capacity`] is the pool's
+/// slot size; the caller fills it via [`WriteBuffer::as_mut`] and records the
+/// length with [`WriteBuffer::set_len`] before passing it to [`write`]. The
+/// slot is recycled when the buffer is dropped.
+pub fn write_buffer(ctx: TaskContext) -> io::Result<WriteBuffer> {
+    let generation = active_gen().expect("write_buffer called outside an active runtime");
+    let bid = ctx
+        .with_runtime(|r| r.write_pool.acquire())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    let ptr = ctx.with_runtime(|r| r.write_pool.slot_ptr(bid));
+    Ok(WriteBuffer::new(ptr, bid, generation))
+}
+
+/// Writes the contents of `wb` to `fd` via `IORING_OP_WRITE_FIXED`. The
+/// buffer's slot is held until the kernel finishes with it and recycled when
+/// `wb` is dropped.
+pub async fn write(ctx: TaskContext, fd: RawFd, wb: WriteBuffer) -> io::Result<usize> {
     let slot = ctx
         .with_task(|task| task.io.free_slot())
         .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
 
-    let wslot = ctx
-        .with_runtime(|r| r.write_pool.acquire())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
-
-    let len = buf.len();
-    if len > ctx.with_runtime(|r| r.write_pool.slot_size()) as usize {
-        ctx.with_runtime(|r| r.write_pool.release(wslot));
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
-    }
-
-    let ptr = ctx.with_runtime(|r| {
-        let slot_mem = r.write_pool.get_slice_mut(wslot);
-        slot_mem[..len].copy_from_slice(&buf);
-        slot_mem.as_ptr()
-    });
+    let len = wb.len();
+    let ptr = wb.ptr().as_ptr();
 
     ctx.with_task(|task| task.io.set_submitted(slot, true));
-    ctx.with_task(|task| task.io.set_bid(slot, wslot));
 
     let entry = io_uring::opcode::WriteFixed::new(
         io_uring::types::Fd(fd),
@@ -159,18 +163,15 @@ pub async fn write(ctx: TaskContext, fd: RawFd, buf: Vec<u8>) -> io::Result<usiz
     .build();
     if let Err(e) = ctx.push_io(entry, slot) {
         ctx.with_task(|task| task.io.reset_slot(slot));
-        ctx.with_runtime(|r| r.write_pool.release(wslot));
         return Err(e);
     }
 
     let result = await_cqe(ctx, slot).await;
     if result < 0 {
         ctx.with_task(|task| task.io.reset_slot(slot));
-        ctx.with_runtime(|r| r.write_pool.release(wslot));
         return Err(io::Error::from_raw_os_error(-result));
     }
 
-    ctx.with_runtime(|r| r.write_pool.release(wslot));
     ctx.with_task(|task| task.io.reset_slot(slot));
     Ok(result as usize)
 }
@@ -679,6 +680,125 @@ mod tests {
         let bytes = buf.into_vec();
         assert_eq!(bytes.len(), 5);
         assert_eq!(data.buffer_pool.ring_tail(), 5);
+    }
+
+    // ── WriteBuffer ───────────────────────────────────────────────────
+
+    #[test]
+    fn write_buffer_drop_recycles_slot() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let bid = data.write_pool.acquire().unwrap();
+        let buf = crate::wbuf::WriteBuffer::new(data.write_pool.slot_ptr(bid), bid, generation);
+
+        assert_eq!(data.write_pool.free_count(), 3);
+        drop(buf);
+        assert_eq!(data.write_pool.free_count(), 4);
+    }
+
+    #[test]
+    fn write_buffer_stale_generation_skips_recycle() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let bid = data.write_pool.acquire().unwrap();
+        let generation = _gen.get() + 1;
+        let buf = crate::wbuf::WriteBuffer::new(data.write_pool.slot_ptr(bid), bid, generation);
+
+        assert_eq!(data.write_pool.free_count(), 3);
+        drop(buf);
+        assert_eq!(data.write_pool.free_count(), 3);
+    }
+
+    #[test]
+    fn write_buffer_helper_returns_slot_capacity() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let before = data.write_pool.free_count();
+        let buf = write_buffer(ctx).unwrap();
+        assert_eq!(buf.capacity(), 16);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(data.write_pool.free_count(), before - 1);
+        drop(buf);
+        assert_eq!(data.write_pool.free_count(), before);
+    }
+
+    #[test]
+    fn write_buffer_as_mut_set_len_clear() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut buf = write_buffer(ctx).unwrap();
+        assert_eq!(buf.as_mut().len(), 16);
+        buf.as_mut()[..5].copy_from_slice(b"hello");
+        buf.set_len(5);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.as_ref(), b"hello");
+
+        buf.set_len(16);
+        assert_eq!(buf.len(), 16);
+
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds capacity")]
+    fn write_buffer_set_len_above_capacity_panics() {
+        let task = Task {
+            ready: false,
+            io: IoState::new(),
+            id: 0,
+        };
+        let mut data = test_runtime_data(64);
+        let index = data.tasks.insert_vacant().unwrap();
+        unsafe { data.tasks.init_task_unchecked(index, task) };
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut buf = write_buffer(ctx).unwrap();
+        buf.set_len(17);
     }
 
     // ── IoUserData ────────────────────────────────────────────────────

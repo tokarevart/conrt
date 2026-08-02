@@ -313,6 +313,7 @@ fn block_on_write_to_file() {
     use std::os::fd::AsRawFd;
 
     use coio::runtime::write;
+    use coio::runtime::write_buffer;
 
     let mut file = tmpfile();
     let fd = file.as_raw_fd();
@@ -326,7 +327,10 @@ fn block_on_write_to_file() {
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let n = write(ctx, fd, b"hello".to_vec()).await.unwrap();
+            let mut wb = write_buffer(ctx).unwrap();
+            wb.as_mut()[..5].copy_from_slice(b"hello");
+            wb.set_len(5);
+            let n = write(ctx, fd, wb).await.unwrap();
             assert_eq!(n, 5);
         },
         fd,
@@ -339,6 +343,45 @@ fn block_on_write_to_file() {
 }
 
 #[test]
+fn block_on_write_full_slot() {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::write;
+    use coio::runtime::write_buffer;
+
+    // The whole slot (buf_size) can be used for a single write.
+    let mut file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        buf_count: 4,
+        buf_size: 16,
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let mut wb = write_buffer(ctx).unwrap();
+            assert_eq!(wb.capacity(), 16);
+            wb.as_mut().fill(0xAB);
+            wb.set_len(16);
+            let n = write(ctx, fd, wb).await.unwrap();
+            assert_eq!(n, 16);
+        },
+        fd,
+    );
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, [0xAB; 16]);
+}
+
+#[test]
 fn block_on_write_many_recycles() {
     use std::io::Read;
     use std::io::Seek;
@@ -346,6 +389,7 @@ fn block_on_write_many_recycles() {
     use std::os::fd::AsRawFd;
 
     use coio::runtime::write;
+    use coio::runtime::write_buffer;
 
     // More writes than the pool holds, exercising slot recycling.
     // Writes use an absolute offset of 0, so each write overwrites the file.
@@ -362,8 +406,11 @@ fn block_on_write_many_recycles() {
         rt,
         |ctx, _rt, fd| async move {
             for i in 0..8u32 {
-                let payload = format!("chunk{i:03}").into_bytes();
-                let n = write(ctx, fd, payload).await.unwrap();
+                let mut wb = write_buffer(ctx).unwrap();
+                let payload = format!("chunk{i:03}");
+                wb.as_mut()[..8].copy_from_slice(payload.as_bytes());
+                wb.set_len(8);
+                let n = write(ctx, fd, wb).await.unwrap();
                 assert_eq!(n, 8);
             }
         },
@@ -374,30 +421,4 @@ fn block_on_write_many_recycles() {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"chunk007");
-}
-
-#[test]
-fn block_on_write_oversized_errors() {
-    use std::os::fd::AsRawFd;
-
-    use coio::runtime::write;
-
-    let file = tmpfile();
-    let fd = file.as_raw_fd();
-
-    let rt = RuntimeParams {
-        tasks_capacity: 4,
-        ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
-    };
-    block_on(
-        rt,
-        |ctx, _rt, fd| async move {
-            let payload = vec![0xAB; 20];
-            let err = write(ctx, fd, payload).await.unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
-        },
-        fd,
-    );
 }
