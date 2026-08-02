@@ -1,94 +1,83 @@
-//! Fixed-buffer write slab (`IORING_REGISTER_BUFFERS`) support.
+//! Fixed-buffer write support (`IORING_REGISTER_BUFFERS`).
 //!
-//! A [`WriteBufferPool`] owns a single contiguous slab split into fixed-size
-//! slots. The caller must [`WriteBufferPool::register`] it with an `io_uring`
-//! instance before use and [`WriteBufferPool::unregister`] it before the ring
-//! is closed. Writes submitted with `IORING_OP_WRITE_FIXED` reference a slot
-//! directly; a [`WriteBuffer`] owns a slot and releases it back to the pool on
-//! drop.
+//! The runtime registers its whole shared buffer slab with the `io_uring` as
+//! fixed buffer index 0. A [`WriteBufferPool`] describes one level of that
+//! slab: a free stack of local slot ids for the level's equal-sized slots. A
+//! [`WriteBuffer`] owns a slot and releases it back to the pool on drop;
+//! writes submitted with `IORING_OP_WRITE_FIXED` reference a slot's address
+//! directly.
 
 #![allow(dead_code)]
 
-use std::io;
+use core::num::NonZeroU32;
 use std::ptr::NonNull;
 
-use io_uring::IoUring;
-
+use crate::levels::bid_level;
+use crate::levels::bid_local;
 use crate::runtime::active_gen_matches;
 use crate::runtime::with_runtime;
 
 pub struct WriteBufferPool {
-    slot_count: u16,
-    slot_size: u32,
-    slab: Vec<u8>,
-    free: Vec<u16>,
+    size: u32,
+    /// Byte offset of this level's first slot within the shared slab.
+    base_offset: u32,
+    /// Start of the shared slab this level's slots live in.
+    slab_base: NonNull<u8>,
+    free: Vec<u32>,
 }
 
 impl WriteBufferPool {
-    /// Allocates a slab of `slot_count` slots of `slot_size` bytes each,
-    /// without registering it with any `io_uring`. Call
-    /// [`WriteBufferPool::register`] to publish the slab to a ring.
-    pub fn new(slot_count: u16, slot_size: u32) -> Self {
-        assert!(slot_count > 0);
-        assert!(slot_size > 0);
+    /// Creates a free stack of `count` slots of `size` bytes each, backed by
+    /// the slot range `[base_offset, base_offset + count*size)` of the
+    /// caller-owned slab at `slab_base`. The slab is registered with the ring
+    /// once, by the runtime.
+    pub(crate) fn new(slab_base: NonNull<u8>, base_offset: usize, size: u32, count: u32) -> Self {
+        assert!(size > 0);
+        assert!(count > 0);
 
-        let slab = vec![0u8; slot_count as usize * slot_size as usize];
         // Seed the free stack so the first acquire returns slot 0.
-        let mut free = Vec::with_capacity(slot_count as usize);
-        free.extend((0..slot_count).rev());
+        let mut free = Vec::with_capacity(count as usize);
+        free.extend((0..count).rev());
 
         Self {
-            slot_count,
-            slot_size,
-            slab,
+            size,
+            base_offset: base_offset as u32,
+            slab_base,
             free,
         }
     }
 
-    /// Registers the whole slab with `ring` as fixed buffer index 0. Must be
-    /// called before `WriteFixed` submissions can reference the slab.
-    pub fn register(&self, ring: &IoUring) -> io::Result<()> {
-        let iovec = libc::iovec {
-            iov_base: self.slab.as_ptr().cast_mut().cast(),
-            iov_len: self.slab.len(),
-        };
-        unsafe { ring.submitter().register_buffers(&[iovec]) }
-    }
-
-    /// Unregisters the slab from `ring`. Must be called before the pool is
-    /// dropped and the ring is closed.
-    pub fn unregister(&self, ring: &IoUring) -> io::Result<()> {
-        ring.submitter().unregister_buffers()
-    }
-
-    pub fn slot_count(&self) -> u16 {
-        self.slot_count
-    }
-
     pub fn slot_size(&self) -> u32 {
-        self.slot_size
+        self.size
     }
 
-    pub fn acquire(&mut self) -> Option<u16> {
+    /// The byte offset of slot `local` within the shared slab.
+    pub(crate) fn slot_offset(&self, local: u32) -> u32 {
+        self.base_offset + local * self.size
+    }
+
+    pub fn acquire(&mut self) -> Option<u32> {
         self.free.pop()
     }
 
-    pub fn release(&mut self, id: u16) {
-        self.free.push(id);
+    pub fn release(&mut self, local: u32) {
+        self.free.push(local);
     }
 
-    pub fn get_slice_mut(&mut self, id: u16) -> &mut [u8] {
-        let start = id as usize * self.slot_size as usize;
-        &mut self.slab[start..start + self.slot_size as usize]
+    pub fn get_slice_mut(&mut self, local: u32) -> &mut [u8] {
+        let start = self.slot_offset(local) as usize;
+        unsafe {
+            core::slice::from_raw_parts_mut(self.slab_base.as_ptr().add(start), self.size as usize)
+        }
     }
 
-    /// Returns a raw pointer to the start of slot `id`'s slab memory.
-    pub fn slot_ptr(&self, id: u16) -> NonNull<u8> {
+    /// Returns a raw pointer to the start of slot `local`'s slab memory.
+    pub fn slot_ptr(&self, local: u32) -> NonNull<u8> {
         unsafe {
             NonNull::new_unchecked(
-                self.slab
+                self.slab_base
                     .as_ptr()
-                    .add(id as usize * self.slot_size as usize) as *mut u8,
+                    .add(self.slot_offset(local) as usize),
             )
         }
     }
@@ -106,29 +95,29 @@ impl WriteBufferPool {
 /// through [`WriteBuffer::as_mut`], records the filled length with
 /// [`WriteBuffer::set_len`], then hands the buffer to
 /// [`crate::runtime::write`], which submits it without copying. The slot is
-/// recycled when the buffer is dropped. Like [`crate::ReadBuffer`], the pool
+/// recycled when the buffer is dropped. Like [`crate::ReadBuffer`], the slab
 /// is reached through the thread-local runtime pointer, guarded by the
 /// generation the buffer was created in: a `WriteBuffer` dropped after its
 /// runtime has shut down skips recycling instead of touching freed memory.
 pub struct WriteBuffer {
-    ptr: NonNull<u8>,
+    offset: u32,
+    bid: u32,
     len: u32,
-    bid: u16,
-    generation: u64,
+    generation: NonZeroU32,
 }
 
 impl WriteBuffer {
-    pub(crate) fn new(ptr: NonNull<u8>, bid: u16, generation: u64) -> Self {
+    pub(crate) fn new(offset: u32, bid: u32, generation: NonZeroU32) -> Self {
         Self {
-            ptr,
-            len: 0,
+            offset,
             bid,
+            len: 0,
             generation,
         }
     }
 
-    pub(crate) fn ptr(&self) -> NonNull<u8> {
-        self.ptr
+    pub(crate) fn offset(&self) -> u32 {
+        self.offset
     }
 
     /// Returns the slot size; the maximum number of bytes that can be written.
@@ -137,7 +126,10 @@ impl WriteBuffer {
             active_gen_matches(self.generation),
             "capacity() called outside the runtime that owns this buffer"
         );
-        with_runtime(|r| r.write_pool.slot_size())
+        with_runtime(|r| {
+            let level = bid_level(self.bid) as usize;
+            r.write_pools[level].slot_size()
+        })
     }
 
     /// Returns the number of bytes marked as filled via
@@ -155,13 +147,31 @@ impl WriteBuffer {
     /// actually written before submitting.
     #[allow(clippy::should_implement_trait)]
     pub fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity() as _) }
+        assert!(
+            active_gen_matches(self.generation),
+            "as_mut() called outside the runtime that owns this buffer"
+        );
+        with_runtime(|r| {
+            let level = bid_level(self.bid) as usize;
+            let capacity = r.write_pools[level].slot_size() as usize;
+            let ptr = unsafe { r.slab.as_ptr().cast_mut().add(self.offset as usize) };
+            unsafe { core::slice::from_raw_parts_mut(ptr, capacity) }
+        })
     }
 
     /// Returns the filled region `[0, len)`.
     #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as _) }
+        assert!(
+            active_gen_matches(self.generation),
+            "as_ref() called outside the runtime that owns this buffer"
+        );
+        with_runtime(|r| unsafe {
+            core::slice::from_raw_parts(
+                r.slab.as_ptr().add(self.offset as usize),
+                self.len as usize,
+            )
+        })
     }
 
     /// Sets the number of filled bytes. Panics if `new_len` exceeds
@@ -182,7 +192,9 @@ impl WriteBuffer {
 
     fn recycle(&mut self) {
         if active_gen_matches(self.generation) {
-            with_runtime(|r| r.write_pool.release(self.bid));
+            let level = bid_level(self.bid) as usize;
+            let local = bid_local(self.bid);
+            with_runtime(|r| r.write_pools[level].release(local));
         }
     }
 }
@@ -198,8 +210,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_buffer_is_16_bytes_with_niche() {
+        assert_eq!(size_of::<WriteBuffer>(), 16);
+        assert_eq!(size_of::<Option<WriteBuffer>>(), 16);
+    }
+
+    fn make_pool(count: u32, size: u32) -> (WriteBufferPool, Vec<u8>) {
+        let mut slab = vec![0u8; count as usize * size as usize];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        (WriteBufferPool::new(base, 0, size, count), slab)
+    }
+
+    #[test]
     fn acquire_release_roundtrip() {
-        let mut pool = WriteBufferPool::new(4, 16);
+        let (mut pool, _slab) = make_pool(4, 16);
         let a = pool.acquire().unwrap();
         let b = pool.acquire().unwrap();
         assert_ne!(a, b);
@@ -209,7 +233,7 @@ mod tests {
 
     #[test]
     fn acquire_exhaustion() {
-        let mut pool = WriteBufferPool::new(4, 16);
+        let (mut pool, _slab) = make_pool(4, 16);
         for _ in 0..4 {
             assert!(pool.acquire().is_some());
         }
@@ -220,7 +244,7 @@ mod tests {
 
     #[test]
     fn get_slice_mut_writes_within_slot() {
-        let mut pool = WriteBufferPool::new(2, 8);
+        let (mut pool, _slab) = make_pool(2, 8);
         let slot = pool.acquire().unwrap();
         pool.get_slice_mut(slot)[..5].copy_from_slice(b"hello");
         let back = pool.get_slice_mut(slot);
@@ -230,7 +254,7 @@ mod tests {
 
     #[test]
     fn slots_are_isolated() {
-        let mut pool = WriteBufferPool::new(2, 8);
+        let (mut pool, _slab) = make_pool(2, 8);
         let a = pool.acquire().unwrap();
         let b = pool.acquire().unwrap();
         pool.get_slice_mut(a)[0] = 1;

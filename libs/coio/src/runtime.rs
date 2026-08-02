@@ -1,12 +1,19 @@
 use core::cell::Cell;
 use core::future::Future;
+use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
 use std::io;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 
+use crate::levels::DEFAULT_LEVELS;
+use crate::levels::Level;
+use crate::levels::layout_levels;
+use crate::levels::level_for;
+use crate::levels::pack_bid;
 use crate::pbuf::ProvidedBufferPool;
 use crate::pbuf::ReadBuffer;
 use crate::task::IoState;
@@ -18,7 +25,7 @@ use crate::wbuf::WriteBufferPool;
 
 thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
-    static ACTIVE_GEN: Cell<u64> = const { Cell::new(0) };
+    static ACTIVE_GEN: Cell<NonZeroU32> = const { Cell::new(NonZeroU32::new(1).unwrap()) };
     static CURRENT_RUNTIME: Cell<*mut Runtime> = const { Cell::new(core::ptr::null_mut()) };
 }
 
@@ -26,23 +33,23 @@ pub(crate) fn is_running() -> bool {
     RUNNING.with(|c| c.get())
 }
 
-pub(crate) fn active_gen_matches(generation: u64) -> bool {
+pub(crate) fn active_gen_matches(generation: NonZeroU32) -> bool {
     active_gen() == Some(generation)
 }
 
-pub(crate) fn active_gen() -> Option<u64> {
-    RUNNING
-        .with(|c| c.get())
-        .then_some(ACTIVE_GEN.with(|c| c.get()))
+pub(crate) fn active_gen() -> Option<NonZeroU32> {
+    if !RUNNING.with(|c| c.get()) {
+        return None;
+    }
+    Some(ACTIVE_GEN.with(|c| c.get()))
 }
 
 pub(crate) fn enter_active_gen() -> ActiveGenGuard {
     assert!(!RUNNING.with(|c| c.get()));
     RUNNING.with(|c| c.set(true));
     ACTIVE_GEN.with(|c| {
-        let g = c.get().wrapping_add(1);
-        c.set(g);
-        ActiveGenGuard(g)
+        c.update(|x| x.checked_add(1).expect("active gen overflow"));
+        ActiveGenGuard(c.get())
     })
 }
 
@@ -50,10 +57,10 @@ pub(crate) fn exit_active_gen() {
     RUNNING.with(|c| c.set(false));
 }
 
-pub(crate) struct ActiveGenGuard(u64);
+pub(crate) struct ActiveGenGuard(NonZeroU32);
 
 impl ActiveGenGuard {
-    pub fn get(&self) -> u64 {
+    pub fn get(&self) -> NonZeroU32 {
         self.0
     }
 }
@@ -83,14 +90,19 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 }
 
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
-/// runtime's provided buffer pool. Returns at most `buf_size` bytes (the
-/// kernel caps the transfer at the selected buffer's size).
+/// runtime's provided buffer pools. The buffer is drawn from the smallest
+/// level whose slot size is at least `max_len`; `max_len` larger than the
+/// largest level's slot size fails with `EFBIG`.
 ///
 /// The returned [`ReadBuffer`] borrows memory from the pool: its slot is
 /// recycled when the buffer is dropped, so the runtime must still be alive
 /// while the buffer is in use.
 pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<ReadBuffer> {
-    let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
+    let bgid = ctx.with_runtime(|r| -> io::Result<u16> {
+        let level = level_for(&r.read_levels, max_len)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        Ok(level as u16)
+    })?;
 
     let slot = ctx
         .with_task(|task| {
@@ -120,25 +132,34 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Rea
     }
 
     let generation = active_gen().expect("read called outside an active runtime");
-    let bid = ctx.with_task(|task| task.io.bid(slot));
-    let ptr = ctx.with_runtime(|r| r.buffer_pool.slot_ptr(bid));
+    let level = bgid as usize;
+    let local = ctx.with_task(|task| task.io.bid(slot));
+    let offset = ctx.with_runtime(|r| r.buffer_pools[level].slot_offset(local));
+    let bid = pack_bid(level as u32, u32::from(local));
     ctx.with_task(|task| task.io.reset_slot(slot));
 
-    Ok(ReadBuffer::new(ptr, result as _, bid, generation))
+    Ok(ReadBuffer::new(offset, bid, result as u32, generation))
 }
 
 /// Acquires a zero-copy write buffer backed by a slot from the runtime's fixed
-/// write buffer slab. The buffer's [`WriteBuffer::capacity`] is the pool's
-/// slot size; the caller fills it via [`WriteBuffer::as_mut`] and records the
-/// length with [`WriteBuffer::set_len`] before passing it to [`write`]. The
-/// slot is recycled when the buffer is dropped.
-pub fn write_buffer(ctx: TaskContext) -> io::Result<WriteBuffer> {
+/// write buffer slab. The buffer is drawn from the smallest level whose slot
+/// size is at least `size`; `size` larger than the largest level's slot size
+/// fails with `EFBIG`. The buffer's [`WriteBuffer::capacity`] is the chosen
+/// level's slot size; the caller fills it via [`WriteBuffer::as_mut`] and
+/// records the length with [`WriteBuffer::set_len`] before passing it to
+/// [`write`]. The slot is recycled when the buffer is dropped.
+pub fn write_buffer(ctx: TaskContext, size: usize) -> io::Result<WriteBuffer> {
     let generation = active_gen().expect("write_buffer called outside an active runtime");
-    let bid = ctx
-        .with_runtime(|r| r.write_pool.acquire())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
-    let ptr = ctx.with_runtime(|r| r.write_pool.slot_ptr(bid));
-    Ok(WriteBuffer::new(ptr, bid, generation))
+    let (bid, offset) = ctx.with_runtime(|r| -> io::Result<(u32, u32)> {
+        let level = level_for(&r.write_levels, size)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        let local = r.write_pools[level]
+            .acquire()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+        let offset = r.write_pools[level].slot_offset(local);
+        Ok((pack_bid(level as u32, local), offset))
+    })?;
+    Ok(WriteBuffer::new(offset, bid, generation))
 }
 
 /// Writes the contents of `wb` to `fd` via `IORING_OP_WRITE_FIXED`. The
@@ -150,13 +171,14 @@ pub async fn write(ctx: TaskContext, fd: RawFd, wb: WriteBuffer) -> io::Result<u
         .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
 
     let len = wb.len();
-    let ptr = wb.ptr().as_ptr();
+    let addr =
+        ctx.with_runtime(|r| unsafe { r.slab.as_ptr().cast_mut().add(wb.offset() as usize) });
 
     ctx.with_task(|task| task.io.set_submitted(slot, true));
 
     let entry = io_uring::opcode::WriteFixed::new(
         io_uring::types::Fd(fd),
-        ptr,
+        addr,
         len as u32,
         0, // the whole slab is registered as fixed buffer index 0
     )
@@ -229,19 +251,24 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
 pub(crate) struct Runtime {
     pub tasks: TaskSlab,
     pub wakeups: Vec<u32>,
-    pub buffer_pool: ProvidedBufferPool,
-    pub write_pool: WriteBufferPool,
+    pub slab: Vec<u8>,
+    pub read_levels: Vec<Level>,
+    pub buffer_pools: Vec<ProvidedBufferPool>,
+    pub write_levels: Vec<Level>,
+    pub write_pools: Vec<WriteBufferPool>,
     pub ring: io_uring::IoUring,
     pub make_fut: *const (),
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // Unregister the provided buffer ring and the fixed write buffer slab
-        // while the io_uring fd is still open; the pools are dropped
-        // afterwards along with the other fields.
-        let _ = self.buffer_pool.unregister(&self.ring);
-        let _ = self.write_pool.unregister(&self.ring);
+        // Unregister every provided buffer ring and the fixed write buffer
+        // slab while the io_uring fd is still open; the pools and slabs are
+        // dropped afterwards along with the other fields.
+        for pool in &self.buffer_pools {
+            let _ = pool.unregister(&self.ring);
+        }
+        let _ = self.ring.submitter().unregister_buffers();
     }
 }
 
@@ -285,22 +312,102 @@ impl Runtime {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct RuntimeParams {
+pub struct RuntimeParams<'a> {
     pub tasks_capacity: u32,
     pub ring_entries: u32,
-    pub buf_count: u16,
-    pub buf_size: u32,
+    /// Per-direction buffer levels for reads. Each `count` must be a power of
+    /// two no larger than 32768.
+    pub read_levels: &'a [Level],
+    /// Per-direction buffer levels for writes.
+    pub write_levels: &'a [Level],
 }
 
-impl Default for RuntimeParams {
+impl<'a> Default for RuntimeParams<'a> {
     fn default() -> Self {
         Self {
             tasks_capacity: 1024,
             ring_entries: 1024,
-            buf_count: 1024,
-            buf_size: 4096,
+            read_levels: &DEFAULT_LEVELS,
+            write_levels: &DEFAULT_LEVELS,
         }
     }
+}
+
+/// The shared buffer slab plus the level tables and pools built over it.
+type BuiltPools = (
+    Vec<u8>,
+    Vec<Level>,
+    Vec<ProvidedBufferPool>,
+    Vec<Level>,
+    Vec<WriteBufferPool>,
+);
+
+/// Builds both directions' pools over one shared slab: the read levels occupy
+/// the start of the slab, the write levels follow them. Each read level gets a
+/// provided-buffer ring registered under `bgid = level index`; the write
+/// levels get free-stack pools, and the whole slab is registered once as fixed
+/// buffer index 0 so writes can address any slot by its absolute offset.
+/// Returns the slab, both sorted level tables, and both pool lists.
+fn build_pools(ring: &io_uring::IoUring, read_spec: &[Level], write_spec: &[Level]) -> BuiltPools {
+    let read_layout = layout_levels(read_spec, true);
+    let write_layout = layout_levels(write_spec, false);
+    let read_total = read_layout.last().map(|l| l.total).unwrap();
+    let total = read_total + write_layout.last().map(|l| l.total).unwrap();
+    assert!(
+        total <= u64::from(u32::MAX),
+        "the combined read+write slab exceeds the 4 GiB offset range"
+    );
+    let mut slab = vec![0u8; total as usize];
+    let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+
+    let read_levels: Vec<Level> = read_layout
+        .iter()
+        .map(|l| Level {
+            size: l.size,
+            count: l.count,
+        })
+        .collect();
+    let mut buffer_pools = Vec::with_capacity(read_layout.len());
+    for (i, l) in read_layout.iter().enumerate() {
+        let pool = ProvidedBufferPool::new(
+            base,
+            l.base_offset as usize,
+            l.count as u16,
+            l.size,
+            i as u16,
+        );
+        pool.register(ring)
+            .expect("failed to register the provided buffer ring");
+        buffer_pools.push(pool);
+    }
+
+    let write_levels: Vec<Level> = write_layout
+        .iter()
+        .map(|l| Level {
+            size: l.size,
+            count: l.count,
+        })
+        .collect();
+    let write_pools = write_layout
+        .iter()
+        .map(|l| {
+            WriteBufferPool::new(
+                base,
+                read_total as usize + l.base_offset as usize,
+                l.size,
+                l.count,
+            )
+        })
+        .collect();
+
+    let iovec = libc::iovec {
+        iov_base: slab.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: slab.len(),
+    };
+    unsafe { ring.submitter().register_buffers(&[iovec]) }
+        .expect("failed to register the buffer slab");
+
+    (slab, read_levels, buffer_pools, write_levels, write_pools)
 }
 
 pub fn block_on_default<S, F, T>(make_fut: S, user_data: T)
@@ -311,7 +418,7 @@ where
     block_on(RuntimeParams::default(), make_fut, user_data)
 }
 
-pub fn block_on<S, F, T>(params: RuntimeParams, make_fut: S, user_data: T)
+pub fn block_on<S, F, T>(params: RuntimeParams<'_>, make_fut: S, user_data: T)
 where
     S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
     F: Future<Output = ()> + 'static,
@@ -327,24 +434,20 @@ where
             io_uring::IoUring::new(params.ring_entries).expect("failed to create io_uring")
         });
 
-    let pool = ProvidedBufferPool::new(params.buf_count, params.buf_size);
-    let write_pool = WriteBufferPool::new(params.buf_count, params.buf_size);
+    let (slab, read_levels, buffer_pools, write_levels, write_pools) =
+        build_pools(&ring, params.read_levels, params.write_levels);
 
     let mut rt = Runtime {
         tasks: TaskSlab::new::<F>(params.tasks_capacity),
         wakeups: Vec::new(),
-        buffer_pool: pool,
-        write_pool,
+        slab,
+        read_levels,
+        buffer_pools,
+        write_levels,
+        write_pools,
         ring,
         make_fut: &raw const make_fut as *const (),
     };
-
-    rt.buffer_pool
-        .register(&rt.ring)
-        .expect("failed to register the provided buffer pool");
-    rt.write_pool
-        .register(&rt.ring)
-        .expect("failed to register the write buffer pool");
 
     let rt_ptr: *mut Runtime = &mut rt;
     set_current_runtime(rt_ptr);
@@ -451,7 +554,7 @@ where
 
 #[derive(Debug)]
 pub struct RuntimeContext<T> {
-    generation: u64,
+    generation: NonZeroU32,
     spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
 }
 
@@ -482,27 +585,50 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
+    use crate::levels::Level;
+    use crate::levels::pack_bid;
+    use crate::pbuf::ReadBuffer;
     use crate::task::IoUserData;
     use crate::task::Task;
     use crate::task::TaskSlab;
+    use crate::wbuf::WriteBuffer;
 
     fn test_runtime_data(capacity: u32) -> Runtime {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let pool = ProvidedBufferPool::new(4, 16);
-        pool.register(&ring).unwrap();
-        let write_pool = WriteBufferPool::new(4, 16);
-        write_pool.register(&ring).unwrap();
+        let (slab, read_levels, buffer_pools, write_levels, write_pools) =
+            build_pools(&ring, &[Level { size: 16, count: 4 }], &[Level {
+                size: 16,
+                count: 4,
+            }]);
         Runtime {
             tasks: TaskSlab::new::<Ready<()>>(capacity),
             wakeups: Vec::new(),
-            buffer_pool: pool,
-            write_pool,
+            slab,
+            read_levels,
+            buffer_pools,
+            write_levels,
+            write_pools,
             ring,
             make_fut: core::ptr::null(),
         }
     }
 
     // ── IoState (inline) ──────────────────────────────────────────────
+
+    #[test]
+    fn shared_slab_write_region_follows_read_region() {
+        let ring = io_uring::IoUring::new(8).unwrap();
+        let (_slab, _rl, read_pools, _wl, write_pools) =
+            build_pools(&ring, &[Level { size: 16, count: 4 }], &[Level {
+                size: 32,
+                count: 2,
+            }]);
+        // The read region is 4 x 16 = 64 bytes; the write level starts right
+        // after it in the same slab.
+        assert_eq!(read_pools[0].slot_offset(3), 48);
+        assert_eq!(write_pools[0].slot_offset(0), 64);
+        assert_eq!(write_pools[0].slot_offset(1), 96);
+    }
 
     #[test]
     fn io_state_free_slot_exhaustion() {
@@ -627,12 +753,13 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let generation = _gen.get();
-        let ptr = data.buffer_pool.slot_ptr(1);
-        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+        let local = 1u16;
+        let offset = data.buffer_pools[0].slot_offset(local);
+        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
         drop(buf);
-        assert_eq!(data.buffer_pool.ring_tail(), 5);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 5);
     }
 
     #[test]
@@ -649,13 +776,14 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get() + 1;
-        let ptr = data.buffer_pool.slot_ptr(1);
-        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+        let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
+        let local = 1u16;
+        let offset = data.buffer_pools[0].slot_offset(local);
+        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
         drop(buf);
-        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
     }
 
     #[test]
@@ -673,13 +801,14 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let generation = _gen.get();
-        let ptr = data.buffer_pool.slot_ptr(1);
-        let buf = crate::pbuf::ReadBuffer::new(ptr, 5, 1, generation);
+        let local = 1u16;
+        let offset = data.buffer_pools[0].slot_offset(local);
+        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pool.ring_tail(), 4);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
         let bytes = buf.into_vec();
         assert_eq!(bytes.len(), 5);
-        assert_eq!(data.buffer_pool.ring_tail(), 5);
+        assert_eq!(data.buffer_pools[0].ring_tail(), 5);
     }
 
     // ── WriteBuffer ───────────────────────────────────────────────────
@@ -699,12 +828,13 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let generation = _gen.get();
-        let bid = data.write_pool.acquire().unwrap();
-        let buf = crate::wbuf::WriteBuffer::new(data.write_pool.slot_ptr(bid), bid, generation);
+        let local = data.write_pools[0].acquire().unwrap();
+        let offset = data.write_pools[0].slot_offset(local);
+        let buf = WriteBuffer::new(offset, pack_bid(0, local), generation);
 
-        assert_eq!(data.write_pool.free_count(), 3);
+        assert_eq!(data.write_pools[0].free_count(), 3);
         drop(buf);
-        assert_eq!(data.write_pool.free_count(), 4);
+        assert_eq!(data.write_pools[0].free_count(), 4);
     }
 
     #[test]
@@ -721,13 +851,14 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let bid = data.write_pool.acquire().unwrap();
-        let generation = _gen.get() + 1;
-        let buf = crate::wbuf::WriteBuffer::new(data.write_pool.slot_ptr(bid), bid, generation);
+        let local = data.write_pools[0].acquire().unwrap();
+        let offset = data.write_pools[0].slot_offset(local);
+        let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
+        let buf = WriteBuffer::new(offset, pack_bid(0, local), generation);
 
-        assert_eq!(data.write_pool.free_count(), 3);
+        assert_eq!(data.write_pools[0].free_count(), 3);
         drop(buf);
-        assert_eq!(data.write_pool.free_count(), 3);
+        assert_eq!(data.write_pools[0].free_count(), 3);
     }
 
     #[test]
@@ -744,13 +875,13 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.write_pool.free_count();
-        let buf = write_buffer(ctx).unwrap();
+        let before = data.write_pools[0].free_count();
+        let buf = write_buffer(ctx, 5).unwrap();
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 0);
-        assert_eq!(data.write_pool.free_count(), before - 1);
+        assert_eq!(data.write_pools[0].free_count(), before - 1);
         drop(buf);
-        assert_eq!(data.write_pool.free_count(), before);
+        assert_eq!(data.write_pools[0].free_count(), before);
     }
 
     #[test]
@@ -767,7 +898,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut buf = write_buffer(ctx).unwrap();
+        let mut buf = write_buffer(ctx, 5).unwrap();
         assert_eq!(buf.as_mut().len(), 16);
         buf.as_mut()[..5].copy_from_slice(b"hello");
         buf.set_len(5);
@@ -797,7 +928,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut buf = write_buffer(ctx).unwrap();
+        let mut buf = write_buffer(ctx, 5).unwrap();
         buf.set_len(17);
     }
 
@@ -1046,7 +1177,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let bgid = ctx.with_runtime(|r| r.buffer_pool.bgid());
+        let bgid = ctx.with_runtime(|r| r.buffer_pools[0].bgid());
         assert_eq!(bgid, 0);
     }
 

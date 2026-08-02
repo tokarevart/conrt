@@ -1,3 +1,4 @@
+use coio::Level;
 use coio::runtime::RuntimeContext;
 use coio::runtime::RuntimeParams;
 use coio::runtime::block_on;
@@ -18,8 +19,8 @@ fn block_on_trivial() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(rt, |_, _, _data: ()| async move {}, ());
 }
@@ -29,8 +30,8 @@ fn block_on_with_spawn() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -48,8 +49,8 @@ fn block_on_spawn_chain() {
     let rt = RuntimeParams {
         tasks_capacity: 16,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -76,8 +77,8 @@ fn stale_runtime_context_panics_outside_block_on() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -110,8 +111,8 @@ fn stale_task_context_panics_outside_block_on() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -144,8 +145,8 @@ fn stale_runtime_context_from_previous_run_panics() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -158,8 +159,8 @@ fn stale_runtime_context_from_previous_run_panics() {
     let rt2 = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt2,
@@ -197,8 +198,8 @@ fn block_on_read_from_file() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -227,8 +228,8 @@ fn block_on_read_full_buffer() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -259,8 +260,8 @@ fn block_on_read_many_recycles() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -291,8 +292,8 @@ fn block_on_read_into_vec() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -321,13 +322,13 @@ fn block_on_write_to_file() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = write_buffer(ctx).unwrap();
+            let mut wb = write_buffer(ctx, 5).unwrap();
             wb.as_mut()[..5].copy_from_slice(b"hello");
             wb.set_len(5);
             let n = write(ctx, fd, wb).await.unwrap();
@@ -359,13 +360,13 @@ fn block_on_write_full_slot() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = write_buffer(ctx).unwrap();
+            let mut wb = write_buffer(ctx, 16).unwrap();
             assert_eq!(wb.capacity(), 16);
             wb.as_mut().fill(0xAB);
             wb.set_len(16);
@@ -399,14 +400,14 @@ fn block_on_write_many_recycles() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        buf_count: 4,
-        buf_size: 16,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
             for i in 0..8u32 {
-                let mut wb = write_buffer(ctx).unwrap();
+                let mut wb = write_buffer(ctx, 8).unwrap();
                 let payload = format!("chunk{i:03}");
                 wb.as_mut()[..8].copy_from_slice(payload.as_bytes());
                 wb.set_len(8);
@@ -421,4 +422,161 @@ fn block_on_write_many_recycles() {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"chunk007");
+}
+
+#[test]
+fn block_on_read_uses_proportional_levels() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::read;
+
+    // Two levels: 8-byte and 64-byte slots. A 5-byte read fits the 8-byte
+    // level, a 16-byte read falls through to the 64-byte level.
+    let mut file = tmpfile();
+    file.write_all(b"hello world").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 8, count: 4 }, Level { size: 64, count: 2 }],
+        write_levels: &[Level { size: 8, count: 4 }],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let data = read(ctx, fd, 5).await.unwrap();
+            assert_eq!(data.as_ref(), b"hello");
+            assert_eq!(data.len(), 5);
+
+            let data = read(ctx, fd, 16).await.unwrap();
+            assert_eq!(data.as_ref(), b"hello world");
+            assert_eq!(data.len(), 11);
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_write_uses_proportional_levels() {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::write;
+    use coio::runtime::write_buffer;
+
+    // An 11-byte write needs the 64-byte level; its capacity is 64.
+    let mut file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 8, count: 4 }],
+        write_levels: &[Level { size: 8, count: 4 }, Level { size: 64, count: 2 }],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let mut wb = write_buffer(ctx, 11).unwrap();
+            assert_eq!(wb.capacity(), 64);
+            wb.as_mut()[..11].copy_from_slice(b"hello world");
+            wb.set_len(11);
+            let n = write(ctx, fd, wb).await.unwrap();
+            assert_eq!(n, 11);
+        },
+        fd,
+    );
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello world");
+}
+
+#[test]
+fn block_on_read_oversized_errors() {
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::read;
+
+    let file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let err = read(ctx, fd, 17).await.err().unwrap();
+            assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_write_buffer_oversized_errors() {
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::write_buffer;
+
+    let file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, _fd| async move {
+            let err = write_buffer(ctx, 17).err().unwrap();
+            assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_read_with_default_levels() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use coio::runtime::read;
+
+    // The default level table (two 2 MiB slabs) is used when the params are
+    // left as `..Default::default()`.
+    let mut file = tmpfile();
+    file.write_all(b"hello world").unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        ..Default::default()
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let data = read(ctx, fd, 5).await.unwrap();
+            assert_eq!(data.as_ref(), b"hello");
+        },
+        fd,
+    );
 }

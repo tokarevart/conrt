@@ -1,15 +1,17 @@
 //! Provided buffer ring (`IORING_REGISTER_PBUF_RING`) support.
 //!
-//! A [`ProvidedBufferPool`] owns a slab of fixed-size data buffers and a
-//! descriptor ring. The caller must [`ProvidedBufferPool::register`] it with an
-//! `io_uring` instance before use and [`ProvidedBufferPool::unregister`] it
-//! before the ring is closed. Reads submitted with `IOSQE_BUFFER_SELECT` let
-//! the kernel pick a buffer from the pool and report which one via
-//! `cqueue::buffer_select`; the caller must then recycle the buffer back into
-//! the pool.
+//! A [`ProvidedBufferPool`] describes one level of buffers: a descriptor ring
+//! for `count` fixed-size slots that live inside the runtime's shared buffer
+//! slab. The pool does not own the slab. The caller must
+//! [`ProvidedBufferPool::register`] it with an `io_uring` instance before use
+//! and [`ProvidedBufferPool::unregister`] it before the ring is closed. Reads
+//! submitted with `IOSQE_BUFFER_SELECT` let the kernel pick a buffer from the
+//! pool and report which one via `cqueue::buffer_select`; the caller must then
+//! recycle the buffer back into the pool.
 
 #![allow(dead_code)]
 
+use core::num::NonZeroU32;
 use core::ops::Deref;
 use std::alloc::Layout;
 use std::alloc::alloc_zeroed;
@@ -21,6 +23,8 @@ use std::sync::atomic::Ordering;
 
 use io_uring::IoUring;
 
+use crate::levels::bid_level;
+use crate::levels::bid_local;
 use crate::runtime::active_gen_matches;
 use crate::runtime::with_runtime;
 
@@ -53,30 +57,40 @@ struct IoUringBufRingHeader {
     tail: AtomicU16,
 }
 
-const BGID: u16 = 0;
-
 pub struct ProvidedBufferPool {
     buf_count: u16,
     buf_size: u32,
-    slab: Vec<u8>,
+    /// Byte offset of this level's first slot within the shared slab.
+    base_offset: u32,
+    /// Start of the shared slab this level's slots live in.
+    slab_base: NonNull<u8>,
+    bgid: u16,
     ring_ptr: NonNull<u8>,
     ring_size: usize,
     tail: u16,
 }
 
 impl ProvidedBufferPool {
-    /// Allocates a slab of `buf_count` buffers of `buf_size` bytes each and
-    /// fills the descriptor ring, without registering it with any `io_uring`.
-    /// Call [`ProvidedBufferPool::register`] to publish the buffers to a ring.
-    /// `buf_count` must be a power of two.
-    pub fn new(buf_count: u16, buf_size: u32) -> Self {
-        assert!(buf_count.is_power_of_two());
-        assert!(buf_count > 0 && buf_count <= 32768);
-        assert!(buf_size > 0);
+    /// Creates a provided-buffer ring for `count` buffers of `size` bytes,
+    /// backed by the slot range `[base_offset, base_offset + count*size)` of
+    /// the caller-owned slab at `slab_base`. Does not register the ring with
+    /// any `io_uring`; call [`ProvidedBufferPool::register`] to publish the
+    /// buffers under `bgid`. `count` must be a power of two.
+    pub fn new(
+        slab_base: NonNull<u8>,
+        base_offset: usize,
+        count: u16,
+        size: u32,
+        bgid: u16,
+    ) -> Self {
+        assert!(count.is_power_of_two());
+        assert!(count > 0 && count <= 32768);
+        assert!(size > 0);
+        assert!(base_offset as u64 <= u64::from(u32::MAX));
 
-        let slab = vec![0u8; buf_count as usize * buf_size as usize];
+        let base_offset = base_offset as u32;
 
-        let ring_size = page_align(buf_count as usize * size_of::<IoUringBuf>());
+        let ring_size = page_align(count as usize * size_of::<IoUringBuf>());
         let ring_layout = Layout::from_size_align(ring_size, PAGE_SIZE).unwrap();
         let ring_raw = unsafe { alloc_zeroed(ring_layout) as *mut IoUringBufRingHeader };
         if ring_raw.is_null() {
@@ -84,27 +98,33 @@ impl ProvidedBufferPool {
         }
 
         let bufs_ptr = ring_raw as *mut IoUringBuf;
-        let bufs = unsafe { std::slice::from_raw_parts_mut(bufs_ptr, buf_count as usize) };
-        for (bid, slot) in bufs.iter_mut().enumerate() {
-            let addr = unsafe { slab.as_ptr().add(bid * buf_size as usize) as u64 };
+        let bufs = unsafe { std::slice::from_raw_parts_mut(bufs_ptr, count as usize) };
+        for (local, slot) in bufs.iter_mut().enumerate() {
+            let addr = unsafe {
+                slab_base
+                    .as_ptr()
+                    .add(base_offset as usize + local * size as usize) as u64
+            };
             *slot = IoUringBuf {
                 addr,
-                len: buf_size,
-                bid: bid as u16,
+                len: size,
+                bid: local as u16,
                 resv: 0,
             };
         }
 
         // Publish the descriptors before advertising the tail to the kernel.
-        unsafe { (*ring_raw).tail.store(buf_count, Ordering::Release) };
+        unsafe { (*ring_raw).tail.store(count, Ordering::Release) };
 
         Self {
-            buf_count,
-            buf_size,
-            slab,
+            buf_count: count,
+            buf_size: size,
+            base_offset,
+            slab_base,
+            bgid,
             ring_ptr: unsafe { NonNull::new_unchecked(ring_raw as *mut u8) },
             ring_size,
-            tail: buf_count,
+            tail: count,
         }
     }
 
@@ -116,7 +136,7 @@ impl ProvidedBufferPool {
             ring.submitter().register_buf_ring_with_flags(
                 self.ring_ptr.as_ptr() as u64,
                 self.buf_count,
-                BGID,
+                self.bgid,
                 0,
             )
         }
@@ -125,22 +145,27 @@ impl ProvidedBufferPool {
     /// Unregisters the pool from `ring`. Must be called before the pool is
     /// dropped and the ring is closed.
     pub fn unregister(&self, ring: &IoUring) -> io::Result<()> {
-        ring.submitter().unregister_buf_ring(BGID)
+        ring.submitter().unregister_buf_ring(self.bgid)
     }
 
     pub fn bgid(&self) -> u16 {
-        BGID
+        self.bgid
     }
 
-    /// Recycles buffer `bid` back to the kernel so it can be selected again.
+    /// The byte offset of slot `local` within the shared slab.
+    pub(crate) fn slot_offset(&self, local: u16) -> u32 {
+        self.base_offset + u32::from(local) * self.buf_size
+    }
+
+    /// Recycles buffer `local` back to the kernel so it can be selected again.
     /// Safe to call out of order, as results are consumed.
-    pub fn recycle_buffer(&mut self, bid: u16) {
+    pub fn recycle_buffer(&mut self, local: u16) {
         let mask = self.buf_count - 1;
         let ring_idx = (self.tail & mask) as usize;
         let buf_addr = unsafe {
-            self.slab
+            self.slab_base
                 .as_ptr()
-                .add(bid as usize * self.buf_size as usize) as u64
+                .add(self.slot_offset(local) as usize) as u64
         };
 
         // `resv` is left untouched: for ring index 0 it overlaps the `tail`
@@ -150,7 +175,7 @@ impl ProvidedBufferPool {
             let slot = bufs_ptr.add(ring_idx);
             (*slot).addr = buf_addr;
             (*slot).len = self.buf_size;
-            (*slot).bid = bid;
+            (*slot).bid = local;
         }
 
         self.tail = self.tail.wrapping_add(1);
@@ -161,19 +186,19 @@ impl ProvidedBufferPool {
         }
     }
 
-    /// Returns the bytes of buffer `bid`. `len` must not exceed `buf_size`.
-    pub fn get_slice(&self, bid: u16, len: usize) -> &[u8] {
-        let start = bid as usize * self.buf_size as usize;
-        &self.slab[start..start + len]
+    /// Returns the bytes of buffer `local`. `len` must not exceed `buf_size`.
+    pub fn get_slice(&self, local: u16, len: usize) -> &[u8] {
+        let start = self.slot_offset(local) as usize;
+        unsafe { core::slice::from_raw_parts(self.slab_base.as_ptr().add(start), len) }
     }
 
-    /// Returns a raw pointer to the start of buffer `bid`'s slab memory.
-    pub fn slot_ptr(&self, bid: u16) -> NonNull<u8> {
+    /// Returns a raw pointer to the start of slot `local`'s slab memory.
+    pub fn slot_ptr(&self, local: u16) -> NonNull<u8> {
         unsafe {
             NonNull::new_unchecked(
-                self.slab
+                self.slab_base
                     .as_ptr()
-                    .add(bid as usize * self.buf_size as usize) as *mut u8,
+                    .add(self.slot_offset(local) as usize),
             )
         }
     }
@@ -196,43 +221,57 @@ impl Drop for ProvidedBufferPool {
 }
 
 /// A zero-copy view of a buffer selected from the runtime's provided buffer
-/// pool by [`crate::runtime::read`].
+/// pools by [`crate::runtime::read`].
 ///
 /// The caller owns the buffer until this value is dropped, at which point the
-/// pool slot is recycled. The pool is reached through the thread-local runtime
+/// pool slot is recycled. The slot is reached through the thread-local runtime
 /// pointer, guarded by the generation the buffer was created in: a
 /// `ReadBuffer` dropped after its runtime has shut down skips recycling
 /// instead of touching freed memory. The data itself must not be read after
 /// the runtime is gone.
 pub struct ReadBuffer {
-    ptr: NonNull<u8>,
+    offset: u32,
+    bid: u32,
     len: u32,
-    bid: u16,
-    generation: u64,
+    generation: NonZeroU32,
 }
 
 impl ReadBuffer {
-    pub(crate) fn new(ptr: NonNull<u8>, len: u32, bid: u16, generation: u64) -> Self {
+    pub(crate) fn new(offset: u32, bid: u32, len: u32, generation: NonZeroU32) -> Self {
         Self {
-            ptr,
-            len,
+            offset,
             bid,
+            len,
             generation,
         }
     }
 
     /// Copies the buffer into an owned `Vec` and recycles the pool slot.
     pub fn into_vec(mut self) -> Vec<u8> {
-        let data =
-            unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }.to_vec();
+        let data = self.data().to_vec();
         self.recycle();
         core::mem::forget(self);
         data
     }
 
+    fn data(&self) -> &[u8] {
+        assert!(
+            active_gen_matches(self.generation),
+            "ReadBuffer used outside the runtime that owns it"
+        );
+        with_runtime(|r| unsafe {
+            core::slice::from_raw_parts(
+                r.slab.as_ptr().add(self.offset as usize),
+                self.len as usize,
+            )
+        })
+    }
+
     fn recycle(&mut self) {
         if active_gen_matches(self.generation) {
-            with_runtime(|r| r.buffer_pool.recycle_buffer(self.bid));
+            let level = bid_level(self.bid) as usize;
+            let local = bid_local(self.bid) as u16;
+            with_runtime(|r| r.buffer_pools[level].recycle_buffer(local));
         }
     }
 }
@@ -247,7 +286,7 @@ impl Deref for ReadBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+        self.data()
     }
 }
 
@@ -260,6 +299,12 @@ impl AsRef<[u8]> for ReadBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_buffer_is_16_bytes_with_niche() {
+        assert_eq!(size_of::<ReadBuffer>(), 16);
+        assert_eq!(size_of::<Option<ReadBuffer>>(), 16);
+    }
 
     fn tmpfile() -> i32 {
         let path = b"/tmp/conrt-pbuf-test.dat\0";
@@ -278,6 +323,7 @@ mod tests {
     fn pbuf_ring_select_and_recycle() {
         const BUF_SIZE: u32 = 16;
         const BUF_COUNT: u16 = 4;
+        const BGID: u16 = 0;
 
         let fd = tmpfile();
         let written = unsafe { libc::write(fd, b"hello world".as_ptr().cast(), 11) };
@@ -285,7 +331,9 @@ mod tests {
         assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
 
         let mut ring = io_uring::IoUring::new(8).unwrap();
-        let mut pool = ProvidedBufferPool::new(BUF_COUNT, BUF_SIZE);
+        let mut slab = vec![0u8; BUF_COUNT as usize * BUF_SIZE as usize];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, BUF_COUNT, BUF_SIZE, BGID);
         pool.register(&ring).unwrap();
 
         let read_entry = || {
