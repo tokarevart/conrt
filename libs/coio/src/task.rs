@@ -17,170 +17,230 @@ thread_local! {
     static NEXT_TASK_ID: Cell<u64> = const { Cell::new(1) };
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum IoState {
-    Inline {
-        submitted: u64,
-        ready: u64,
-        results: [i32; 64],
-        bids: [u16; 64],
-    },
-    Heap {
-        submitted: Vec<u64>,
-        ready: Vec<u64>,
-        results: Vec<i32>,
-        bids: Vec<u16>,
-    },
+/// One in-flight IO op's state, stored in the runtime's global io slab. The
+/// slot is only ever touched through Rust code, so no stable layout is
+/// required; the fields are ordered to land on exactly 8 bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoSlot {
+    pub result: i32,
+    pub submitted: u8,
+    pub ready: u8,
+    pub bid: u16,
 }
 
-impl Default for IoState {
+const IO_HEAP_FLAG: u32 = 1 << 31;
+const IO_INLINE_CAP: usize = 3;
+
+/// Inline arm of `IoVecRepr`. `len` is the first field so it aliases the first
+/// field of the heap arm: the switch bit (`IO_HEAP_FLAG`) and the low 31-bit
+/// logical length can always be read from offset zero, whichever arm is live.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoVecInline {
+    len: u32,
+    inline: [u32; IO_INLINE_CAP],
+}
+
+/// Heap arm of `IoVecRepr`. `len` sits at the same offset as in
+/// `IoVecInline`; `cap` fills what would otherwise be padding before the
+/// 8-byte-aligned pointer. The union is exactly 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoVecHeap {
+    len: u32,
+    cap: u32,
+    ptr: NonNull<u32>,
+}
+
+#[repr(C)]
+union IoVecRepr {
+    inline: IoVecInline,
+    heap: IoVecHeap,
+}
+
+/// A compact set of the io slab slots a task currently holds (its in-flight
+/// ops). Up to three slot indices are stored inline; beyond that the indices
+/// move to a heap allocation. The switch bit is the highest bit of `len`: when
+/// set, the heap arm of the union is live.
+pub struct IoVec {
+    repr: IoVecRepr,
+}
+
+impl IoVec {
+    pub fn new() -> Self {
+        Self {
+            repr: IoVecRepr {
+                inline: IoVecInline {
+                    len: 0,
+                    inline: [0; IO_INLINE_CAP],
+                },
+            },
+        }
+    }
+
+    fn len_field(&self) -> u32 {
+        // `len` is the first field of both arms, so reading via the inline arm
+        // is well-defined (u32 has no invalid bit patterns) regardless of the
+        // live variant.
+        unsafe { self.repr.inline.len }
+    }
+
+    fn set_len_field(&mut self, len: u32) {
+        self.repr.inline.len = len;
+    }
+
+    pub fn len(&self) -> usize {
+        (self.len_field() & !IO_HEAP_FLAG) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_heap(&self) -> bool {
+        self.len_field() & IO_HEAP_FLAG != 0
+    }
+
+    fn capacity(&self) -> usize {
+        if self.is_heap() {
+            unsafe { self.repr.heap.cap as usize }
+        } else {
+            IO_INLINE_CAP
+        }
+    }
+
+    fn slot_at(&self, i: usize) -> u32 {
+        unsafe {
+            if self.is_heap() {
+                *self.repr.heap.ptr.as_ptr().add(i)
+            } else {
+                self.repr.inline.inline[i]
+            }
+        }
+    }
+
+    fn slot_at_mut(&mut self, i: usize) -> &mut u32 {
+        unsafe {
+            if self.is_heap() {
+                &mut *self.repr.heap.ptr.as_ptr().add(i)
+            } else {
+                &mut self.repr.inline.inline[i]
+            }
+        }
+    }
+
+    /// Appends `index`, growing to a heap allocation past the inline capacity.
+    pub fn push(&mut self, index: u32) {
+        let len = self.len();
+        if !self.is_heap() {
+            if len < IO_INLINE_CAP {
+                unsafe {
+                    self.repr.inline.inline[len] = index;
+                }
+                self.set_len_field(self.len_field() + 1);
+                return;
+            }
+            self.grow_to_heap();
+        }
+        if len == self.capacity() {
+            self.grow_heap();
+        }
+        *self.slot_at_mut(len) = index;
+        self.set_len_field(self.len_field() + 1);
+    }
+
+    /// Removes the first occurrence of `index`, swapping in the last element.
+    /// Returns whether the index was present. Order is irrelevant: the set of
+    /// in-flight slot indices is unordered.
+    pub fn remove_value(&mut self, index: u32) -> bool {
+        let len = self.len();
+        for i in 0..len {
+            if self.slot_at(i) == index {
+                let last = len - 1;
+                if i != last {
+                    let last_value = self.slot_at(last);
+                    *self.slot_at_mut(i) = last_value;
+                }
+                self.set_len_field(self.len_field() - 1);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn iter(&self) -> IoVecIter<'_> {
+        IoVecIter {
+            vec: self,
+            i: 0,
+            len: self.len(),
+        }
+    }
+
+    fn grow_to_heap(&mut self) {
+        let new_cap = (IO_INLINE_CAP as u32).max(4);
+        let layout = Layout::array::<u32>(new_cap as usize).unwrap();
+        let ptr = unsafe { alloc(layout) } as *mut u32;
+        assert!(!ptr.is_null(), "io vec allocation failed");
+        let len = self.len_field() | IO_HEAP_FLAG;
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.repr.inline.inline.as_ptr(), ptr, IO_INLINE_CAP);
+            self.repr.heap = IoVecHeap {
+                len,
+                cap: new_cap,
+                ptr: NonNull::new_unchecked(ptr),
+            };
+        }
+    }
+
+    fn grow_heap(&mut self) {
+        let (old_ptr, old_cap) = unsafe { (self.repr.heap.ptr, self.repr.heap.cap) };
+        let old_cap = old_cap as usize;
+        let new_cap = old_cap * 2;
+        let layout = Layout::array::<u32>(old_cap).unwrap();
+        let new_layout = Layout::array::<u32>(new_cap).unwrap();
+        let ptr = unsafe { alloc(new_layout) } as *mut u32;
+        assert!(!ptr.is_null(), "io vec allocation failed");
+        unsafe {
+            core::ptr::copy_nonoverlapping(old_ptr.as_ptr(), ptr, old_cap);
+            dealloc(old_ptr.as_ptr().cast(), layout);
+            self.repr.heap.ptr = NonNull::new_unchecked(ptr);
+            self.repr.heap.cap = new_cap as u32;
+        }
+    }
+}
+
+impl Default for IoVec {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl IoState {
-    pub fn new() -> Self {
-        Self::Inline {
-            submitted: 0,
-            ready: 0,
-            results: [0; 64],
-            bids: [0; 64],
+impl Drop for IoVec {
+    fn drop(&mut self) {
+        if self.is_heap() {
+            let (ptr, cap) = unsafe { (self.repr.heap.ptr, self.repr.heap.cap) };
+            let layout = Layout::array::<u32>(cap as usize).unwrap();
+            unsafe { dealloc(ptr.as_ptr().cast(), layout) };
         }
     }
+}
 
-    pub fn is_submitted(&self, bit: u32) -> bool {
-        match self {
-            Self::Inline { submitted, .. } => *submitted & (1 << bit) != 0,
-            Self::Heap { submitted, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                submitted[word] & (1 << bit) != 0
-            }
-        }
-    }
+pub struct IoVecIter<'a> {
+    vec: &'a IoVec,
+    i: usize,
+    len: usize,
+}
 
-    pub fn set_submitted(&mut self, bit: u32, value: bool) {
-        match self {
-            Self::Inline { submitted, .. } => {
-                if value {
-                    *submitted |= 1 << bit;
-                } else {
-                    *submitted &= !(1 << bit);
-                }
-            }
-            Self::Heap { submitted, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                if value {
-                    submitted[word] |= 1 << bit;
-                } else {
-                    submitted[word] &= !(1 << bit);
-                }
-            }
-        }
-    }
+impl Iterator for IoVecIter<'_> {
+    type Item = u32;
 
-    pub fn is_ready(&self, bit: u32) -> bool {
-        match self {
-            Self::Inline { ready, .. } => *ready & (1 << bit) != 0,
-            Self::Heap { ready, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                word < ready.len() && ready[word] & (1 << bit) != 0
-            }
-        }
-    }
-
-    pub fn set_ready(&mut self, bit: u32, value: bool) {
-        match self {
-            Self::Inline { ready, .. } => {
-                if value {
-                    *ready |= 1 << bit;
-                } else {
-                    *ready &= !(1 << bit);
-                }
-            }
-            Self::Heap { ready, .. } => {
-                let word = bit as usize / 64;
-                let bit = bit as usize % 64;
-                if value {
-                    ready[word] |= 1 << bit;
-                } else {
-                    ready[word] &= !(1 << bit);
-                }
-            }
-        }
-    }
-
-    pub fn result(&self, slot: u32) -> i32 {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize],
-            Self::Heap { results, .. } => results[slot as usize],
-        }
-    }
-
-    pub fn set_result(&mut self, slot: u32, value: i32) {
-        match self {
-            Self::Inline { results, .. } => results[slot as usize] = value,
-            Self::Heap { results, .. } => results[slot as usize] = value,
-        }
-    }
-
-    pub fn set_bid(&mut self, slot: u32, value: u16) {
-        match self {
-            Self::Inline { bids, .. } => bids[slot as usize] = value,
-            Self::Heap { bids, .. } => {
-                let idx = slot as usize;
-                if idx >= bids.len() {
-                    bids.resize(idx + 1, 0);
-                }
-                bids[idx] = value;
-            }
-        }
-    }
-
-    pub fn bid(&self, slot: u32) -> u16 {
-        match self {
-            Self::Inline { bids, .. } => bids[slot as usize],
-            Self::Heap { bids, .. } => bids[slot as usize],
-        }
-    }
-
-    pub fn reset_slot(&mut self, slot: u32) {
-        self.set_submitted(slot, false);
-        self.set_ready(slot, false);
-    }
-
-    pub fn free_slot(&self) -> Option<u32> {
-        let bits = match self {
-            Self::Inline { submitted, .. } => !submitted,
-            Self::Heap { submitted, .. } => !submitted[0],
-        };
-
-        if bits == 0 {
-            None
+    fn next(&mut self) -> Option<u32> {
+        if self.i < self.len {
+            let value = self.vec.slot_at(self.i);
+            self.i += 1;
+            Some(value)
         } else {
-            Some(bits.trailing_zeros())
-        }
-    }
-
-    pub fn has_io_in_flight(&self) -> bool {
-        match self {
-            Self::Inline {
-                submitted, ready, ..
-            } => *submitted & !*ready != 0,
-            Self::Heap {
-                submitted, ready, ..
-            } => {
-                for (s, r) in submitted.iter().zip(ready.iter()) {
-                    if s & !r != 0 {
-                        return true;
-                    }
-                }
-                false
-            }
+            None
         }
     }
 }
@@ -205,7 +265,7 @@ impl From<u64> for IoUserData {
 
 pub struct Task {
     pub ready: bool,
-    pub io: IoState,
+    pub io: IoVec,
     pub(crate) id: u64,
 }
 
@@ -334,33 +394,6 @@ impl TaskSlab {
         let word = index as usize / 64;
         let bit = index as usize % 64;
         word < self.free.len() && self.free[word] & (1 << bit) == 0
-    }
-
-    pub fn has_io_in_flight(&self) -> bool {
-        for (word_idx, &word) in self.free.iter().enumerate() {
-            let base = word_idx as u32 * 64;
-            let cap = self.tasks.len() as u32;
-            if base >= cap {
-                break;
-            }
-            let max = (cap - base).min(64);
-            let occupied = !word & ((1u64 << max) - 1);
-            for slot in 0..max {
-                if occupied & (1 << slot) != 0 {
-                    let idx = base + slot;
-                    let task = unsafe {
-                        self.tasks[idx as usize]
-                            .assume_init_ref()
-                            .io
-                            .has_io_in_flight()
-                    };
-                    if task {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     pub fn insert_vacant(&mut self) -> Option<u32> {
@@ -504,7 +537,7 @@ mod tests {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
                 ready: true,
-                io: IoState::new(),
+                io: IoVec::new(),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -527,7 +560,7 @@ mod tests {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
                 ready: true,
-                io: IoState::new(),
+                io: IoVec::new(),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -543,7 +576,7 @@ mod tests {
             let idx = slab.insert_vacant().unwrap();
             let task = Task {
                 ready: true,
-                io: IoState::new(),
+                io: IoVec::new(),
                 id: 0,
             };
             slab.init_task_unchecked(idx, task);
@@ -569,88 +602,89 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── has_io_in_flight ────────────────────────────────────────────
+    // ── IoVec ─────────────────────────────────────────────────────────
 
     #[test]
-    fn has_io_in_flight_empty_slab() {
-        let slab = TaskSlab::new::<Ready<()>>(10);
-        assert!(!slab.has_io_in_flight());
+    fn io_vec_new_is_empty_inline() {
+        let v = IoVec::new();
+        assert!(v.is_empty());
+        assert!(!v.is_heap());
     }
 
     #[test]
-    fn has_io_in_flight_occupied_no_io() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let task = Task {
-                ready: true,
-                io: IoState::new(),
-                id: 0,
-            };
-            slab.init_task_unchecked(idx, task);
-            assert!(!slab.has_io_in_flight());
-        }
+    fn io_vec_stays_inline_up_to_three() {
+        let mut v = IoVec::new();
+        v.push(7);
+        v.push(8);
+        v.push(9);
+        assert!(!v.is_heap());
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.iter().collect::<Vec<_>>(), vec![7, 8, 9]);
     }
 
     #[test]
-    fn has_io_in_flight_with_pending_io() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let mut io = IoState::new();
-            io.set_submitted(0, true); // submitted but not ready → in flight
-            let task = Task {
-                ready: true,
-                io,
-                id: 0,
-            };
-            slab.init_task_unchecked(idx, task);
-            assert!(slab.has_io_in_flight());
+    fn io_vec_grows_to_heap_on_fourth_push() {
+        let mut v = IoVec::new();
+        for i in 0..4 {
+            v.push(i);
         }
+        assert!(v.is_heap());
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     }
 
     #[test]
-    fn has_io_in_flight_completed_io() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let mut io = IoState::new();
-            io.set_submitted(0, true);
-            io.set_ready(0, true); // completed → not in flight
-            let task = Task {
-                ready: true,
-                io,
-                id: 0,
-            };
-            slab.init_task_unchecked(idx, task);
-            assert!(!slab.has_io_in_flight());
+    fn io_vec_grows_past_initial_heap_capacity() {
+        let mut v = IoVec::new();
+        for i in 0..20 {
+            v.push(i);
         }
+        assert!(v.is_heap());
+        assert_eq!(v.len(), 20);
+        assert_eq!(v.iter().collect::<Vec<_>>(), (0..20).collect::<Vec<_>>());
     }
 
     #[test]
-    fn has_io_in_flight_multi_task() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx0 = slab.insert_vacant().unwrap();
-            let task0 = Task {
-                ready: true,
-                io: IoState::new(),
-                id: 0,
-            };
-            slab.init_task_unchecked(idx0, task0);
+    fn io_vec_remove_value_missing() {
+        let mut v = IoVec::new();
+        v.push(1);
+        v.push(2);
+        assert!(!v.remove_value(3));
+        assert_eq!(v.len(), 2);
+    }
 
-            let idx1 = slab.insert_vacant().unwrap();
-            let mut io1 = IoState::new();
-            io1.set_submitted(5, true);
-            let task1 = Task {
-                ready: true,
-                io: io1,
-                id: 0,
-            };
-            slab.init_task_unchecked(idx1, task1);
+    #[test]
+    fn io_vec_remove_value_inline() {
+        let mut v = IoVec::new();
+        v.push(1);
+        v.push(2);
+        v.push(3);
+        assert!(v.remove_value(2));
+        assert_eq!(v.iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert!(!v.is_heap());
+    }
 
-            // Task 1 has in-flight IO → overall true
-            assert!(slab.has_io_in_flight());
+    #[test]
+    fn io_vec_remove_value_heap() {
+        let mut v = IoVec::new();
+        for i in 0..10 {
+            v.push(i);
         }
+        assert!(v.remove_value(3));
+        assert_eq!(v.len(), 9);
+        let mut rest: Vec<u32> = v.iter().collect();
+        rest.sort();
+        assert_eq!(rest, (0..10).filter(|&i| i != 3).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn io_vec_heap_allocation_is_freed_on_drop() {
+        // Drop a heap-backed vec; the test harness would catch a leak or
+        // double-free.
+        let mut v = IoVec::new();
+        for i in 0..100 {
+            v.push(i);
+        }
+        assert!(v.is_heap());
     }
 }

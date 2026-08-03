@@ -16,7 +16,8 @@ use crate::levels::level_for;
 use crate::levels::pack_bid;
 use crate::pbuf::ProvidedBufferPool;
 use crate::pbuf::ReadBuffer;
-use crate::task::IoState;
+use crate::task::IoSlot;
+use crate::task::IoVec;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
@@ -104,13 +105,8 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Rea
         Ok(level as u16)
     })?;
 
-    let slot = ctx
-        .with_task(|task| {
-            let slot = task.io.free_slot()?;
-            task.io.set_submitted(slot, true);
-            Some(slot)
-        })
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    let slot = ctx.with_runtime(|r| r.alloc_io_slot());
+    ctx.with_task(|task| task.io.push(slot));
 
     let entry = io_uring::opcode::Read::new(
         io_uring::types::Fd(fd),
@@ -121,22 +117,29 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Rea
     .build()
     .flags(io_uring::squeue::Flags::BUFFER_SELECT);
     if let Err(e) = ctx.push_io(entry, slot) {
-        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.free_io_slot(slot));
+        ctx.with_task(|task| task.io.remove_value(slot));
         return Err(e);
     }
 
     let result = await_cqe(ctx, slot).await;
     if result < 0 {
-        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.free_io_slot(slot));
+        ctx.with_task(|task| task.io.remove_value(slot));
         return Err(io::Error::from_raw_os_error(-result));
     }
 
     let generation = active_gen().expect("read called outside an active runtime");
     let level = bgid as usize;
-    let local = ctx.with_task(|task| task.io.bid(slot));
-    let offset = ctx.with_runtime(|r| r.buffer_pools[level].slot_offset(local));
-    let bid = pack_bid(level as u32, u32::from(local));
-    ctx.with_task(|task| task.io.reset_slot(slot));
+    let (offset, bid) = ctx.with_runtime(|r| {
+        let slot_ref = &r.io_slab[slot as usize];
+        let local = slot_ref.bid;
+        let offset = r.buffer_pools[level].slot_offset(local);
+        let bid = pack_bid(level as u32, u32::from(local));
+        r.free_io_slot(slot);
+        (offset, bid)
+    });
+    ctx.with_task(|task| task.io.remove_value(slot));
 
     Ok(ReadBuffer::new(offset, bid, result as u32, generation))
 }
@@ -166,15 +169,12 @@ pub fn write_buffer(ctx: TaskContext, size: usize) -> io::Result<WriteBuffer> {
 /// buffer's slot is held until the kernel finishes with it and recycled when
 /// `wb` is dropped.
 pub async fn write(ctx: TaskContext, fd: RawFd, wb: WriteBuffer) -> io::Result<usize> {
-    let slot = ctx
-        .with_task(|task| task.io.free_slot())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    let slot = ctx.with_runtime(|r| r.alloc_io_slot());
+    ctx.with_task(|task| task.io.push(slot));
 
     let len = wb.len();
     let addr =
         ctx.with_runtime(|r| unsafe { r.slab.as_ptr().cast_mut().add(wb.offset() as usize) });
-
-    ctx.with_task(|task| task.io.set_submitted(slot, true));
 
     let entry = io_uring::opcode::WriteFixed::new(
         io_uring::types::Fd(fd),
@@ -184,25 +184,35 @@ pub async fn write(ctx: TaskContext, fd: RawFd, wb: WriteBuffer) -> io::Result<u
     )
     .build();
     if let Err(e) = ctx.push_io(entry, slot) {
-        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.free_io_slot(slot));
+        ctx.with_task(|task| task.io.remove_value(slot));
         return Err(e);
     }
 
     let result = await_cqe(ctx, slot).await;
     if result < 0 {
-        ctx.with_task(|task| task.io.reset_slot(slot));
+        ctx.with_runtime(|r| r.free_io_slot(slot));
+        ctx.with_task(|task| task.io.remove_value(slot));
         return Err(io::Error::from_raw_os_error(-result));
     }
 
-    ctx.with_task(|task| task.io.reset_slot(slot));
+    ctx.with_runtime(|r| r.free_io_slot(slot));
+    ctx.with_task(|task| task.io.remove_value(slot));
     Ok(result as usize)
 }
 
 pub async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
     loop {
-        let ready = ctx.with_task(|task| task.io.is_ready(slot));
-        if ready {
-            return ctx.with_task(|task| task.io.result(slot));
+        let result = ctx.with_runtime(|r| {
+            let slot_ref = &r.io_slab[slot as usize];
+            if slot_ref.ready != 0 {
+                Some(slot_ref.result)
+            } else {
+                None
+            }
+        });
+        if let Some(result) = result {
+            return result;
         }
         yield_now(ctx).await;
     }
@@ -251,6 +261,11 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
 pub(crate) struct Runtime {
     pub tasks: TaskSlab,
     pub wakeups: Vec<u32>,
+    /// Runtime-wide slab of per-op io states; a slot lives while the op it
+    /// tracks is in flight, then is recycled via `free_io_slots`.
+    pub io_slab: Vec<IoSlot>,
+    /// Indices of reusable io slab slots.
+    pub free_io_slots: Vec<u32>,
     pub slab: Vec<u8>,
     pub read_levels: Vec<Level>,
     pub buffer_pools: Vec<ProvidedBufferPool>,
@@ -273,6 +288,49 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    /// Allocates an io slab slot and marks it submitted. The slot is reused
+    /// from the free list when available, otherwise the slab grows; it only
+    /// ever holds in-flight ops, so it stays bounded by peak concurrency.
+    fn alloc_io_slot(&mut self) -> u32 {
+        let index = match self.free_io_slots.pop() {
+            Some(index) => index,
+            None => {
+                self.io_slab.push(IoSlot::default());
+                (self.io_slab.len() - 1) as u32
+            }
+        };
+        self.io_slab[index as usize].submitted = 1;
+        index
+    }
+
+    /// Returns `index` to the free list. Only call once the CQE for the op is
+    /// consumed, so a late completion can never land on a recycled slot.
+    fn free_io_slot(&mut self, index: u32) {
+        self.io_slab[index as usize] = IoSlot::default();
+        self.free_io_slots.push(index);
+    }
+
+    /// Whether any io op is still in flight. Scans the slab for submitted
+    /// slots that are not yet ready; orphaned ops of removed tasks keep this
+    /// true until their CQEs are drained.
+    fn has_io_in_flight(&self) -> bool {
+        self.io_slab
+            .iter()
+            .any(|slot| slot.submitted != 0 && slot.ready == 0)
+    }
+
+    /// Reclaims a removed task's io slots. Slots whose ops already completed
+    /// (ready) are freed immediately; slots still in flight are left orphaned
+    /// and freed by [`Self::drain_cqes`] when their late CQE arrives.
+    fn reap_io_slots(&mut self, io: &IoVec) {
+        for index in io.iter() {
+            let slot = &self.io_slab[index as usize];
+            if slot.submitted != 0 && slot.ready != 0 {
+                self.free_io_slot(index);
+            }
+        }
+    }
+
     fn context_for(&mut self, index: u32) -> TaskContext {
         assert!(
             self.tasks.is_occupied(index),
@@ -284,29 +342,42 @@ impl Runtime {
     }
 
     fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
+        let mut orphaned = Vec::new();
         for cqe in self.ring.completion() {
             let raw = cqe.user_data();
             let task_index = (raw >> 32) as u32;
             let io_slot = raw as u32;
             let result = cqe.result();
 
+            if io_slot as usize >= self.io_slab.len() {
+                continue;
+            }
+
             unsafe {
                 if self.tasks.is_occupied(task_index) {
-                    let task = self.tasks.task_mut_unchecked(task_index);
-                    task.io.set_result(io_slot, result);
+                    let slot = &mut self.io_slab[io_slot as usize];
+                    slot.result = result;
                     // Only reads report a selected buffer via the CQE flags;
                     // writes store their own slot id in `bids`, so leave it
                     // untouched when no buffer flag is present.
                     if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
-                        task.io.set_bid(io_slot, bid);
+                        slot.bid = bid;
                     }
-                    task.io.set_ready(io_slot, true);
+                    slot.ready = 1;
+                    let task = self.tasks.task_mut_unchecked(task_index);
                     if !task.ready {
                         task.ready = true;
                         ready.push(task_index);
                     }
+                } else {
+                    // The owning task is gone: its CQE just arrived, so this is
+                    // the only safe moment to recycle the orphaned slot.
+                    orphaned.push(io_slot);
                 }
             }
+        }
+        for io_slot in orphaned {
+            self.free_io_slot(io_slot);
         }
     }
 }
@@ -440,6 +511,8 @@ where
     let mut rt = Runtime {
         tasks: TaskSlab::new::<F>(params.tasks_capacity),
         wakeups: Vec::new(),
+        io_slab: Vec::new(),
+        free_io_slots: Vec::new(),
         slab,
         read_levels,
         buffer_pools,
@@ -466,7 +539,7 @@ where
 
     let task = Task {
         ready: true,
-        io: IoState::new(),
+        io: IoVec::new(),
         id: 0,
     };
     unsafe { rt.tasks.init_task_unchecked(index, task) };
@@ -498,7 +571,10 @@ where
 
             match future.poll(&mut cx) {
                 Poll::Ready(()) => {
-                    unsafe { rt.tasks.remove_unchecked::<F>(idx) };
+                    let task = unsafe { rt.tasks.remove_unchecked::<F>(idx) };
+                    // Reclaim the task's io slots now that it is gone; slots
+                    // with ops still in flight stay orphaned until drained.
+                    rt.reap_io_slots(&task.io);
                 }
                 Poll::Pending => {}
             }
@@ -506,7 +582,7 @@ where
 
         ready_tasks.clear();
 
-        if !rt.tasks.has_io_in_flight() {
+        if !rt.has_io_in_flight() {
             if rt.wakeups.is_empty() {
                 break;
             }
@@ -534,7 +610,7 @@ where
         let index = data.tasks.insert_vacant()?;
         let task = Task {
             ready: true,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -603,6 +679,8 @@ mod tests {
         Runtime {
             tasks: TaskSlab::new::<Ready<()>>(capacity),
             wakeups: Vec::new(),
+            io_slab: Vec::new(),
+            free_io_slots: Vec::new(),
             slab,
             read_levels,
             buffer_pools,
@@ -613,7 +691,58 @@ mod tests {
         }
     }
 
-    // ── IoState (inline) ──────────────────────────────────────────────
+    // ── io slab ───────────────────────────────────────────────────────
+
+    #[test]
+    fn io_slot_alloc_marks_submitted() {
+        let mut data = test_runtime_data(64);
+        let slot = data.alloc_io_slot();
+        assert_eq!(slot, 0);
+        assert_eq!(data.io_slab[slot as usize].submitted, 1);
+        assert!(data.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_slot_free_clears_and_reuses() {
+        let mut data = test_runtime_data(64);
+        let a = data.alloc_io_slot();
+        let b = data.alloc_io_slot();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        data.free_io_slot(a);
+        assert_eq!(data.io_slab[a as usize].submitted, 0);
+        // The freed slot is reused before the slab grows.
+        let c = data.alloc_io_slot();
+        assert_eq!(c, 0);
+        assert_eq!(data.io_slab.len(), 2);
+    }
+
+    #[test]
+    fn io_slab_reaps_completed_unreaped_slot() {
+        let mut data = test_runtime_data(64);
+        let mut io = IoVec::new();
+        let slot = data.alloc_io_slot();
+        io.push(slot);
+        // The op completed but the task never reaped it.
+        data.io_slab[slot as usize].ready = 1;
+        data.reap_io_slots(&io);
+        assert_eq!(data.io_slab[slot as usize].submitted, 0);
+        assert_eq!(data.free_io_slots, vec![slot]);
+        assert!(!data.has_io_in_flight());
+    }
+
+    #[test]
+    fn io_slab_leaves_in_flight_slot_orphaned() {
+        let mut data = test_runtime_data(64);
+        let mut io = IoVec::new();
+        let slot = data.alloc_io_slot();
+        io.push(slot);
+        // Still in flight: reaping must leave it for the late CQE.
+        data.reap_io_slots(&io);
+        assert_eq!(data.io_slab[slot as usize].submitted, 1);
+        assert!(data.free_io_slots.is_empty());
+        assert!(data.has_io_in_flight());
+    }
 
     #[test]
     fn shared_slab_write_region_follows_read_region() {
@@ -630,119 +759,13 @@ mod tests {
         assert_eq!(write_pools[0].slot_offset(1), 96);
     }
 
-    #[test]
-    fn io_state_free_slot_exhaustion() {
-        let mut s = IoState::new();
-        for i in 0..64 {
-            assert_eq!(s.free_slot(), Some(i));
-            s.set_submitted(i, true);
-        }
-        assert_eq!(s.free_slot(), None);
-    }
-
-    #[test]
-    fn io_state_free_slot_reuses_freed() {
-        let mut s = IoState::new();
-        s.set_submitted(0, true);
-        s.set_submitted(1, true);
-        s.set_submitted(2, true);
-        // free slot 1
-        s.set_submitted(1, false);
-        assert_eq!(s.free_slot(), Some(1));
-    }
-
-    // ── IoState (heap variant) ────────────────────────────────────────
-
-    fn make_heap_state(capacity: usize) -> IoState {
-        IoState::Heap {
-            submitted: vec![0; capacity],
-            ready: vec![0; capacity],
-            results: vec![0; capacity * 64],
-            bids: vec![0; capacity * 64],
-        }
-    }
-
-    #[test]
-    fn io_state_heap_free_slot() {
-        let mut s = make_heap_state(1);
-        assert_eq!(s.free_slot(), Some(0));
-        s.set_submitted(0, true);
-        // After submitting slot 0, '!submitted[0]' has bit 0 cleared => free_slot = 1
-        assert_eq!(s.free_slot(), Some(1));
-    }
-
-    #[test]
-    fn io_state_heap_free_slot_exhausted() {
-        let mut s = make_heap_state(1);
-        for i in 0..64 {
-            s.set_submitted(i, true);
-        }
-        assert_eq!(s.free_slot(), None);
-    }
-
-    #[test]
-    fn io_state_heap_beyond_64() {
-        let mut s = make_heap_state(2);
-        // submitted[0] covers slots 0..63, submitted[1] covers 64..127
-        assert_eq!(s.free_slot(), Some(0));
-        s.set_submitted(64, true);
-        assert!(s.is_submitted(64));
-        assert_eq!(s.free_slot(), Some(0));
-    }
-
-    #[test]
-    fn io_state_heap_ready_and_result() {
-        let mut s = make_heap_state(1);
-        s.set_submitted(10, true);
-        s.set_result(10, -1);
-        s.set_ready(10, true);
-        assert!(s.is_ready(10));
-        assert_eq!(s.result(10), -1);
-    }
-
-    // ── IoState bid storage ───────────────────────────────────────────
-
-    #[test]
-    fn io_state_bid_inline_roundtrip() {
-        let mut s = IoState::new();
-        assert_eq!(s.bid(0), 0);
-        s.set_bid(0, 3);
-        assert_eq!(s.bid(0), 3);
-        s.set_bid(0, 5);
-        assert_eq!(s.bid(0), 5);
-    }
-
-    #[test]
-    fn io_state_bid_heap_roundtrip() {
-        let mut s = make_heap_state(2);
-        assert_eq!(s.bid(64), 0);
-        s.set_bid(64, 7);
-        assert_eq!(s.bid(64), 7);
-        s.set_bid(64, 9);
-        assert_eq!(s.bid(64), 9);
-    }
-
-    #[test]
-    fn io_state_reset_slot_clears_state() {
-        let mut s = IoState::new();
-        s.set_submitted(5, true);
-        s.set_ready(5, true);
-        s.set_bid(5, 2);
-        s.reset_slot(5);
-        assert!(!s.is_submitted(5));
-        assert!(!s.is_ready(5));
-        // bids is not cleared: like `results`, it is only read once `ready`
-        // is set and is overwritten before the next use of the slot.
-        assert_eq!(s.bid(5), 2);
-    }
-
     // ── ReadBuffer ────────────────────────────────────────────────────
 
     #[test]
     fn read_buffer_drop_recycles_slot() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -766,7 +789,7 @@ mod tests {
     fn read_buffer_stale_generation_skips_recycle() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -790,7 +813,7 @@ mod tests {
     fn read_buffer_into_vec_recycles_slot() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -817,7 +840,7 @@ mod tests {
     fn write_buffer_drop_recycles_slot() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -841,7 +864,7 @@ mod tests {
     fn write_buffer_stale_generation_skips_recycle() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -865,7 +888,7 @@ mod tests {
     fn write_buffer_helper_returns_slot_capacity() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -888,7 +911,7 @@ mod tests {
     fn write_buffer_as_mut_set_len_clear() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -918,7 +941,7 @@ mod tests {
     fn write_buffer_set_len_above_capacity_panics() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -955,64 +978,52 @@ mod tests {
         assert_eq!(back.io_slot, 7);
     }
 
-    // ── IoState::has_io_in_flight ─────────────────────────────────────
+    // ── Runtime::has_io_in_flight ────────────────────────────────────
 
     #[test]
-    fn io_state_no_io_in_flight_when_empty() {
-        let s = IoState::new();
-        assert!(!s.has_io_in_flight());
+    fn has_io_in_flight_empty_slab() {
+        let data = test_runtime_data(64);
+        assert!(!data.has_io_in_flight());
     }
 
     #[test]
-    fn io_state_has_io_in_flight_when_submitted_not_ready() {
-        let mut s = IoState::new();
-        s.set_submitted(3, true);
-        // submitted=3, ready=0 => submitted & !ready != 0
-        assert!(s.has_io_in_flight());
+    fn has_io_in_flight_true_while_submitted_not_ready() {
+        let mut data = test_runtime_data(64);
+        data.alloc_io_slot();
+        assert!(data.has_io_in_flight());
     }
 
     #[test]
-    fn io_state_no_io_in_flight_when_submitted_and_ready() {
-        let mut s = IoState::new();
-        s.set_submitted(3, true);
-        s.set_ready(3, true);
-        // submitted=3, ready=3 => submitted & !ready == 0
-        assert!(!s.has_io_in_flight());
+    fn has_io_in_flight_false_when_ready() {
+        let mut data = test_runtime_data(64);
+        let slot = data.alloc_io_slot();
+        data.io_slab[slot as usize].ready = 1;
+        assert!(!data.has_io_in_flight());
     }
 
     #[test]
-    fn io_state_no_io_in_flight_after_clearing_submitted() {
-        let mut s = IoState::new();
-        s.set_submitted(3, true);
-        s.set_submitted(3, false);
-        assert!(!s.has_io_in_flight());
-    }
-
-    #[test]
-    fn io_state_heap_has_io_in_flight() {
-        let mut s = make_heap_state(2);
-        s.set_submitted(64, true);
-        assert!(s.has_io_in_flight());
-        s.set_ready(64, true);
-        assert!(!s.has_io_in_flight());
+    fn has_io_in_flight_false_after_free() {
+        let mut data = test_runtime_data(64);
+        let slot = data.alloc_io_slot();
+        data.free_io_slot(slot);
+        assert!(!data.has_io_in_flight());
     }
 
     // ── await_cqe ─────────────────────────────────────────────────────
 
     #[test]
     fn await_cqe_immediate_ready() {
-        let mut task = Task {
+        let mut data = test_runtime_data(64);
+        let slot = data.alloc_io_slot();
+        data.io_slab[slot as usize].result = 42;
+        data.io_slab[slot as usize].ready = 1;
+
+        let index = data.tasks.insert_vacant().unwrap();
+        let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
-        let slot = task.io.free_slot().unwrap();
-        task.io.set_submitted(slot, true);
-        task.io.set_result(slot, 42);
-        task.io.set_ready(slot, true);
-
-        let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let _gen = enter_active_gen();
@@ -1027,17 +1038,16 @@ mod tests {
 
     #[test]
     fn await_cqe_delayed_ready() {
-        let mut task = Task {
-            ready: false,
-            io: IoState::new(),
-            id: 0,
-        };
-        let slot = task.io.free_slot().unwrap();
-        task.io.set_submitted(slot, true);
+        let mut data = test_runtime_data(64);
+        let slot = data.alloc_io_slot();
         // NOT setting ready yet
 
-        let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
+        let task = Task {
+            ready: false,
+            io: IoVec::new(),
+            id: 0,
+        };
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let _gen = enter_active_gen();
@@ -1051,9 +1061,8 @@ mod tests {
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
 
         // Now set ready externally
-        let task = unsafe { data.tasks.task_mut_unchecked(index) };
-        task.io.set_ready(slot, true);
-        task.io.set_result(slot, 99);
+        data.io_slab[slot as usize].result = 99;
+        data.io_slab[slot as usize].ready = 1;
 
         // Second poll: Yield's second poll → Ready, loop sees ready → Ready(99)
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(99));
@@ -1065,7 +1074,7 @@ mod tests {
     fn yield_first_poll_returns_pending() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1086,7 +1095,7 @@ mod tests {
     fn yield_second_poll_returns_ready() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1107,7 +1116,7 @@ mod tests {
     fn yield_calls_wake_on_first_poll() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1131,7 +1140,7 @@ mod tests {
     fn task_context_with_task_reads_correct_task() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1149,7 +1158,7 @@ mod tests {
     fn task_context_with_task_modifies() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1167,7 +1176,7 @@ mod tests {
     fn task_context_with_runtime_reads_buffer_pool() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1185,7 +1194,7 @@ mod tests {
     fn task_context_with_runtime_after_removal_panics() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1211,7 +1220,7 @@ mod tests {
     fn task_context_wake_pushes_index() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1230,7 +1239,7 @@ mod tests {
     fn task_context_after_removal_panics() {
         let task = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1256,7 +1265,7 @@ mod tests {
     fn task_context_after_slot_reuse_panics_without_touching_new_task() {
         let task_a = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1274,7 +1283,7 @@ mod tests {
 
         let task_b = Task {
             ready: true,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         unsafe { data.tasks.init_task_unchecked(index, task_b) };
@@ -1295,7 +1304,7 @@ mod tests {
     fn task_context_of_live_task_usable_alongside_other_tasks() {
         let task_a = Task {
             ready: false,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let mut data = test_runtime_data(64);
@@ -1304,7 +1313,7 @@ mod tests {
 
         let task_b = Task {
             ready: true,
-            io: IoState::new(),
+            io: IoVec::new(),
             id: 0,
         };
         let index_b = data.tasks.insert_vacant().unwrap();
