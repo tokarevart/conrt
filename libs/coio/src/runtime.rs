@@ -6,6 +6,7 @@ use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
@@ -540,7 +541,7 @@ where
     let task = Task {
         ready: true,
         io: IoVec::new(),
-        id: 0,
+        id: NonZeroU64::new(1).unwrap(),
     };
     unsafe { rt.tasks.init_task_unchecked(index, task) };
 
@@ -611,7 +612,7 @@ where
         let task = Task {
             ready: true,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
@@ -767,7 +768,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -791,7 +792,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -815,7 +816,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -842,7 +843,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -866,7 +867,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -890,7 +891,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -913,7 +914,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -943,7 +944,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1023,7 +1024,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
@@ -1047,7 +1048,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
@@ -1076,7 +1077,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1097,7 +1098,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1118,7 +1119,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1142,7 +1143,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1160,7 +1161,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1178,7 +1179,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1196,7 +1197,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1222,7 +1223,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1241,7 +1242,7 @@ mod tests {
         let task = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1267,7 +1268,7 @@ mod tests {
         let task_a = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
@@ -1285,7 +1286,7 @@ mod tests {
         let task_b = Task {
             ready: true,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(2).unwrap(),
         };
         unsafe { data.tasks.init_task_unchecked(index, task_b) };
         unsafe {
@@ -1306,7 +1307,7 @@ mod tests {
         let task_a = Task {
             ready: false,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(1).unwrap(),
         };
         let mut data = test_runtime_data(64);
         let index_a = data.tasks.insert_vacant().unwrap();
@@ -1315,7 +1316,7 @@ mod tests {
         let task_b = Task {
             ready: true,
             io: IoVec::new(),
-            id: 0,
+            id: NonZeroU64::new(2).unwrap(),
         };
         let index_b = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index_b, task_b) };

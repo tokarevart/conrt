@@ -7,6 +7,7 @@ use std::alloc::Layout;
 use std::alloc::alloc;
 use std::alloc::dealloc;
 use std::io;
+use std::num::NonZeroU64;
 
 use io_uring::squeue;
 
@@ -14,7 +15,7 @@ use crate::runtime;
 use crate::runtime::Runtime;
 
 thread_local! {
-    static NEXT_TASK_ID: Cell<u64> = const { Cell::new(1) };
+    static NEXT_TASK_ID: Cell<NonZeroU64> = const { Cell::new(NonZeroU64::new(1).unwrap()) };
 }
 
 /// One in-flight IO op's state, stored in the runtime's global io slab. The
@@ -260,7 +261,7 @@ impl From<u64> for IoUserData {
 pub struct Task {
     pub ready: bool,
     pub io: IoVec,
-    pub(crate) id: u64,
+    pub(crate) id: NonZeroU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,11 +289,11 @@ impl std::error::Error for TaskContextError {}
 #[derive(Debug, Clone, Copy)]
 pub struct TaskContext {
     task_index: u32,
-    task_id: u64,
+    task_id: NonZeroU64,
 }
 
 impl TaskContext {
-    pub(crate) fn new(task_index: u32, task_id: u64) -> Self {
+    pub(crate) fn new(task_index: u32, task_id: NonZeroU64) -> Self {
         Self {
             task_index,
             task_id,
@@ -436,7 +437,7 @@ impl TaskSlab {
     pub unsafe fn init_task_unchecked(&mut self, index: u32, mut task: Task) {
         task.id = NEXT_TASK_ID.with(|c| {
             let id = c.get();
-            c.set(id.wrapping_add(1));
+            c.set(id.checked_add(1).unwrap());
             id
         });
         self.tasks[index as usize] = MaybeUninit::new(task);
@@ -532,7 +533,7 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoVec::new(),
-                id: 0,
+                id: NonZeroU64::new(1).unwrap(),
             };
             slab.init_task_unchecked(idx, task);
 
@@ -555,7 +556,7 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoVec::new(),
-                id: 0,
+                id: NonZeroU64::new(1).unwrap(),
             };
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
@@ -571,7 +572,7 @@ mod tests {
             let task = Task {
                 ready: true,
                 io: IoVec::new(),
-                id: 0,
+                id: NonZeroU64::new(1).unwrap(),
             };
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
