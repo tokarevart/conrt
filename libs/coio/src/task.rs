@@ -261,7 +261,25 @@ impl From<u64> for IoUserData {
 pub struct Task {
     pub ready: bool,
     pub io: IoVec,
-    pub(crate) id: NonZeroU64,
+    id: NonZeroU64,
+}
+
+impl Task {
+    /// Creates a task with a fresh unique id, `ready = false` and an empty io
+    /// vec. The only way to construct a task.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let id = NEXT_TASK_ID.with(|c| {
+            let id = c.get();
+            c.set(id.checked_add(1).unwrap());
+            id
+        });
+        Self {
+            ready: false,
+            io: IoVec::new(),
+            id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +436,17 @@ impl TaskSlab {
         unsafe { self.tasks[index as usize].assume_init_mut() }
     }
 
+    /// Builds a [`TaskContext`] for the task at `index`. The context carries
+    /// the task's unique id so it stays valid against later slot reuse.
+    pub fn context_for(&self, index: u32) -> TaskContext {
+        assert!(
+            self.is_occupied(index),
+            "cannot build a context for an uninitialized slot"
+        );
+        let task_id = unsafe { self.task_unchecked(index) }.id;
+        TaskContext::new(index, task_id)
+    }
+
     /// Returns a pointer to the byte slot backing future `index`. The slot is
     /// only valid for the `F` the slab was created for.
     fn future_slot<F>(&self, index: u32) -> *mut MaybeUninit<u8> {
@@ -434,12 +463,7 @@ impl TaskSlab {
 
     /// # Safety
     /// `index` must be an in-bounds slot that has not already been initialized.
-    pub unsafe fn init_task_unchecked(&mut self, index: u32, mut task: Task) {
-        task.id = NEXT_TASK_ID.with(|c| {
-            let id = c.get();
-            c.set(id.checked_add(1).unwrap());
-            id
-        });
+    pub unsafe fn init_task_unchecked(&mut self, index: u32, task: Task) {
         self.tasks[index as usize] = MaybeUninit::new(task);
     }
 
@@ -530,11 +554,8 @@ mod tests {
         let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
-            let task = Task {
-                ready: true,
-                io: IoVec::new(),
-                id: NonZeroU64::new(1).unwrap(),
-            };
+            let mut task = Task::new();
+            task.ready = true;
             slab.init_task_unchecked(idx, task);
 
             let ptr = slab.task_ptr_unchecked(idx);
@@ -553,11 +574,8 @@ mod tests {
         let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
-            let task = Task {
-                ready: true,
-                io: IoVec::new(),
-                id: NonZeroU64::new(1).unwrap(),
-            };
+            let mut task = Task::new();
+            task.ready = true;
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
             assert!(slab.is_occupied(idx));
@@ -569,11 +587,8 @@ mod tests {
         let mut slab = TaskSlab::new::<Ready<()>>(10);
         unsafe {
             let idx = slab.insert_vacant().unwrap();
-            let task = Task {
-                ready: true,
-                io: IoVec::new(),
-                id: NonZeroU64::new(1).unwrap(),
-            };
+            let mut task = Task::new();
+            task.ready = true;
             slab.init_task_unchecked(idx, task);
             slab.init_future_unchecked(idx, core::future::ready(()));
 

@@ -6,7 +6,6 @@ use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
 use std::io;
-use std::num::NonZeroU64;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
@@ -332,14 +331,9 @@ impl Runtime {
         }
     }
 
-    fn context_for(&mut self, index: u32) -> TaskContext {
-        assert!(
-            self.tasks.is_occupied(index),
-            "cannot build a context for an uninitialized slot"
-        );
-        let task_id = unsafe { self.tasks.task_unchecked(index) }.id;
+    fn context_for(&mut self, task_idx: u32) -> TaskContext {
         set_current_runtime(self as *mut Runtime);
-        TaskContext::new(index, task_id)
+        self.tasks.context_for(task_idx)
     }
 
     fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
@@ -533,23 +527,20 @@ where
 
     let ctx = RuntimeContext { generation, spawn };
 
-    let index = rt
+    let task_idx = rt
         .tasks
         .insert_vacant()
         .expect("failed to insert vacant task");
 
-    let task = Task {
-        ready: true,
-        io: IoVec::new(),
-        id: NonZeroU64::new(1).unwrap(),
-    };
-    unsafe { rt.tasks.init_task_unchecked(index, task) };
+    let mut task = Task::new();
+    task.ready = true;
+    unsafe { rt.tasks.init_task_unchecked(task_idx, task) };
 
-    let task_ctx = rt.context_for(index);
+    let task_ctx = rt.context_for(task_idx);
 
     let future = (make_fut)(task_ctx, ctx, user_data);
-    unsafe { rt.tasks.init_future_unchecked(index, future) };
-    rt.wakeups.push(index);
+    unsafe { rt.tasks.init_future_unchecked(task_idx, future) };
+    rt.wakeups.push(task_idx);
 
     let mut ready_tasks = Vec::new();
 
@@ -609,11 +600,8 @@ where
         let closure = unsafe { &*(data.make_fut as *const S) };
 
         let index = data.tasks.insert_vacant()?;
-        let task = Task {
-            ready: true,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let mut task = Task::new();
+        task.ready = true;
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let task_ctx = data.context_for(index);
@@ -765,11 +753,7 @@ mod tests {
 
     #[test]
     fn read_buffer_drop_recycles_slot() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -789,11 +773,7 @@ mod tests {
 
     #[test]
     fn read_buffer_stale_generation_skips_recycle() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -813,11 +793,7 @@ mod tests {
 
     #[test]
     fn read_buffer_into_vec_recycles_slot() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -840,11 +816,7 @@ mod tests {
 
     #[test]
     fn write_buffer_drop_recycles_slot() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -864,11 +836,7 @@ mod tests {
 
     #[test]
     fn write_buffer_stale_generation_skips_recycle() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -888,11 +856,7 @@ mod tests {
 
     #[test]
     fn write_buffer_helper_returns_slot_capacity() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -911,11 +875,7 @@ mod tests {
 
     #[test]
     fn write_buffer_as_mut_set_len_clear() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -941,11 +901,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds capacity")]
     fn write_buffer_set_len_above_capacity_panics() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1021,11 +977,7 @@ mod tests {
         data.io_slab[slot as usize].ready = 1;
 
         let index = data.tasks.insert_vacant().unwrap();
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let _gen = enter_active_gen();
@@ -1045,11 +997,7 @@ mod tests {
         // NOT setting ready yet
 
         let index = data.tasks.insert_vacant().unwrap();
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let _gen = enter_active_gen();
@@ -1074,11 +1022,7 @@ mod tests {
 
     #[test]
     fn yield_first_poll_returns_pending() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1095,11 +1039,7 @@ mod tests {
 
     #[test]
     fn yield_second_poll_returns_ready() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1116,11 +1056,7 @@ mod tests {
 
     #[test]
     fn yield_calls_wake_on_first_poll() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1140,11 +1076,7 @@ mod tests {
 
     #[test]
     fn task_context_with_task_reads_correct_task() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1158,11 +1090,7 @@ mod tests {
 
     #[test]
     fn task_context_with_task_modifies() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1176,11 +1104,7 @@ mod tests {
 
     #[test]
     fn task_context_with_runtime_reads_buffer_pool() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1194,11 +1118,7 @@ mod tests {
 
     #[test]
     fn task_context_with_runtime_after_removal_panics() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1220,11 +1140,7 @@ mod tests {
 
     #[test]
     fn task_context_wake_pushes_index() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1239,11 +1155,7 @@ mod tests {
 
     #[test]
     fn task_context_after_removal_panics() {
-        let task = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task) };
@@ -1265,11 +1177,7 @@ mod tests {
 
     #[test]
     fn task_context_after_slot_reuse_panics_without_touching_new_task() {
-        let task_a = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task_a = Task::new();
         let mut data = test_runtime_data(64);
         let index = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index, task_a) };
@@ -1283,11 +1191,8 @@ mod tests {
 
         let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
 
-        let task_b = Task {
-            ready: true,
-            io: IoVec::new(),
-            id: NonZeroU64::new(2).unwrap(),
-        };
+        let mut task_b = Task::new();
+        task_b.ready = true;
         unsafe { data.tasks.init_task_unchecked(index, task_b) };
         unsafe {
             data.tasks
@@ -1304,20 +1209,13 @@ mod tests {
 
     #[test]
     fn task_context_of_live_task_usable_alongside_other_tasks() {
-        let task_a = Task {
-            ready: false,
-            io: IoVec::new(),
-            id: NonZeroU64::new(1).unwrap(),
-        };
+        let task_a = Task::new();
         let mut data = test_runtime_data(64);
         let index_a = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index_a, task_a) };
 
-        let task_b = Task {
-            ready: true,
-            io: IoVec::new(),
-            id: NonZeroU64::new(2).unwrap(),
-        };
+        let mut task_b = Task::new();
+        task_b.ready = true;
         let index_b = data.tasks.insert_vacant().unwrap();
         unsafe { data.tasks.init_task_unchecked(index_b, task_b) };
 
