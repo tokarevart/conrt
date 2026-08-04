@@ -665,6 +665,7 @@ mod tests {
     use crate::levels::pack_bid;
     use crate::pbuf::ReadBuffer;
     use crate::task::IoUserData;
+    use crate::task::IoVec;
     use crate::task::Task;
     use crate::task::TaskSlab;
     use crate::wbuf::WriteBuffer;

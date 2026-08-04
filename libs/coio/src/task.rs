@@ -52,28 +52,22 @@ struct IoVecHeap {
     ptr: NonNull<u32>,
 }
 
-#[repr(C)]
-union IoVecRepr {
-    inline: IoVecInline,
-    heap: IoVecHeap,
-}
-
 /// A compact set of the io slab slots a task currently holds (its in-flight
 /// ops). Up to three slot indices are stored inline; beyond that the indices
 /// move to a heap allocation. The switch bit is the highest bit of `len`: when
 /// set, the heap arm of the union is live.
-pub struct IoVec {
-    repr: IoVecRepr,
+#[repr(C)]
+pub union IoVec {
+    inline: IoVecInline,
+    heap: IoVecHeap,
 }
 
 impl IoVec {
     pub fn new() -> Self {
         Self {
-            repr: IoVecRepr {
-                inline: IoVecInline {
-                    len: 0,
-                    inline: [0; IO_INLINE_CAP],
-                },
+            inline: IoVecInline {
+                len: 0,
+                inline: [0; IO_INLINE_CAP],
             },
         }
     }
@@ -82,11 +76,11 @@ impl IoVec {
         // `len` is the first field of both arms, so reading via the inline arm
         // is well-defined (u32 has no invalid bit patterns) regardless of the
         // live variant.
-        unsafe { self.repr.inline.len }
+        unsafe { self.inline.len }
     }
 
     fn set_len_field(&mut self, len: u32) {
-        self.repr.inline.len = len;
+        self.inline.len = len;
     }
 
     pub fn len(&self) -> usize {
@@ -103,7 +97,7 @@ impl IoVec {
 
     fn capacity(&self) -> usize {
         if self.is_heap() {
-            unsafe { self.repr.heap.cap as usize }
+            unsafe { self.heap.cap as usize }
         } else {
             IO_INLINE_CAP
         }
@@ -112,9 +106,9 @@ impl IoVec {
     fn slot_at(&self, i: usize) -> u32 {
         unsafe {
             if self.is_heap() {
-                *self.repr.heap.ptr.as_ptr().add(i)
+                *self.heap.ptr.as_ptr().add(i)
             } else {
-                self.repr.inline.inline[i]
+                self.inline.inline[i]
             }
         }
     }
@@ -122,9 +116,9 @@ impl IoVec {
     fn slot_at_mut(&mut self, i: usize) -> &mut u32 {
         unsafe {
             if self.is_heap() {
-                &mut *self.repr.heap.ptr.as_ptr().add(i)
+                &mut *self.heap.ptr.as_ptr().add(i)
             } else {
-                &mut self.repr.inline.inline[i]
+                &mut self.inline.inline[i]
             }
         }
     }
@@ -135,7 +129,7 @@ impl IoVec {
         if !self.is_heap() {
             if len < IO_INLINE_CAP {
                 unsafe {
-                    self.repr.inline.inline[len] = index;
+                    self.inline.inline[len] = index;
                 }
                 self.set_len_field(self.len_field() + 1);
                 return;
@@ -183,8 +177,8 @@ impl IoVec {
         assert!(!ptr.is_null(), "io vec allocation failed");
         let len = self.len_field() | IO_HEAP_FLAG;
         unsafe {
-            core::ptr::copy_nonoverlapping(self.repr.inline.inline.as_ptr(), ptr, IO_INLINE_CAP);
-            self.repr.heap = IoVecHeap {
+            core::ptr::copy_nonoverlapping(self.inline.inline.as_ptr(), ptr, IO_INLINE_CAP);
+            self.heap = IoVecHeap {
                 len,
                 cap: new_cap,
                 ptr: NonNull::new_unchecked(ptr),
@@ -193,7 +187,7 @@ impl IoVec {
     }
 
     fn grow_heap(&mut self) {
-        let (old_ptr, old_cap) = unsafe { (self.repr.heap.ptr, self.repr.heap.cap) };
+        let (old_ptr, old_cap) = unsafe { (self.heap.ptr, self.heap.cap) };
         let old_cap = old_cap as usize;
         let new_cap = old_cap * 2;
         let layout = Layout::array::<u32>(old_cap).unwrap();
@@ -203,8 +197,8 @@ impl IoVec {
         unsafe {
             core::ptr::copy_nonoverlapping(old_ptr.as_ptr(), ptr, old_cap);
             dealloc(old_ptr.as_ptr().cast(), layout);
-            self.repr.heap.ptr = NonNull::new_unchecked(ptr);
-            self.repr.heap.cap = new_cap as u32;
+            self.heap.ptr = NonNull::new_unchecked(ptr);
+            self.heap.cap = new_cap as u32;
         }
     }
 }
@@ -218,7 +212,7 @@ impl Default for IoVec {
 impl Drop for IoVec {
     fn drop(&mut self) {
         if self.is_heap() {
-            let (ptr, cap) = unsafe { (self.repr.heap.ptr, self.repr.heap.cap) };
+            let (ptr, cap) = unsafe { (self.heap.ptr, self.heap.cap) };
             let layout = Layout::array::<u32>(cap as usize).unwrap();
             unsafe { dealloc(ptr.as_ptr().cast(), layout) };
         }
