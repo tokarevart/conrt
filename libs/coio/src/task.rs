@@ -272,6 +272,11 @@ pub struct Task {
     /// runtime issues cancel requests for the task's in-flight io only when
     /// this is set; otherwise finished io runs to completion naturally.
     pub(crate) cancel_requested: bool,
+    /// Whether `outputs[my_index]` in the runtime's output slab holds a live
+    /// value: the output of the task this task joined, waiting to be read by
+    /// its [`JoinFuture`]. Set by the target's finish path; cleared when the
+    /// value is read or dropped.
+    pub(crate) output_pending: bool,
     /// Index of the task currently awaiting this task's completion via its
     /// [`JoinHandle`], or [`NO_JOINER`]. Task indices can never equal
     /// `NO_JOINER`, so the sentinel is unambiguous.
@@ -296,6 +301,7 @@ impl Task {
             ready: false,
             finished: false,
             cancel_requested: false,
+            output_pending: false,
             joiner: NO_JOINER,
             io: IoVec::new(),
             id,
@@ -354,10 +360,8 @@ impl TaskContext {
                 return Err(TaskContextError::TaskRemoved);
             }
 
-            unsafe {
-                if rt.tasks.task_unchecked(self.task_index).id != self.task_id {
-                    return Err(TaskContextError::TaskReused);
-                }
+            if rt.tasks.task(self.task_index).id != self.task_id {
+                return Err(TaskContextError::TaskReused);
             }
             Ok(())
         })
@@ -367,7 +371,7 @@ impl TaskContext {
         if let Err(e) = self.validate() {
             panic!("invalid TaskContext: {e}");
         }
-        runtime::with_runtime(|rt| unsafe { f(rt.tasks.task_mut_unchecked(self.task_index)) })
+        runtime::with_runtime(|rt| f(rt.tasks.task_mut(self.task_index)))
     }
 
     pub(crate) fn with_runtime<R>(&self, f: impl FnOnce(&mut Runtime) -> R) -> R {
@@ -401,31 +405,36 @@ impl TaskContext {
 /// counts as alive until it is fully removed: its future has finished and all
 /// of its io has been recycled.
 pub(crate) fn task_alive(index: u32, id: NonZeroU64) -> bool {
-    runtime::with_runtime(|rt| {
-        rt.tasks.is_occupied(index) && unsafe { rt.tasks.task_unchecked(index).id == id }
-    })
+    runtime::with_runtime(|rt| rt.tasks.is_occupied(index) && rt.tasks.task(index).id == id)
 }
 
 /// A handle to a spawned task. A task's in-flight io is not cancelled when it
 /// finishes; it runs to completion in the background unless
-/// [`cancel`](Self::cancel) is called on the handle.
+/// [`cancel`](Self::cancel) is called on the handle. The handle is generic
+/// over the task's output type `R`; [`join`](Self::join) yields `Option<R>`.
 #[derive(Debug)]
-pub struct JoinHandle {
+pub struct JoinHandle<R> {
     target: TaskContext,
+    _marker: core::marker::PhantomData<R>,
 }
 
-impl JoinHandle {
+impl<R> JoinHandle<R> {
     pub(crate) fn new(target: TaskContext) -> Self {
-        Self { target }
+        Self {
+            target,
+            _marker: core::marker::PhantomData,
+        }
     }
 
     /// Returns a future that resolves once the task has fully finished: its
-    /// future has returned and all of its io has been recycled. Consumes the
-    /// handle; recover it with [`JoinFuture::into_handle`] to wait later
-    /// instead.
-    pub fn join(self) -> JoinFuture {
+    /// future has returned and all of its io has been recycled. The future
+    /// yields the task's output, or `None` if the task was cancelled before
+    /// producing one. Consumes the handle; recover it with
+    /// [`JoinFuture::into_handle`] to wait later instead.
+    pub fn join(self) -> JoinFuture<R> {
         JoinFuture {
-            handle: self,
+            handle: Some(self),
+            me: None,
             registered: false,
         }
     }
@@ -445,14 +454,12 @@ impl JoinHandle {
             return false;
         }
         runtime::with_runtime(|rt| {
-            unsafe {
-                let task = rt.tasks.task_mut_unchecked(self.target.task_index);
-                if task.finished {
-                    return true;
-                }
-                task.finished = true;
-                task.cancel_requested = true;
+            let task = rt.tasks.task_mut(self.target.task_index);
+            if task.finished {
+                return true;
             }
+            task.finished = true;
+            task.cancel_requested = true;
             rt.wakeups.push(self.target.task_index);
             true
         })
@@ -460,48 +467,82 @@ impl JoinHandle {
 }
 
 /// A future returned by [`JoinHandle::join`]; resolves once the target task
-/// has fully finished and been removed.
-pub struct JoinFuture {
-    handle: JoinHandle,
+/// has fully finished and been removed, yielding its output as `Option<R>`
+/// (`None` if the task was cancelled before producing one).
+pub struct JoinFuture<R> {
+    handle: Option<JoinHandle<R>>,
+    /// This future's own task index, captured at registration. Needed to read
+    /// the output slot once the target is gone and to unregister on drop.
+    me: Option<u32>,
     registered: bool,
 }
 
-impl JoinFuture {
+impl<R> JoinFuture<R> {
     /// Recovers the [`JoinHandle`] so the wait can be resumed later with
     /// another [`JoinHandle::join`]. Unregisters this future's waiter first,
     /// so a later join can register again.
-    pub fn into_handle(self) -> JoinHandle {
-        if let Some(me) = runtime::current_task_index() {
-            let target = self.handle.target;
-            if task_alive(target.task_index, target.task_id) {
-                runtime::with_runtime(|rt| {
-                    let task = unsafe { rt.tasks.task_mut_unchecked(target.task_index) };
-                    if task.joiner == me {
-                        task.joiner = NO_JOINER;
-                    }
-                });
-            }
+    pub fn into_handle(mut self) -> JoinHandle<R> {
+        if let (Some(me), true) = (self.me, self.registered) {
+            self.unregister(me);
+            self.registered = false;
         }
-        self.handle
+        self.handle.take().expect("handle already taken")
+    }
+
+    fn unregister(&self, me: u32) {
+        let target = self.handle.as_ref().expect("handle present").target;
+        if task_alive(target.task_index, target.task_id) {
+            runtime::with_runtime(|rt| {
+                let task = rt.tasks.task_mut(target.task_index);
+                if task.joiner == me {
+                    task.joiner = NO_JOINER;
+                }
+            });
+        }
     }
 }
 
-impl Future for JoinFuture {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        let target = self.handle.target;
-        if !task_alive(target.task_index, target.task_id) {
-            return Poll::Ready(());
+impl<R> Drop for JoinFuture<R> {
+    fn drop(&mut self) {
+        // Unlink from the target on drop: otherwise a removed joiner leaves a
+        // stale index in `target.joiner`, and a later finish of the target
+        // would write its output into a slot that may have been reused.
+        if let (Some(me), true) = (self.me, self.registered) {
+            self.unregister(me);
         }
-        if !self.registered {
-            self.registered = true;
+    }
+}
+
+/// `JoinFuture` holds no pinned state: it only stores the handle, its own
+/// index and a flag, and the output is returned by value.
+impl<R> Unpin for JoinFuture<R> {}
+
+impl<R: 'static> Future for JoinFuture<R> {
+    type Output = Option<R>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let target = this.handle.as_ref().expect("handle present").target;
+        if !task_alive(target.task_index, target.task_id) {
+            return Poll::Ready(this.me.and_then(|me| {
+                runtime::with_runtime(|rt| {
+                    if rt.tasks.task(me).output_pending {
+                        Some(rt.tasks.take_output::<R>(me))
+                    } else {
+                        None
+                    }
+                })
+            }));
+        }
+        if !this.registered {
+            this.registered = true;
             if let Some(waiter) = runtime::current_task_index() {
                 runtime::with_runtime(|rt| {
-                    let task = unsafe { rt.tasks.task_mut_unchecked(target.task_index) };
+                    let task = rt.tasks.task_mut(target.task_index);
                     assert!(task.joiner == NO_JOINER, "task already has a joiner");
                     task.joiner = waiter;
                 });
+                this.me = Some(waiter);
             }
         }
         Poll::Pending
@@ -512,11 +553,17 @@ pub struct TaskSlab {
     tasks: Box<[MaybeUninit<Task>]>,
     futures: NonNull<u8>,
     future_type_id: TypeId,
+    outputs: NonNull<u8>,
+    output_type_id: TypeId,
     free: Box<[u64]>,
 }
 
 impl TaskSlab {
-    pub fn new<F: 'static>(capacity: u32) -> Self {
+    pub(crate) fn new<F, R>(capacity: u32) -> Self
+    where
+        F: Future<Output = R> + 'static,
+        R: 'static,
+    {
         let cap = capacity as usize;
         let mut tasks = Vec::with_capacity(cap);
         tasks.resize_with(cap, MaybeUninit::uninit);
@@ -527,10 +574,21 @@ impl TaskSlab {
         let futures = unsafe { alloc(layout) };
         let futures = NonNull::new(futures).expect("future allocation failed");
 
+        // Zero-sized `R` gets one byte per slot so the slot pointers stay
+        // within an allocation; reads and writes of a ZST are no-ops that
+        // produce the canonical value.
+        let array_layout = Layout::array::<R>(cap).unwrap();
+        let output_layout =
+            Layout::from_size_align(array_layout.size().max(1), array_layout.align()).unwrap();
+        let outputs = unsafe { alloc(output_layout) };
+        let outputs = NonNull::new(outputs).expect("output allocation failed");
+
         Self {
             tasks: tasks.into_boxed_slice(),
             futures,
             future_type_id: TypeId::of::<F>(),
+            outputs,
+            output_type_id: TypeId::of::<R>(),
             free,
         }
     }
@@ -541,7 +599,12 @@ impl TaskSlab {
         word < self.free.len() && self.free[word] & (1 << bit) == 0
     }
 
-    pub fn insert_vacant(&mut self) -> Option<u32> {
+    /// Claims a free slot, clearing its bit, and returns its index. The slot
+    /// is not initialized yet: the caller must populate it with
+    /// [`Self::insert`] (or the private init methods). Private because handing
+    /// out an uninitialized slot is unsafe: reads and teardown assume a clear
+    /// bit means a fully initialized task.
+    fn reserve(&mut self) -> Option<u32> {
         for (word_idx, word) in self.free.iter().enumerate() {
             if *word != 0 {
                 let bit = word.trailing_zeros();
@@ -558,15 +621,57 @@ impl TaskSlab {
         None
     }
 
-    /// # Safety
-    /// `index` must be an in-bounds, initialized slot.
-    pub unsafe fn task_unchecked(&self, index: u32) -> &Task {
+    /// Claims a free slot and initializes it with a task and a future in one
+    /// call, so a clear free bit always means a fully initialized slot. This
+    /// is the only safe way to create a task. Returns the new slot's index, or
+    /// `None` if the slab is full.
+    ///
+    /// The future is built from the slot's [`TaskContext`], which only exists
+    /// once the slot is claimed. `make_fut` must not panic: it runs after the
+    /// slot has been claimed but before its future is written, and a panic
+    /// would leave a partially initialized slot that teardown cannot drop
+    /// safely.
+    pub fn insert<F, R, S>(&mut self, task: Task, make_fut: S) -> Option<u32>
+    where
+        F: Future<Output = R> + 'static,
+        R: 'static,
+        S: FnOnce(TaskContext) -> F,
+    {
+        let index = self.reserve()?;
+        unsafe {
+            self.init_task(index, task);
+            self.init_future(index, make_fut(self.context_for(index)));
+        }
+        Some(index)
+    }
+
+    fn assert_in_bounds(&self, index: u32) {
+        assert!(
+            (index as usize) < self.tasks.len(),
+            "task slab: index {index} is out of bounds"
+        );
+    }
+
+    fn assert_occupied(&self, index: u32) {
+        assert!(
+            self.is_occupied(index),
+            "task slab: slot {index} is not initialized"
+        );
+    }
+
+    /// Returns the task at `index`. Panics if `index` is out of bounds or the
+    /// slot is not occupied.
+    pub fn task(&self, index: u32) -> &Task {
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
         unsafe { self.tasks[index as usize].assume_init_ref() }
     }
 
-    /// # Safety
-    /// `index` must be an in-bounds, initialized slot.
-    pub unsafe fn task_mut_unchecked(&mut self, index: u32) -> &mut Task {
+    /// Returns the task at `index` mutably. Panics if `index` is out of bounds
+    /// or the slot is not occupied.
+    pub fn task_mut(&mut self, index: u32) -> &mut Task {
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
         unsafe { self.tasks[index as usize].assume_init_mut() }
     }
 
@@ -577,7 +682,7 @@ impl TaskSlab {
             self.is_occupied(index),
             "cannot build a context for an uninitialized slot"
         );
-        let task_id = unsafe { self.task_unchecked(index) }.id;
+        let task_id = self.task(index).id;
         TaskContext::new(index, task_id)
     }
 
@@ -588,40 +693,108 @@ impl TaskSlab {
         unsafe { base.add(index as usize) as _ }
     }
 
-    /// # Safety
-    /// `index` must be an in-bounds, initialized slot.
-    pub unsafe fn future_mut_unchecked<F: 'static>(&mut self, index: u32) -> &mut F {
+    /// Returns a pointer to the byte slot backing output `index`. The slot is
+    /// only valid for the `R` the slab was created for.
+    fn output_slot<R>(&self, index: u32) -> *mut MaybeUninit<u8> {
+        let base = self.outputs.as_ptr().cast::<R>();
+        unsafe { base.add(index as usize) as _ }
+    }
+
+    /// Returns the future at `index` mutably. Panics unless `F` matches the
+    /// type the slab was created for and the slot is in bounds and occupied.
+    pub fn future_mut<F: 'static>(&mut self, index: u32) -> &mut F {
         assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
         unsafe { &mut *(self.future_slot::<F>(index) as *mut F) }
     }
 
     /// # Safety
-    /// `index` must be an in-bounds slot that has not already been initialized.
-    pub unsafe fn init_task_unchecked(&mut self, index: u32, task: Task) {
+    /// `index` must be an in-bounds slot that was claimed with
+    /// [`Self::insert`] and whose task has not already been initialized.
+    /// Initializing a slot a second time overwrites a live task without
+    /// dropping it: its in-flight io is no longer tracked by the slot, and a
+    /// stale CQE landing on a recycled slot can corrupt the runtime's io and
+    /// buffer state.
+    unsafe fn init_task(&mut self, index: u32, task: Task) {
+        self.assert_in_bounds(index);
         self.tasks[index as usize] = MaybeUninit::new(task);
     }
 
     /// # Safety
-    /// `index` must be an in-bounds slot that has not already been initialized.
-    pub unsafe fn init_future_unchecked<F: 'static>(&mut self, index: u32, future: F) {
+    /// `index` must be an in-bounds slot whose task has already been
+    /// initialized (so the slot was claimed via [`Self::insert`]), and whose
+    /// future has not already been written. `F` must match the type the slab
+    /// was created for. Initializing a second time leaks the previous future
+    /// and can leave the slot in a state the runtime does not expect.
+    unsafe fn init_future<F: 'static>(&mut self, index: u32, future: F) {
         assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        self.assert_in_bounds(index);
         unsafe { (self.future_slot::<F>(index) as *mut F).write(future) };
     }
 
-    pub fn task_ptr_unchecked(&mut self, index: u32) -> *mut Task {
+    /// Returns a raw pointer to the task at `index`. Panics if `index` is out
+    /// of bounds or the slot is not occupied. The pointer stays valid while
+    /// the task stays in its slot.
+    pub fn task_ptr(&mut self, index: u32) -> *mut Task {
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
         self.tasks[index as usize].as_mut_ptr()
     }
 
-    pub fn future_ptr_unchecked<F: 'static>(&mut self, index: u32) -> *mut F {
+    /// Returns a raw pointer to the future at `index`. Panics unless `F`
+    /// matches the type the slab was created for and the slot is in bounds and
+    /// occupied.
+    pub fn future_ptr<F: 'static>(&mut self, index: u32) -> *mut F {
         assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
         self.future_slot::<F>(index) as *mut F
     }
 
-    /// # Safety
-    /// `index` must be an in-bounds, initialized slot that has not already
-    /// been removed.
-    pub unsafe fn remove_unchecked<F: 'static>(&mut self, index: u32) -> Task {
+    /// Stores a finished task's output into the slot its joiner holds and
+    /// marks it pending. `R` must match the type the slab was created for, the
+    /// joiner slot must be in bounds and occupied, and it must not already hold
+    /// an unconsumed output.
+    pub fn init_output<R: 'static>(&mut self, index: u32, value: R) {
+        assert_eq!(TypeId::of::<R>(), self.output_type_id);
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
+        assert!(
+            !unsafe { self.tasks[index as usize].assume_init_ref() }.output_pending,
+            "task slab: slot {index} already holds an unconsumed output"
+        );
+        unsafe { (self.output_slot::<R>(index) as *mut R).write(value) };
+        self.task_mut(index).output_pending = true;
+    }
+
+    /// Reads and removes the output stored in slot `index`, marking it
+    /// consumed. `R` must match the type the slab was created for, the slot
+    /// must be in bounds and occupied, and it must hold an unconsumed output.
+    pub fn take_output<R: 'static>(&mut self, index: u32) -> R {
+        assert_eq!(TypeId::of::<R>(), self.output_type_id);
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
+        assert!(
+            unsafe { self.tasks[index as usize].assume_init_ref() }.output_pending,
+            "task slab: slot {index} holds no unconsumed output"
+        );
+        let output = unsafe { (self.output_slot::<R>(index) as *mut R).read() };
+        self.task_mut(index).output_pending = false;
+        output
+    }
+
+    /// Removes the task at `index`, dropping its future and any unconsumed
+    /// output, and frees the slot. `F` and `R` must match the types the slab
+    /// was created for and the slot must be in bounds and occupied.
+    pub fn remove<F: 'static, R: 'static>(&mut self, index: u32) -> Task {
         assert_eq!(TypeId::of::<F>(), self.future_type_id);
+        assert_eq!(TypeId::of::<R>(), self.output_type_id);
+        self.assert_in_bounds(index);
+        self.assert_occupied(index);
+        if self.task(index).output_pending {
+            unsafe { core::ptr::drop_in_place(self.output_slot::<R>(index).cast::<R>()) };
+        }
         let word = index as usize / 64;
         let bit = index as usize % 64;
         self.free[word] |= 1 << bit;
@@ -647,6 +820,24 @@ impl TaskSlab {
             unsafe { dealloc(this.futures.as_ptr(), layout) };
         }
     }
+
+    /// # Safety
+    /// `slab` must point to a live slab that is never used again. `R` must
+    /// match the type the slab was created for. Drops any unconsumed outputs
+    /// still sitting in their joiners' slots and frees the output slab.
+    pub unsafe fn drop_outputs_raw<R: 'static>(slab: *mut TaskSlab) {
+        let this = unsafe { &*slab };
+        assert_eq!(TypeId::of::<R>(), this.output_type_id);
+        let array_layout = Layout::array::<R>(this.tasks.len()).unwrap();
+        for index in 0..this.tasks.len() as u32 {
+            if this.is_occupied(index) && this.task(index).output_pending {
+                unsafe { core::ptr::drop_in_place(this.output_slot::<R>(index).cast::<R>()) };
+            }
+        }
+        let layout =
+            Layout::from_size_align(array_layout.size().max(1), array_layout.align()).unwrap();
+        unsafe { dealloc(this.outputs.as_ptr(), layout) };
+    }
 }
 
 #[cfg(test)]
@@ -659,7 +850,7 @@ mod tests {
 
     #[test]
     fn slab_new_large_capacity() {
-        let slab = TaskSlab::new::<Ready<()>>(128);
+        let slab = TaskSlab::new::<Ready<()>, ()>(128);
         assert_eq!(slab.tasks.len(), 128);
         assert_eq!(slab.free.len(), 2); // 128 / 64 = 2 words
         assert_eq!(slab.free[0], u64::MAX);
@@ -667,83 +858,164 @@ mod tests {
     }
 
     #[test]
-    fn insert_vacant_sequential() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        assert_eq!(slab.insert_vacant(), Some(0));
-        assert_eq!(slab.insert_vacant(), Some(1));
-        assert_eq!(slab.insert_vacant(), Some(2));
+    fn reserve_sequential() {
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(10);
+        assert_eq!(slab.reserve(), Some(0));
+        assert_eq!(slab.reserve(), Some(1));
+        assert_eq!(slab.reserve(), Some(2));
     }
 
     #[test]
-    fn insert_vacant_exhaustion() {
-        let mut slab = TaskSlab::new::<Ready<()>>(3);
-        assert_eq!(slab.insert_vacant(), Some(0));
-        assert_eq!(slab.insert_vacant(), Some(1));
-        assert_eq!(slab.insert_vacant(), Some(2));
-        assert_eq!(slab.insert_vacant(), None);
+    fn reserve_exhaustion() {
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(3);
+        assert_eq!(slab.reserve(), Some(0));
+        assert_eq!(slab.reserve(), Some(1));
+        assert_eq!(slab.reserve(), Some(2));
+        assert_eq!(slab.reserve(), None);
     }
 
     #[test]
     fn init_and_retrieve_task() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let mut task = Task::new();
-            task.ready = true;
-            slab.init_task_unchecked(idx, task);
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab.insert(task, |_| core::future::ready(())).unwrap();
 
-            let ptr = slab.task_ptr_unchecked(idx);
-            assert!((*ptr).ready);
-        }
+        let ptr = slab.task_ptr(idx);
+        unsafe { assert!((*ptr).ready) };
     }
 
     #[test]
     fn is_occupied_initially_false() {
-        let slab = TaskSlab::new::<Ready<()>>(10);
+        let slab = TaskSlab::new::<Ready<()>, ()>(10);
         assert!(!slab.is_occupied(0));
     }
 
     #[test]
     fn is_occupied_after_init() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let mut task = Task::new();
-            task.ready = true;
-            slab.init_task_unchecked(idx, task);
-            slab.init_future_unchecked(idx, core::future::ready(()));
-            assert!(slab.is_occupied(idx));
-        }
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab.insert(task, |_| core::future::ready(())).unwrap();
+        assert!(slab.is_occupied(idx));
     }
 
     #[test]
-    fn remove_unchecked_returns_values_and_frees_slot() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
-        unsafe {
-            let idx = slab.insert_vacant().unwrap();
-            let mut task = Task::new();
-            task.ready = true;
-            slab.init_task_unchecked(idx, task);
-            slab.init_future_unchecked(idx, core::future::ready(()));
+    fn remove_returns_values_and_frees_slot() {
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab.insert(task, |_| core::future::ready(())).unwrap();
 
-            let t = slab.remove_unchecked::<Ready<()>>(idx);
-            assert!(t.ready);
-            // future is Ready<()>, dropping it after taking is fine
+        let t = slab.remove::<Ready<()>, ()>(idx);
+        assert!(t.ready);
+        // future is Ready<()>, dropping it after taking is fine
 
-            // Slot should now be free again
-            assert!(!slab.is_occupied(idx));
-            let next_idx = slab.insert_vacant().unwrap();
-            assert_eq!(next_idx, idx); // reused
-        }
+        // Slot should now be free again
+        assert!(!slab.is_occupied(idx));
+        let next_idx = slab
+            .insert(Task::new(), |_| core::future::ready(()))
+            .unwrap();
+        assert_eq!(next_idx, idx); // reused
     }
 
     #[test]
     fn future_type_mismatch_panics() {
-        let mut slab = TaskSlab::new::<Ready<()>>(10);
+        let mut slab = TaskSlab::new::<Ready<()>, ()>(10);
+        let idx = slab
+            .insert(Task::new(), |_| core::future::ready(()))
+            .unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = slab.future_ptr_unchecked::<Ready<u8>>(0);
+            unsafe { slab.init_future::<Ready<u8>>(idx, core::future::ready(42u8)) };
         }));
         assert!(result.is_err());
+    }
+
+    // ── output slab ───────────────────────────────────────────────────
+
+    #[test]
+    fn output_slab_roundtrip() {
+        let mut slab = TaskSlab::new::<Ready<u32>, u32>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab.insert(task, |_| core::future::ready(42u32)).unwrap();
+
+        slab.init_output::<u32>(idx, 42);
+        assert_eq!(slab.take_output::<u32>(idx), 42);
+
+        // Recycle the slot; output slab is indexed the same way.
+        let _ = slab.remove::<Ready<u32>, u32>(idx);
+        let next = slab
+            .insert(Task::new(), |_| core::future::ready(42u32))
+            .unwrap();
+        assert_eq!(next, idx);
+    }
+
+    struct DropCounter(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn remove_drops_pending_output() {
+        let output_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let future_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut slab = TaskSlab::new::<Ready<DropCounter>, DropCounter>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab
+            .insert(task, |_| {
+                core::future::ready(DropCounter(future_drops.clone()))
+            })
+            .unwrap();
+        slab.init_output::<DropCounter>(idx, DropCounter(output_drops.clone()));
+
+        let _ = slab.remove::<Ready<DropCounter>, DropCounter>(idx);
+        assert_eq!(output_drops.get(), 1);
+        assert_eq!(future_drops.get(), 1);
+    }
+
+    #[test]
+    fn remove_keeps_consumed_output() {
+        let output_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let future_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut slab = TaskSlab::new::<Ready<DropCounter>, DropCounter>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab
+            .insert(task, |_| {
+                core::future::ready(DropCounter(future_drops.clone()))
+            })
+            .unwrap();
+        slab.init_output::<DropCounter>(idx, DropCounter(output_drops.clone()));
+
+        // The joiner consumed the output: flag cleared, removal drops nothing.
+        slab.task_mut(idx).output_pending = false;
+        let _ = slab.remove::<Ready<DropCounter>, DropCounter>(idx);
+        assert_eq!(output_drops.get(), 0);
+        assert_eq!(future_drops.get(), 1);
+    }
+
+    #[test]
+    fn drop_outputs_raw_drops_unconsumed_outputs() {
+        let output_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let future_drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut slab = TaskSlab::new::<Ready<DropCounter>, DropCounter>(10);
+        let mut task = Task::new();
+        task.ready = true;
+        let idx = slab
+            .insert(task, |_| {
+                core::future::ready(DropCounter(future_drops.clone()))
+            })
+            .unwrap();
+        slab.init_output::<DropCounter>(idx, DropCounter(output_drops.clone()));
+
+        unsafe { TaskSlab::drop_outputs_raw::<DropCounter>(&mut slab) };
+        assert_eq!(output_drops.get(), 1);
+        assert_eq!(future_drops.get(), 0);
     }
 
     // ── IoVec ─────────────────────────────────────────────────────────

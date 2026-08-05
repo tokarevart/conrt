@@ -35,7 +35,7 @@ fn block_on_with_spawn() {
     };
     block_on(
         rt,
-        |_, rt: RuntimeContext<u32>, data: u32| async move {
+        |_, rt: RuntimeContext<u32, ()>, data: u32| async move {
             if data < 3 {
                 rt.spawn(data + 1);
             }
@@ -54,7 +54,7 @@ fn block_on_spawn_chain() {
     };
     block_on(
         rt,
-        |_, rt: RuntimeContext<u32>, data: u32| async move {
+        |_, rt: RuntimeContext<u32, ()>, data: u32| async move {
             if data < 3 {
                 rt.spawn(data + 1);
                 rt.spawn(data + 2);
@@ -71,7 +71,7 @@ fn stale_runtime_context_panics_outside_block_on() {
     use std::panic::catch_unwind;
 
     thread_local! {
-        static STASH: RefCell<Option<RuntimeContext<u32>>> = const { RefCell::new(None) };
+        static STASH: RefCell<Option<RuntimeContext<u32, ()>>> = const { RefCell::new(None) };
     }
 
     let rt = RuntimeParams {
@@ -82,7 +82,7 @@ fn stale_runtime_context_panics_outside_block_on() {
     };
     block_on(
         rt,
-        |_, rt: RuntimeContext<u32>, _data: u32| async move {
+        |_, rt: RuntimeContext<u32, ()>, _data: u32| async move {
             STASH.with(|s| *s.borrow_mut() = Some(rt));
         },
         0,
@@ -139,7 +139,7 @@ fn stale_runtime_context_from_previous_run_panics() {
     use std::panic::catch_unwind;
 
     thread_local! {
-        static STASH: RefCell<Option<RuntimeContext<u32>>> = const { RefCell::new(None) };
+        static STASH: RefCell<Option<RuntimeContext<u32, ()>>> = const { RefCell::new(None) };
     }
 
     let rt = RuntimeParams {
@@ -150,7 +150,7 @@ fn stale_runtime_context_from_previous_run_panics() {
     };
     block_on(
         rt,
-        |_, rt: RuntimeContext<u32>, _data: u32| async move {
+        |_, rt: RuntimeContext<u32, ()>, _data: u32| async move {
             STASH.with(|s| *s.borrow_mut() = Some(rt));
         },
         0,
@@ -164,7 +164,7 @@ fn stale_runtime_context_from_previous_run_panics() {
     };
     block_on(
         rt2,
-        |_, _rt: RuntimeContext<u32>, _data: u32| async move {
+        |_, _rt: RuntimeContext<u32, ()>, _data: u32| async move {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 STASH.with(|s| {
                     if let Some(ctx) = s.borrow().as_ref() {
@@ -234,10 +234,95 @@ fn block_on_read_full_buffer() {
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let data = read(ctx, fd, 16).await.unwrap();
-            assert_eq!(data.as_ref(), b"hello world");
+            let data = read(ctx, fd, 5).await.unwrap();
+            assert_eq!(data.as_ref(), b"hello");
         },
         fd,
+    );
+}
+
+#[test]
+fn block_on_returns_main_output() {
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    let out = block_on(rt, |_, _rt, data: u32| async move { data + 1 }, 41);
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn join_yields_task_output() {
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    let out = block_on(
+        rt,
+        |_, rt: RuntimeContext<u32, u32>, data: u32| async move {
+            if data < 42
+                && let Some(handle) = rt.spawn(data + 1)
+            {
+                let joined = handle.join().await;
+                assert_eq!(joined, Some(data + 1));
+            }
+            data
+        },
+        41,
+    );
+    assert_eq!(out, 41);
+}
+
+#[test]
+fn join_after_cancel_returns_none() {
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    let out = block_on(
+        rt,
+        |_, rt: RuntimeContext<u32, u32>, data: u32| async move {
+            if data < 42
+                && let Some(handle) = rt.spawn(data + 1)
+            {
+                assert!(handle.cancel());
+                let joined = handle.join().await;
+                assert_eq!(joined, None);
+            }
+            7
+        },
+        41,
+    );
+    assert_eq!(out, 7);
+}
+
+#[test]
+fn into_handle_resumes_later_join() {
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        read_levels: &[Level { size: 16, count: 4 }],
+        write_levels: &[Level { size: 16, count: 4 }],
+    };
+    block_on(
+        rt,
+        |_, rt: RuntimeContext<u32, u32>, data: u32| async move {
+            if data < 42
+                && let Some(handle) = rt.spawn(data + 1)
+            {
+                // The target runs to completion unjoined; the handle can be
+                // dropped without corrupting the output slab.
+                let _ = handle.join().into_handle();
+            }
+            0
+        },
+        41,
     );
 }
 

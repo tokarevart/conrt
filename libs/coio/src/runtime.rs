@@ -361,8 +361,8 @@ impl Runtime {
     /// to completion instead of issuing cancel requests. The task stays in its
     /// slot until its io drains, so a CQE can never land on a recycled slot
     /// and the finished-task branch of [`Self::drain_cqes`] is airtight.
-    fn finalize_task<F: 'static>(&mut self, idx: u32) {
-        let task_ptr = self.tasks.task_ptr_unchecked(idx);
+    fn finalize_task<F: 'static, R: 'static>(&mut self, idx: u32) {
+        let task_ptr = self.tasks.task_ptr(idx);
         unsafe {
             assert!((*task_ptr).finished);
         }
@@ -386,7 +386,7 @@ impl Runtime {
         }
 
         if unsafe { (*task_ptr).io.is_empty() } {
-            self.remove_task::<F>(idx);
+            self.remove_task::<F, R>(idx);
         }
     }
 
@@ -395,7 +395,7 @@ impl Runtime {
     /// is recycled by the same finished-task drain path as the victim's.
     fn push_cancel(&mut self, idx: u32, victim_slot: u32) {
         let cancel_slot = self.alloc_io_slot();
-        unsafe { self.tasks.task_mut_unchecked(idx).io.push(cancel_slot) };
+        self.tasks.task_mut(idx).io.push(cancel_slot);
 
         let victim_ud = IoUserData {
             index: idx,
@@ -416,26 +416,19 @@ impl Runtime {
             // Ring full: the victim's natural CQE will still recycle its slot,
             // so give up the cancel slot.
             self.free_io_slot(cancel_slot);
-            unsafe {
-                self.tasks
-                    .task_mut_unchecked(idx)
-                    .io
-                    .remove_value(cancel_slot)
-            };
+            self.tasks.task_mut(idx).io.remove_value(cancel_slot);
         }
     }
 
     /// Removes a finished task whose io has fully drained, waking the task
     /// blocked on its [`JoinHandle`], if any.
-    fn remove_task<F: 'static>(&mut self, idx: u32) {
-        assert!(unsafe { self.tasks.task_unchecked(idx).finished });
-        let joiner = unsafe { self.tasks.task_mut_unchecked(idx).joiner };
+    fn remove_task<F: 'static, R: 'static>(&mut self, idx: u32) {
+        assert!(self.tasks.task(idx).finished);
+        let joiner = self.tasks.task_mut(idx).joiner;
         if joiner != NO_JOINER {
             self.wakeups.push(joiner);
         }
-        unsafe {
-            self.tasks.remove_unchecked::<F>(idx);
-        }
+        self.tasks.remove::<F, R>(idx);
     }
 
     fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
@@ -449,40 +442,35 @@ impl Runtime {
                 continue;
             }
 
-            unsafe {
-                if !self.tasks.is_occupied(task_index) {
-                    continue;
-                }
-                if self.tasks.task_unchecked(task_index).finished {
-                    // The task is done and only waiting for its io to drain:
-                    // recycle the slot now and let the loop finalize the
-                    // removal once the last slot is gone. `free_io_slot` is
-                    // inlined since the ring borrow rules it out here.
-                    self.tasks
-                        .task_mut_unchecked(task_index)
-                        .io
-                        .remove_value(io_slot);
-                    self.io_slab[io_slot as usize] = IoSlot::default();
-                    self.free_io_slots.push(io_slot);
-                    if self.tasks.task_unchecked(task_index).io.is_empty() {
-                        ready.push(task_index);
-                    }
-                    continue;
-                }
-                let slot = &mut self.io_slab[io_slot as usize];
-                slot.result = result;
-                // Only reads report a selected buffer via the CQE flags;
-                // writes store their own slot id in `bids`, so leave it
-                // untouched when no buffer flag is present.
-                if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
-                    slot.bid = bid;
-                }
-                slot.ready = 1;
-                let task = self.tasks.task_mut_unchecked(task_index);
-                if !task.ready {
-                    task.ready = true;
+            if !self.tasks.is_occupied(task_index) {
+                continue;
+            }
+            if self.tasks.task(task_index).finished {
+                // The task is done and only waiting for its io to drain:
+                // recycle the slot now and let the loop finalize the
+                // removal once the last slot is gone. `free_io_slot` is
+                // inlined since the ring borrow rules it out here.
+                self.tasks.task_mut(task_index).io.remove_value(io_slot);
+                self.io_slab[io_slot as usize] = IoSlot::default();
+                self.free_io_slots.push(io_slot);
+                if self.tasks.task(task_index).io.is_empty() {
                     ready.push(task_index);
                 }
+                continue;
+            }
+            let slot = &mut self.io_slab[io_slot as usize];
+            slot.result = result;
+            // Only reads report a selected buffer via the CQE flags;
+            // writes store their own slot id in `bids`, so leave it
+            // untouched when no buffer flag is present.
+            if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
+                slot.bid = bid;
+            }
+            slot.ready = 1;
+            let task = self.tasks.task_mut(task_index);
+            if !task.ready {
+                task.ready = true;
+                ready.push(task_index);
             }
         }
     }
@@ -587,18 +575,20 @@ fn build_pools(ring: &io_uring::IoUring, read_spec: &[Level], write_spec: &[Leve
     (slab, read_levels, buffer_pools, write_levels, write_pools)
 }
 
-pub fn block_on_default<S, F, T>(make_fut: S, user_data: T)
+pub fn block_on_default<S, F, T, R>(make_fut: S, user_data: T) -> R
 where
-    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-    F: Future<Output = ()> + 'static,
+    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
+    F: Future<Output = R> + 'static,
+    R: 'static,
 {
     block_on(RuntimeParams::default(), make_fut, user_data)
 }
 
-pub fn block_on<S, F, T>(params: RuntimeParams<'_>, make_fut: S, user_data: T)
+pub fn block_on<S, F, T, R>(params: RuntimeParams<'_>, make_fut: S, user_data: T) -> R
 where
-    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-    F: Future<Output = ()> + 'static,
+    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
+    F: Future<Output = R> + 'static,
+    R: 'static,
 {
     let _gen_guard = enter_active_gen();
     let generation = _gen_guard.get();
@@ -615,7 +605,7 @@ where
         build_pools(&ring, params.read_levels, params.write_levels);
 
     let mut rt = Runtime {
-        tasks: TaskSlab::new::<F>(params.tasks_capacity),
+        tasks: TaskSlab::new::<F, R>(params.tasks_capacity),
         wakeups: Vec::new(),
         io_slab: Vec::new(),
         free_io_slots: Vec::new(),
@@ -631,29 +621,25 @@ where
     let rt_ptr: *mut Runtime = &mut rt;
     set_current_runtime(rt_ptr);
     let _rt_guard = DropGuard::new(clear_current_runtime);
-    let _drop_guard =
-        DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
+    let _drop_guard = DropGuard::new(move || unsafe {
+        TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks);
+        TaskSlab::drop_outputs_raw::<R>(&mut (*rt_ptr).tasks);
+    });
 
-    let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<JoinHandle> = spawn::<S, F, T>;
+    let spawn: unsafe fn(RuntimeContext<T, R>, T) -> Option<JoinHandle<R>> = spawn::<S, F, T, R>;
 
     let ctx = RuntimeContext { generation, spawn };
 
-    let task_idx = rt
-        .tasks
-        .insert_vacant()
-        .expect("failed to insert vacant task");
-
     let mut task = Task::new();
     task.ready = true;
-    unsafe { rt.tasks.init_task_unchecked(task_idx, task) };
-
-    let task_ctx = rt.context_for(task_idx);
-
-    let future = (make_fut)(task_ctx, ctx, user_data);
-    unsafe { rt.tasks.init_future_unchecked(task_idx, future) };
+    let task_idx = rt
+        .tasks
+        .insert(task, |task_ctx| (make_fut)(task_ctx, ctx, user_data))
+        .expect("failed to insert vacant task");
     rt.wakeups.push(task_idx);
 
     let mut ready_tasks = Vec::new();
+    let mut main_output: Option<R> = None;
 
     loop {
         core::mem::swap(&mut rt.wakeups, &mut ready_tasks);
@@ -666,23 +652,33 @@ where
                 continue;
             }
 
-            if unsafe { rt.tasks.task_unchecked(idx).finished } {
-                rt.finalize_task::<F>(idx);
+            if rt.tasks.task(idx).finished {
+                rt.finalize_task::<F, R>(idx);
                 continue;
             }
 
-            unsafe { rt.tasks.task_mut_unchecked(idx).ready = false };
+            rt.tasks.task_mut(idx).ready = false;
 
             CURRENT_TASK_INDEX.with(|c| c.set(Some(idx)));
             let mut cx = Context::from_waker(Waker::noop());
-            let future_ptr = rt.tasks.future_ptr_unchecked::<F>(idx);
+            let future_ptr = rt.tasks.future_ptr::<F>(idx);
             let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
             let poll_result = future.poll(&mut cx);
             CURRENT_TASK_INDEX.with(|c| c.set(None));
 
-            if poll_result.is_ready() {
-                unsafe { rt.tasks.task_mut_unchecked(idx).finished = true };
-                rt.finalize_task::<F>(idx);
+            if let Poll::Ready(output) = poll_result {
+                if idx == task_idx {
+                    main_output = Some(output);
+                } else {
+                    let joiner = rt.tasks.task_mut(idx).joiner;
+                    if joiner == NO_JOINER {
+                        drop(output);
+                    } else {
+                        rt.tasks.init_output::<R>(joiner, output);
+                    }
+                }
+                rt.tasks.task_mut(idx).finished = true;
+                rt.finalize_task::<F, R>(idx);
             }
         }
 
@@ -699,32 +695,34 @@ where
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
             Err(_) => {
-                return;
+                return main_output
+                    .expect("block_on: submit failed before the main future completed");
             }
         }
     }
+
+    main_output.expect(
+        "block_on: the main future ended Pending with no pending io or wakeups and can never \
+         complete",
+    )
 }
 
-unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<JoinHandle>
+unsafe fn spawn<S, F, T, R>(ctx: RuntimeContext<T, R>, user_data: T) -> Option<JoinHandle<R>>
 where
-    S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
-    F: Future<Output = ()> + 'static,
+    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
+    F: Future<Output = R> + 'static,
+    R: 'static,
 {
     with_runtime(|data| {
         let closure = unsafe { &*(data.make_fut as *const S) };
 
-        let index = data.tasks.insert_vacant()?;
         let mut task = Task::new();
         task.ready = true;
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |task_ctx| closure(task_ctx, ctx, user_data))?;
 
-        let task_ctx = data.context_for(index);
-        let handle = JoinHandle::new(task_ctx);
-
-        let future = closure(task_ctx, ctx, user_data);
-        unsafe {
-            data.tasks.init_future_unchecked(index, future);
-        }
+        let handle = JoinHandle::new(data.context_for(index));
 
         data.wakeups.push(index);
 
@@ -733,21 +731,21 @@ where
 }
 
 #[derive(Debug)]
-pub struct RuntimeContext<T> {
+pub struct RuntimeContext<T, R> {
     generation: NonZeroU32,
-    spawn: unsafe fn(RuntimeContext<T>, T) -> Option<JoinHandle>,
+    spawn: unsafe fn(RuntimeContext<T, R>, T) -> Option<JoinHandle<R>>,
 }
 
-impl<T> Clone for RuntimeContext<T> {
+impl<T, R> Clone for RuntimeContext<T, R> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T> Copy for RuntimeContext<T> {}
+impl<T, R> Copy for RuntimeContext<T, R> {}
 
-impl<T> RuntimeContext<T> {
-    pub fn spawn(&self, user_data: T) -> Option<JoinHandle> {
+impl<T, R> RuntimeContext<T, R> {
+    pub fn spawn(&self, user_data: T) -> Option<JoinHandle<R>> {
         assert!(
             active_gen_matches(self.generation),
             "RuntimeContext used outside the runtime it belongs to"
@@ -782,7 +780,7 @@ mod tests {
                 count: 4,
             }]);
         Runtime {
-            tasks: TaskSlab::new::<Ready<()>>(capacity),
+            tasks: TaskSlab::new::<Ready<()>, ()>(capacity),
             wakeups: Vec::new(),
             io_slab: Vec::new(),
             free_io_slots: Vec::new(),
@@ -870,8 +868,10 @@ mod tests {
     fn read_buffer_drop_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
@@ -890,8 +890,10 @@ mod tests {
     fn read_buffer_stale_generation_skips_recycle() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
@@ -910,8 +912,10 @@ mod tests {
     fn read_buffer_into_vec_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
@@ -933,8 +937,10 @@ mod tests {
     fn write_buffer_drop_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
@@ -953,8 +959,10 @@ mod tests {
     fn write_buffer_stale_generation_skips_recycle() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
@@ -973,8 +981,10 @@ mod tests {
     fn write_buffer_helper_returns_slot_capacity() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -992,8 +1002,10 @@ mod tests {
     fn write_buffer_as_mut_set_len_clear() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1018,8 +1030,10 @@ mod tests {
     fn write_buffer_set_len_above_capacity_panics() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1091,9 +1105,10 @@ mod tests {
         data.io_slab[slot as usize].result = 42;
         data.io_slab[slot as usize].ready = 1;
 
-        let index = data.tasks.insert_vacant().unwrap();
-        let task = Task::new();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(Task::new(), |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1111,9 +1126,10 @@ mod tests {
         let slot = data.alloc_io_slot();
         // NOT setting ready yet
 
-        let index = data.tasks.insert_vacant().unwrap();
-        let task = Task::new();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(Task::new(), |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1139,8 +1155,10 @@ mod tests {
     fn yield_first_poll_returns_pending() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1156,8 +1174,10 @@ mod tests {
     fn yield_second_poll_returns_ready() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1173,8 +1193,10 @@ mod tests {
     fn yield_calls_wake_on_first_poll() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1193,8 +1215,10 @@ mod tests {
     fn task_context_with_task_reads_correct_task() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1207,22 +1231,26 @@ mod tests {
     fn task_context_with_task_modifies() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
         ctx.with_task(|t| t.ready = true);
-        assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
+        assert!(data.tasks.task(index).ready);
     }
 
     #[test]
     fn task_context_with_runtime_reads_buffer_pool() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1235,17 +1263,15 @@ mod tests {
     fn task_context_with_runtime_after_removal_panics() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
-        unsafe {
-            data.tasks
-                .init_future_unchecked(index, core::future::ready(()))
-        };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+        let _ = data.tasks.remove::<Ready<()>, ()>(index);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_runtime(|_r| ());
@@ -1257,8 +1283,10 @@ mod tests {
     fn task_context_wake_pushes_index() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
@@ -1272,17 +1300,15 @@ mod tests {
     fn task_context_after_removal_panics() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task) };
-        unsafe {
-            data.tasks
-                .init_future_unchecked(index, core::future::ready(()))
-        };
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+        let _ = data.tasks.remove::<Ready<()>, ()>(index);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_task(|_t| ());
@@ -1294,45 +1320,46 @@ mod tests {
     fn task_context_after_slot_reuse_panics_without_touching_new_task() {
         let task_a = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index, task_a) };
-        unsafe {
-            data.tasks
-                .init_future_unchecked(index, core::future::ready(()))
-        };
+        let index = data
+            .tasks
+            .insert(task_a, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let _ = unsafe { data.tasks.remove_unchecked::<Ready<()>>(index) };
+        let _ = data.tasks.remove::<Ready<()>, ()>(index);
 
         let mut task_b = Task::new();
         task_b.ready = true;
-        unsafe { data.tasks.init_task_unchecked(index, task_b) };
-        unsafe {
-            data.tasks
-                .init_future_unchecked(index, core::future::ready(()))
-        };
+        let index = data
+            .tasks
+            .insert(task_b, |_| core::future::ready(()))
+            .expect("slot should be free");
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.with_task(|t| t.ready = false);
         }));
 
         assert!(result.is_err());
-        assert!(unsafe { data.tasks.task_unchecked(index) }.ready);
+        assert!(data.tasks.task(index).ready);
     }
 
     #[test]
     fn task_context_of_live_task_usable_alongside_other_tasks() {
         let task_a = Task::new();
         let mut data = test_runtime_data(64);
-        let index_a = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index_a, task_a) };
+        let index_a = data
+            .tasks
+            .insert(task_a, |_| core::future::ready(()))
+            .unwrap();
 
         let mut task_b = Task::new();
         task_b.ready = true;
-        let index_b = data.tasks.insert_vacant().unwrap();
-        unsafe { data.tasks.init_task_unchecked(index_b, task_b) };
+        let index_b = data
+            .tasks
+            .insert(task_b, |_| core::future::ready(()))
+            .unwrap();
 
         let _gen = enter_active_gen();
         let ctx_a = data.context_for(index_a);
@@ -1343,6 +1370,6 @@ mod tests {
         }));
 
         assert!(result.is_ok());
-        assert!(unsafe { data.tasks.task_unchecked(index_a) }.ready);
+        assert!(data.tasks.task(index_a).ready);
     }
 }
