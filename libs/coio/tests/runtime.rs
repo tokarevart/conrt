@@ -188,7 +188,7 @@ fn block_on_read_from_file() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     let mut file = tmpfile();
     file.write_all(b"hello world").unwrap();
@@ -218,7 +218,7 @@ fn block_on_read_full_buffer() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     let mut file = tmpfile();
     file.write_all(b"hello world").unwrap();
@@ -333,7 +333,7 @@ fn block_on_read_many_recycles() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     // More reads than the pool holds, exercising tail wrap + recycling.
     // Reads use an absolute offset of 0, so every call returns the same bytes.
@@ -367,7 +367,7 @@ fn block_on_read_into_vec() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     let mut file = tmpfile();
     file.write_all(b"hello world").unwrap();
@@ -398,8 +398,8 @@ fn block_on_write_to_file() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::write;
-    use coio::runtime::write_buffer;
+    use coio::io::write;
+    use coio::io::write_buffer;
 
     let mut file = tmpfile();
     let fd = file.as_raw_fd();
@@ -435,8 +435,8 @@ fn block_on_write_full_slot() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::write;
-    use coio::runtime::write_buffer;
+    use coio::io::write;
+    use coio::io::write_buffer;
 
     // The whole slot (buf_size) can be used for a single write.
     let mut file = tmpfile();
@@ -474,8 +474,8 @@ fn block_on_write_many_recycles() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::write;
-    use coio::runtime::write_buffer;
+    use coio::io::write;
+    use coio::io::write_buffer;
 
     // More writes than the pool holds, exercising slot recycling.
     // Writes use an absolute offset of 0, so each write overwrites the file.
@@ -516,7 +516,7 @@ fn block_on_read_uses_proportional_levels() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     // Two levels: 8-byte and 64-byte slots. A 5-byte read fits the 8-byte
     // level, a 16-byte read falls through to the 64-byte level.
@@ -553,8 +553,8 @@ fn block_on_write_uses_proportional_levels() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::write;
-    use coio::runtime::write_buffer;
+    use coio::io::write;
+    use coio::io::write_buffer;
 
     // An 11-byte write needs the 64-byte level; its capacity is 64.
     let mut file = tmpfile();
@@ -589,7 +589,7 @@ fn block_on_write_uses_proportional_levels() {
 fn block_on_read_oversized_errors() {
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     let file = tmpfile();
     let fd = file.as_raw_fd();
@@ -614,7 +614,7 @@ fn block_on_read_oversized_errors() {
 fn block_on_write_buffer_oversized_errors() {
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::write_buffer;
+    use coio::io::write_buffer;
 
     let file = tmpfile();
     let fd = file.as_raw_fd();
@@ -642,7 +642,7 @@ fn block_on_read_with_default_levels() {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
-    use coio::runtime::read;
+    use coio::io::read;
 
     // The default level table (two 2 MiB slabs) is used when the params are
     // left as `..Default::default()`.

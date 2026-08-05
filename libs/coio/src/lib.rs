@@ -1,9 +1,18 @@
+pub mod io;
 pub mod levels;
 mod pbuf;
 pub mod runtime;
 pub mod task;
 mod wbuf;
 
+pub use crate::io::Yield;
+pub use crate::io::accept;
+pub use crate::io::read;
+pub use crate::io::recvmsg;
+pub use crate::io::sendmsg;
+pub use crate::io::write;
+pub use crate::io::write_buffer;
+pub use crate::io::yield_now;
 pub use crate::levels::Level;
 pub use crate::pbuf::ReadBuffer;
 pub use crate::task::JoinFuture;

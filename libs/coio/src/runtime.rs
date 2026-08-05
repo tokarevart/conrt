@@ -5,17 +5,12 @@ use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
-use std::io;
-use std::os::fd::RawFd;
 use std::ptr::NonNull;
 
 use crate::levels::DEFAULT_LEVELS;
 use crate::levels::Level;
 use crate::levels::layout_levels;
-use crate::levels::level_for;
-use crate::levels::pack_bid;
 use crate::pbuf::ProvidedBufferPool;
-use crate::pbuf::ReadBuffer;
 use crate::task::IoSlot;
 use crate::task::IoUserData;
 use crate::task::IoVec;
@@ -24,7 +19,6 @@ use crate::task::NO_JOINER;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
-use crate::wbuf::WriteBuffer;
 use crate::wbuf::WriteBufferPool;
 
 thread_local! {
@@ -100,157 +94,6 @@ pub(crate) fn current_task_index() -> Option<u32> {
     CURRENT_TASK_INDEX.with(|c| c.get())
 }
 
-/// Reads up to `max_len` bytes from `fd` into a buffer selected from the
-/// runtime's provided buffer pools. The buffer is drawn from the smallest
-/// level whose slot size is at least `max_len`; `max_len` larger than the
-/// largest level's slot size fails with `EFBIG`.
-///
-/// The returned [`ReadBuffer`] borrows memory from the pool: its slot is
-/// recycled when the buffer is dropped, so the runtime must still be alive
-/// while the buffer is in use.
-pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<ReadBuffer> {
-    let bgid = ctx.with_runtime(|r| -> io::Result<u16> {
-        let level = level_for(&r.read_levels, max_len)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-        Ok(level as u16)
-    })?;
-
-    let slot = ctx.with_runtime(|r| r.alloc_io_slot());
-    ctx.with_task(|task| task.io.push(slot));
-
-    let entry = io_uring::opcode::Read::new(
-        io_uring::types::Fd(fd),
-        std::ptr::null_mut(),
-        max_len as u32,
-    )
-    .buf_group(bgid)
-    .build()
-    .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-    if let Err(e) = ctx.push_io(entry, slot) {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(e);
-    }
-
-    let result = await_cqe(ctx, slot).await;
-    if result < 0 {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(io::Error::from_raw_os_error(-result));
-    }
-
-    let generation = active_gen().expect("read called outside an active runtime");
-    let level = bgid as usize;
-    let (offset, bid) = ctx.with_runtime(|r| {
-        let slot_ref = &r.io_slab[slot as usize];
-        let local = slot_ref.bid;
-        let offset = r.buffer_pools[level].slot_offset(local);
-        let bid = pack_bid(level as u32, u32::from(local));
-        r.free_io_slot(slot);
-        (offset, bid)
-    });
-    ctx.with_task(|task| task.io.remove_value(slot));
-
-    Ok(ReadBuffer::new(offset, bid, result as u32, generation))
-}
-
-/// Acquires a zero-copy write buffer backed by a slot from the runtime's fixed
-/// write buffer slab. The buffer is drawn from the smallest level whose slot
-/// size is at least `size`; `size` larger than the largest level's slot size
-/// fails with `EFBIG`. The buffer's [`WriteBuffer::capacity`] is the chosen
-/// level's slot size; the caller fills it via [`WriteBuffer::as_mut`] and
-/// records the length with [`WriteBuffer::set_len`] before passing it to
-/// [`write`]. The slot is recycled when the buffer is dropped.
-pub fn write_buffer(ctx: TaskContext, size: usize) -> io::Result<WriteBuffer> {
-    let generation = active_gen().expect("write_buffer called outside an active runtime");
-    let (bid, offset) = ctx.with_runtime(|r| -> io::Result<(u32, u32)> {
-        let level = level_for(&r.write_levels, size)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-        let local = r.write_pools[level]
-            .acquire()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
-        let offset = r.write_pools[level].slot_offset(local);
-        Ok((pack_bid(level as u32, local), offset))
-    })?;
-    Ok(WriteBuffer::new(offset, bid, generation))
-}
-
-/// Writes the contents of `wb` to `fd` via `IORING_OP_WRITE_FIXED`. The
-/// buffer's slot is held until the kernel finishes with it and recycled when
-/// `wb` is dropped.
-pub async fn write(ctx: TaskContext, fd: RawFd, wb: WriteBuffer) -> io::Result<usize> {
-    let slot = ctx.with_runtime(|r| r.alloc_io_slot());
-    ctx.with_task(|task| task.io.push(slot));
-
-    let len = wb.len();
-    let addr =
-        ctx.with_runtime(|r| unsafe { r.slab.as_ptr().cast_mut().add(wb.offset() as usize) });
-
-    let entry = io_uring::opcode::WriteFixed::new(
-        io_uring::types::Fd(fd),
-        addr,
-        len as u32,
-        0, // the whole slab is registered as fixed buffer index 0
-    )
-    .build();
-    if let Err(e) = ctx.push_io(entry, slot) {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(e);
-    }
-
-    let result = await_cqe(ctx, slot).await;
-    if result < 0 {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(io::Error::from_raw_os_error(-result));
-    }
-
-    ctx.with_runtime(|r| r.free_io_slot(slot));
-    ctx.with_task(|task| task.io.remove_value(slot));
-    Ok(result as usize)
-}
-
-pub async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
-    loop {
-        let result = ctx.with_runtime(|r| {
-            let slot_ref = &r.io_slab[slot as usize];
-            if slot_ref.ready != 0 {
-                Some(slot_ref.result)
-            } else {
-                None
-            }
-        });
-        if let Some(result) = result {
-            return result;
-        }
-        yield_now(ctx).await;
-    }
-}
-
-pub fn yield_now(ctx: TaskContext) -> Yield {
-    Yield { ctx, polled: false }
-}
-
-pub struct Yield {
-    ctx: TaskContext,
-    polled: bool,
-}
-
-impl Future for Yield {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if self.polled {
-            Poll::Ready(())
-        } else {
-            self.polled = true;
-            self.ctx.wake();
-            Poll::Pending
-        }
-    }
-}
-
 /// Runs a closure exactly once when dropped, even on panic unwind.
 struct DropGuard<F: FnOnce()>(Option<F>);
 
@@ -301,7 +144,7 @@ impl Runtime {
     /// Allocates an io slab slot and marks it submitted. The slot is reused
     /// from the free list when available, otherwise the slab grows; it only
     /// ever holds in-flight ops, so it stays bounded by peak concurrency.
-    fn alloc_io_slot(&mut self) -> u32 {
+    pub(crate) fn alloc_io_slot(&mut self) -> u32 {
         let index = match self.free_io_slots.pop() {
             Some(index) => index,
             None => {
@@ -315,7 +158,7 @@ impl Runtime {
 
     /// Returns `index` to the free list. Only call once the CQE for the op is
     /// consumed, so a late completion can never land on a recycled slot.
-    fn free_io_slot(&mut self, index: u32) {
+    pub(crate) fn free_io_slot(&mut self, index: u32) {
         self.io_slab[index as usize] = IoSlot::default();
         self.free_io_slots.push(index);
     }
@@ -763,6 +606,9 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
+    use crate::io::await_cqe;
+    use crate::io::write_buffer;
+    use crate::io::yield_now;
     use crate::levels::Level;
     use crate::levels::pack_bid;
     use crate::pbuf::ReadBuffer;

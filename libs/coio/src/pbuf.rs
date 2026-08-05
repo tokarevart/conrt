@@ -221,7 +221,7 @@ impl Drop for ProvidedBufferPool {
 }
 
 /// A zero-copy view of a buffer selected from the runtime's provided buffer
-/// pools by [`crate::runtime::read`].
+/// pools by [`crate::io::read`].
 ///
 /// The caller owns the buffer until this value is dropped, at which point the
 /// pool slot is recycled. The slot is reached through the thread-local runtime

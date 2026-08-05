@@ -91,10 +91,10 @@ impl WriteBufferPool {
 /// A zero-copy buffer that borrows a slot from the runtime's fixed write
 /// buffer slab.
 ///
-/// Created by [`crate::runtime::write_buffer`]; the caller fills the slot
+/// Created by [`crate::io::write_buffer`]; the caller fills the slot
 /// through [`WriteBuffer::as_mut`], records the filled length with
 /// [`WriteBuffer::set_len`], then hands the buffer to
-/// [`crate::runtime::write`], which submits it without copying. The slot is
+/// [`crate::io::write`], which submits it without copying. The slot is
 /// recycled when the buffer is dropped. Like [`crate::ReadBuffer`], the slab
 /// is reached through the thread-local runtime pointer, guarded by the
 /// generation the buffer was created in: a `WriteBuffer` dropped after its
