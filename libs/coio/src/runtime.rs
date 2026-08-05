@@ -17,7 +17,10 @@ use crate::levels::pack_bid;
 use crate::pbuf::ProvidedBufferPool;
 use crate::pbuf::ReadBuffer;
 use crate::task::IoSlot;
+use crate::task::IoUserData;
 use crate::task::IoVec;
+use crate::task::JoinHandle;
+use crate::task::NO_JOINER;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
@@ -28,6 +31,7 @@ thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_GEN: Cell<NonZeroU32> = const { Cell::new(NonZeroU32::new(1).unwrap()) };
     static CURRENT_RUNTIME: Cell<*mut Runtime> = const { Cell::new(core::ptr::null_mut()) };
+    static CURRENT_TASK_INDEX: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 pub(crate) fn is_running() -> bool {
@@ -88,6 +92,12 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
     let ptr = CURRENT_RUNTIME.with(|c| c.get());
     assert!(!ptr.is_null(), "no active runtime");
     unsafe { f(&mut *ptr) }
+}
+
+/// The index of the task currently being polled by the runtime loop, if any.
+/// Join futures use it to register their waiter in the target's waiter list.
+pub(crate) fn current_task_index() -> Option<u32> {
+    CURRENT_TASK_INDEX.with(|c| c.get())
 }
 
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
@@ -311,22 +321,30 @@ impl Runtime {
     }
 
     /// Whether any io op is still in flight. Scans the slab for submitted
-    /// slots that are not yet ready; orphaned ops of removed tasks keep this
-    /// true until their CQEs are drained.
+    /// slots that are not yet ready; a finished task's ops keep this true
+    /// until their CQEs are drained.
     fn has_io_in_flight(&self) -> bool {
         self.io_slab
             .iter()
             .any(|slot| slot.submitted != 0 && slot.ready == 0)
     }
 
-    /// Reclaims a removed task's io slots. Slots whose ops already completed
-    /// (ready) are freed immediately; slots still in flight are left orphaned
-    /// and freed by [`Self::drain_cqes`] when their late CQE arrives.
-    fn reap_io_slots(&mut self, io: &IoVec) {
-        for index in io.iter() {
-            let slot = &self.io_slab[index as usize];
-            if slot.submitted != 0 && slot.ready != 0 {
-                self.free_io_slot(index);
+    /// Recycles the io slots in `io` whose ops have already completed (ready),
+    /// removing them from `io`. Slots still in flight are left for their
+    /// pending CQE, which recycles them through [`Self::drain_cqes`].
+    fn reap_io_slots(&mut self, io: &mut IoVec) {
+        let mut i = 0;
+        while i < io.len() {
+            let slot = {
+                let mut it = io.iter();
+                it.nth(i).expect("index in bounds")
+            };
+            if self.io_slab[slot as usize].submitted != 0 && self.io_slab[slot as usize].ready != 0
+            {
+                self.free_io_slot(slot);
+                io.remove_value(slot);
+            } else {
+                i += 1;
             }
         }
     }
@@ -336,8 +354,91 @@ impl Runtime {
         self.tasks.context_for(task_idx)
     }
 
+    /// Finalizes a finished task: recycles io slots whose ops already
+    /// completed, cancels the rest if [`JoinHandle::cancel`] was called on the
+    /// task, and removes the task once its io has fully drained, waking any
+    /// joiners. A task that finished on its own keeps its in-flight io running
+    /// to completion instead of issuing cancel requests. The task stays in its
+    /// slot until its io drains, so a CQE can never land on a recycled slot
+    /// and the finished-task branch of [`Self::drain_cqes`] is airtight.
+    fn finalize_task<F: 'static>(&mut self, idx: u32) {
+        let task_ptr = self.tasks.task_ptr_unchecked(idx);
+        unsafe {
+            assert!((*task_ptr).finished);
+        }
+
+        // Recycle slots whose ops already completed; their CQEs are consumed,
+        // so only this path can free them.
+        self.reap_io_slots(unsafe { &mut (*task_ptr).io });
+
+        if unsafe { (*task_ptr).cancel_requested } {
+            // Cancel the still-in-flight ops. `push_cancel` only appends its
+            // cancel slots, so the first `n` entries stay the victims and the
+            // loop never touches the slots it adds.
+            let n = unsafe { (*task_ptr).io.len() };
+            for i in 0..n {
+                let slot = {
+                    let mut it = unsafe { (*task_ptr).io.iter() };
+                    it.nth(i).expect("index in bounds")
+                };
+                self.push_cancel(idx, slot);
+            }
+        }
+
+        if unsafe { (*task_ptr).io.is_empty() } {
+            self.remove_task::<F>(idx);
+        }
+    }
+
+    /// Submits an `IORING_OP_ASYNC_CANCEL` for one in-flight io slot of a
+    /// finished task. The cancel request occupies its own io slot, so its CQE
+    /// is recycled by the same finished-task drain path as the victim's.
+    fn push_cancel(&mut self, idx: u32, victim_slot: u32) {
+        let cancel_slot = self.alloc_io_slot();
+        unsafe { self.tasks.task_mut_unchecked(idx).io.push(cancel_slot) };
+
+        let victim_ud = IoUserData {
+            index: idx,
+            io_slot: victim_slot,
+        };
+        let cancel_ud = IoUserData {
+            index: idx,
+            io_slot: cancel_slot,
+        };
+        let entry = io_uring::opcode::AsyncCancel::new(victim_ud.into())
+            .build()
+            .user_data(cancel_ud.into());
+
+        let mut sq = self.ring.submission();
+        let pushed = unsafe { sq.push(&entry) };
+        drop(sq);
+        if pushed.is_err() {
+            // Ring full: the victim's natural CQE will still recycle its slot,
+            // so give up the cancel slot.
+            self.free_io_slot(cancel_slot);
+            unsafe {
+                self.tasks
+                    .task_mut_unchecked(idx)
+                    .io
+                    .remove_value(cancel_slot)
+            };
+        }
+    }
+
+    /// Removes a finished task whose io has fully drained, waking the task
+    /// blocked on its [`JoinHandle`], if any.
+    fn remove_task<F: 'static>(&mut self, idx: u32) {
+        assert!(unsafe { self.tasks.task_unchecked(idx).finished });
+        let joiner = unsafe { self.tasks.task_mut_unchecked(idx).joiner };
+        if joiner != NO_JOINER {
+            self.wakeups.push(joiner);
+        }
+        unsafe {
+            self.tasks.remove_unchecked::<F>(idx);
+        }
+    }
+
     fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
-        let mut orphaned = Vec::new();
         for cqe in self.ring.completion() {
             let raw = cqe.user_data();
             let task_index = (raw >> 32) as u32;
@@ -349,30 +450,40 @@ impl Runtime {
             }
 
             unsafe {
-                if self.tasks.is_occupied(task_index) {
-                    let slot = &mut self.io_slab[io_slot as usize];
-                    slot.result = result;
-                    // Only reads report a selected buffer via the CQE flags;
-                    // writes store their own slot id in `bids`, so leave it
-                    // untouched when no buffer flag is present.
-                    if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
-                        slot.bid = bid;
-                    }
-                    slot.ready = 1;
-                    let task = self.tasks.task_mut_unchecked(task_index);
-                    if !task.ready {
-                        task.ready = true;
+                if !self.tasks.is_occupied(task_index) {
+                    continue;
+                }
+                if self.tasks.task_unchecked(task_index).finished {
+                    // The task is done and only waiting for its io to drain:
+                    // recycle the slot now and let the loop finalize the
+                    // removal once the last slot is gone. `free_io_slot` is
+                    // inlined since the ring borrow rules it out here.
+                    self.tasks
+                        .task_mut_unchecked(task_index)
+                        .io
+                        .remove_value(io_slot);
+                    self.io_slab[io_slot as usize] = IoSlot::default();
+                    self.free_io_slots.push(io_slot);
+                    if self.tasks.task_unchecked(task_index).io.is_empty() {
                         ready.push(task_index);
                     }
-                } else {
-                    // The owning task is gone: its CQE just arrived, so this is
-                    // the only safe moment to recycle the orphaned slot.
-                    orphaned.push(io_slot);
+                    continue;
+                }
+                let slot = &mut self.io_slab[io_slot as usize];
+                slot.result = result;
+                // Only reads report a selected buffer via the CQE flags;
+                // writes store their own slot id in `bids`, so leave it
+                // untouched when no buffer flag is present.
+                if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
+                    slot.bid = bid;
+                }
+                slot.ready = 1;
+                let task = self.tasks.task_mut_unchecked(task_index);
+                if !task.ready {
+                    task.ready = true;
+                    ready.push(task_index);
                 }
             }
-        }
-        for io_slot in orphaned {
-            self.free_io_slot(io_slot);
         }
     }
 }
@@ -523,7 +634,7 @@ where
     let _drop_guard =
         DropGuard::new(move || unsafe { TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks) });
 
-    let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32> = spawn::<S, F, T>;
+    let spawn: unsafe fn(RuntimeContext<T>, T) -> Option<JoinHandle> = spawn::<S, F, T>;
 
     let ctx = RuntimeContext { generation, spawn };
 
@@ -555,20 +666,23 @@ where
                 continue;
             }
 
+            if unsafe { rt.tasks.task_unchecked(idx).finished } {
+                rt.finalize_task::<F>(idx);
+                continue;
+            }
+
             unsafe { rt.tasks.task_mut_unchecked(idx).ready = false };
 
+            CURRENT_TASK_INDEX.with(|c| c.set(Some(idx)));
             let mut cx = Context::from_waker(Waker::noop());
             let future_ptr = rt.tasks.future_ptr_unchecked::<F>(idx);
             let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
+            let poll_result = future.poll(&mut cx);
+            CURRENT_TASK_INDEX.with(|c| c.set(None));
 
-            match future.poll(&mut cx) {
-                Poll::Ready(()) => {
-                    let task = unsafe { rt.tasks.remove_unchecked::<F>(idx) };
-                    // Reclaim the task's io slots now that it is gone; slots
-                    // with ops still in flight stay orphaned until drained.
-                    rt.reap_io_slots(&task.io);
-                }
-                Poll::Pending => {}
+            if poll_result.is_ready() {
+                unsafe { rt.tasks.task_mut_unchecked(idx).finished = true };
+                rt.finalize_task::<F>(idx);
             }
         }
 
@@ -591,7 +705,7 @@ where
     }
 }
 
-unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<u32>
+unsafe fn spawn<S, F, T>(ctx: RuntimeContext<T>, user_data: T) -> Option<JoinHandle>
 where
     S: Fn(TaskContext, RuntimeContext<T>, T) -> F,
     F: Future<Output = ()> + 'static,
@@ -605,6 +719,7 @@ where
         unsafe { data.tasks.init_task_unchecked(index, task) };
 
         let task_ctx = data.context_for(index);
+        let handle = JoinHandle::new(task_ctx);
 
         let future = closure(task_ctx, ctx, user_data);
         unsafe {
@@ -613,14 +728,14 @@ where
 
         data.wakeups.push(index);
 
-        Some(index)
+        Some(handle)
     })
 }
 
 #[derive(Debug)]
 pub struct RuntimeContext<T> {
     generation: NonZeroU32,
-    spawn: unsafe fn(RuntimeContext<T>, T) -> Option<u32>,
+    spawn: unsafe fn(RuntimeContext<T>, T) -> Option<JoinHandle>,
 }
 
 impl<T> Clone for RuntimeContext<T> {
@@ -632,7 +747,7 @@ impl<T> Clone for RuntimeContext<T> {
 impl<T> Copy for RuntimeContext<T> {}
 
 impl<T> RuntimeContext<T> {
-    pub fn spawn(&self, user_data: T) -> Option<u32> {
+    pub fn spawn(&self, user_data: T) -> Option<JoinHandle> {
         assert!(
             active_gen_matches(self.generation),
             "RuntimeContext used outside the runtime it belongs to"
@@ -715,7 +830,7 @@ mod tests {
         io.push(slot);
         // The op completed but the task never reaped it.
         data.io_slab[slot as usize].ready = 1;
-        data.reap_io_slots(&io);
+        data.reap_io_slots(&mut io);
         assert_eq!(data.io_slab[slot as usize].submitted, 0);
         assert_eq!(data.free_io_slots, vec![slot]);
         assert!(!data.has_io_in_flight());
@@ -728,7 +843,7 @@ mod tests {
         let slot = data.alloc_io_slot();
         io.push(slot);
         // Still in flight: reaping must leave it for the late CQE.
-        data.reap_io_slots(&io);
+        data.reap_io_slots(&mut io);
         assert_eq!(data.io_slab[slot as usize].submitted, 1);
         assert!(data.free_io_slots.is_empty());
         assert!(data.has_io_in_flight());

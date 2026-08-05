@@ -1,8 +1,12 @@
 use core::any::TypeId;
 use core::cell::Cell;
 use core::fmt;
+use core::future::Future;
 use core::mem::MaybeUninit;
+use core::pin::Pin;
 use core::ptr::NonNull;
+use core::task::Context;
+use core::task::Poll;
 use std::alloc::Layout;
 use std::alloc::alloc;
 use std::alloc::dealloc;
@@ -258,11 +262,25 @@ impl From<u64> for IoUserData {
     }
 }
 
+/// The joiner sentinel: no task is currently waiting on this task's join.
+pub(crate) const NO_JOINER: u32 = u32::MAX;
+
 pub struct Task {
     pub ready: bool,
+    pub(crate) finished: bool,
+    /// Whether [`JoinHandle::cancel`] has been called on this task. The
+    /// runtime issues cancel requests for the task's in-flight io only when
+    /// this is set; otherwise finished io runs to completion naturally.
+    pub(crate) cancel_requested: bool,
+    /// Index of the task currently awaiting this task's completion via its
+    /// [`JoinHandle`], or [`NO_JOINER`]. Task indices can never equal
+    /// `NO_JOINER`, so the sentinel is unambiguous.
+    pub(crate) joiner: u32,
     pub io: IoVec,
     id: NonZeroU64,
 }
+
+const _: () = assert!(size_of::<Task>() == 32);
 
 impl Task {
     /// Creates a task with a fresh unique id, `ready = false` and an empty io
@@ -276,6 +294,9 @@ impl Task {
         });
         Self {
             ready: false,
+            finished: false,
+            cancel_requested: false,
+            joiner: NO_JOINER,
             io: IoVec::new(),
             id,
         }
@@ -376,6 +397,117 @@ impl TaskContext {
     }
 }
 
+/// Whether the task identified by `(index, id)` still exists. The task only
+/// counts as alive until it is fully removed: its future has finished and all
+/// of its io has been recycled.
+pub(crate) fn task_alive(index: u32, id: NonZeroU64) -> bool {
+    runtime::with_runtime(|rt| {
+        rt.tasks.is_occupied(index) && unsafe { rt.tasks.task_unchecked(index).id == id }
+    })
+}
+
+/// A handle to a spawned task. A task's in-flight io is not cancelled when it
+/// finishes; it runs to completion in the background unless
+/// [`cancel`](Self::cancel) is called on the handle.
+#[derive(Debug)]
+pub struct JoinHandle {
+    target: TaskContext,
+}
+
+impl JoinHandle {
+    pub(crate) fn new(target: TaskContext) -> Self {
+        Self { target }
+    }
+
+    /// Returns a future that resolves once the task has fully finished: its
+    /// future has returned and all of its io has been recycled. Consumes the
+    /// handle; recover it with [`JoinFuture::into_handle`] to wait later
+    /// instead.
+    pub fn join(self) -> JoinFuture {
+        JoinFuture {
+            handle: self,
+            registered: false,
+        }
+    }
+
+    /// Whether the task has fully finished and been removed. Panics outside an
+    /// active runtime, like the other runtime-facing methods.
+    pub fn is_finished(&self) -> bool {
+        !task_alive(self.target.task_index, self.target.task_id)
+    }
+
+    /// Stops the task from running further and cancels its in-flight io with
+    /// `IORING_OP_ASYNC_CANCEL` requests. A task that has already finished is
+    /// left alone: its io completes naturally. Returns `false` if the task is
+    /// already gone.
+    pub fn cancel(&self) -> bool {
+        if !task_alive(self.target.task_index, self.target.task_id) {
+            return false;
+        }
+        runtime::with_runtime(|rt| {
+            unsafe {
+                let task = rt.tasks.task_mut_unchecked(self.target.task_index);
+                if task.finished {
+                    return true;
+                }
+                task.finished = true;
+                task.cancel_requested = true;
+            }
+            rt.wakeups.push(self.target.task_index);
+            true
+        })
+    }
+}
+
+/// A future returned by [`JoinHandle::join`]; resolves once the target task
+/// has fully finished and been removed.
+pub struct JoinFuture {
+    handle: JoinHandle,
+    registered: bool,
+}
+
+impl JoinFuture {
+    /// Recovers the [`JoinHandle`] so the wait can be resumed later with
+    /// another [`JoinHandle::join`]. Unregisters this future's waiter first,
+    /// so a later join can register again.
+    pub fn into_handle(self) -> JoinHandle {
+        if let Some(me) = runtime::current_task_index() {
+            let target = self.handle.target;
+            if task_alive(target.task_index, target.task_id) {
+                runtime::with_runtime(|rt| {
+                    let task = unsafe { rt.tasks.task_mut_unchecked(target.task_index) };
+                    if task.joiner == me {
+                        task.joiner = NO_JOINER;
+                    }
+                });
+            }
+        }
+        self.handle
+    }
+}
+
+impl Future for JoinFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        let target = self.handle.target;
+        if !task_alive(target.task_index, target.task_id) {
+            return Poll::Ready(());
+        }
+        if !self.registered {
+            self.registered = true;
+            if let Some(waiter) = runtime::current_task_index() {
+                runtime::with_runtime(|rt| {
+                    let task = unsafe { rt.tasks.task_mut_unchecked(target.task_index) };
+                    assert!(task.joiner == NO_JOINER, "task already has a joiner");
+                    task.joiner = waiter;
+                });
+            }
+        }
+        Poll::Pending
+    }
+}
+
 pub struct TaskSlab {
     tasks: Box<[MaybeUninit<Task>]>,
     futures: NonNull<u8>,
@@ -414,7 +546,9 @@ impl TaskSlab {
             if *word != 0 {
                 let bit = word.trailing_zeros();
                 let index = word_idx as u32 * 64 + bit;
-                if index as usize >= self.tasks.len() {
+                if index as usize >= self.tasks.len() || index == NO_JOINER {
+                    // Out of range or the joiner sentinel: treat the slab as
+                    // full rather than hand out an ambiguous index.
                     return None;
                 }
                 self.free[word_idx] &= !(1 << bit);
