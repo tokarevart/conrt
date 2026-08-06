@@ -15,6 +15,10 @@ use std::num::NonZeroU64;
 
 use io_uring::squeue;
 
+use crate::buf::Buffer;
+use crate::buf::BufferBytes;
+use crate::classes::class_for;
+use crate::classes::pack_bid;
 use crate::runtime;
 use crate::runtime::Runtime;
 
@@ -379,6 +383,48 @@ impl TaskContext {
             panic!("invalid TaskContext: {e}");
         }
         runtime::with_runtime(f)
+    }
+
+    /// Allocates a slot of pooled op-argument memory for `T` from the
+    /// runtime's fixed buffer slab, or `None` when the pool is exhausted or no
+    /// size class fits `T`. Panics if `T` is zero-sized: a ZST needs no pinned
+    /// memory. The slot is uninitialized; initialize it through the returned
+    /// `Buffer<MaybeUninit<T>>` before use. The slot is recycled when the
+    /// allocation is dropped.
+    pub fn alloc<T>(&self) -> Option<Buffer<MaybeUninit<T>>> {
+        assert!(
+            core::mem::size_of::<T>() > 0,
+            "alloc: zero-sized types cannot be pooled"
+        );
+        self.with_runtime(|r| {
+            let class = class_for(&r.fixed_classes, core::mem::size_of::<T>())?;
+            let local = r.fixed_pools[class].acquire()?;
+            let generation = runtime::active_gen().expect("alloc called outside an active runtime");
+            Some(Buffer::new(pack_bid(class as u32, local), generation))
+        })
+    }
+
+    /// Allocates a zero-copy buffer backed by a slot from the runtime's fixed
+    /// buffer slab. The buffer is drawn from the smallest size class whose
+    /// slot size is at least `size`; `size` larger than the largest class's
+    /// slot size fails with `EFBIG`. The buffer's [`BufferBytes::capacity`] is
+    /// the chosen class's slot size; the caller fills it via
+    /// [`BufferBytes::as_mut`] and records the length with
+    /// [`BufferBytes::set_len`] before passing it to [`crate::io::write`]. The
+    /// slot is recycled when the buffer is dropped.
+    pub fn alloc_bytes(&self, size: usize) -> io::Result<BufferBytes> {
+        let generation =
+            runtime::active_gen().expect("alloc_bytes called outside an active runtime");
+        let (bid, offset) = self.with_runtime(|r| -> io::Result<(u32, u32)> {
+            let class = class_for(&r.fixed_classes, size)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+            let local = r.fixed_pools[class]
+                .acquire()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
+            let offset = r.fixed_pools[class].slot_offset(local);
+            Ok((pack_bid(class as u32, local), offset))
+        })?;
+        Ok(BufferBytes::new(offset, bid, generation))
     }
 
     pub fn wake(&self) {

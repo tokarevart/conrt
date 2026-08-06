@@ -1,8 +1,8 @@
 //! Provided buffer ring (`IORING_REGISTER_PBUF_RING`) support.
 //!
-//! A [`ProvidedBufferPool`] describes one level of buffers: a descriptor ring
-//! for `count` fixed-size slots that live inside the runtime's shared buffer
-//! slab. The pool does not own the slab. The caller must
+//! A [`ProvidedBufferPool`] describes one size class of buffers: a descriptor
+//! ring for `count` fixed-size slots that live inside the runtime's shared
+//! buffer slab. The pool does not own the slab. The caller must
 //! [`ProvidedBufferPool::register`] it with an `io_uring` instance before use
 //! and [`ProvidedBufferPool::unregister`] it before the ring is closed. Reads
 //! submitted with `IOSQE_BUFFER_SELECT` let the kernel pick a buffer from the
@@ -23,8 +23,8 @@ use std::sync::atomic::Ordering;
 
 use io_uring::IoUring;
 
-use crate::levels::bid_level;
-use crate::levels::bid_local;
+use crate::classes::bid_class;
+use crate::classes::bid_local;
 use crate::runtime::active_gen_matches;
 use crate::runtime::with_runtime;
 
@@ -60,9 +60,9 @@ struct IoUringBufRingHeader {
 pub struct ProvidedBufferPool {
     buf_count: u16,
     buf_size: u32,
-    /// Byte offset of this level's first slot within the shared slab.
+    /// Byte offset of this class's first slot within the shared slab.
     base_offset: u32,
-    /// Start of the shared slab this level's slots live in.
+    /// Start of the shared slab this class's slots live in.
     slab_base: NonNull<u8>,
     bgid: u16,
     ring_ptr: NonNull<u8>,
@@ -226,17 +226,17 @@ impl Drop for ProvidedBufferPool {
 /// The caller owns the buffer until this value is dropped, at which point the
 /// pool slot is recycled. The slot is reached through the thread-local runtime
 /// pointer, guarded by the generation the buffer was created in: a
-/// `ReadBuffer` dropped after its runtime has shut down skips recycling
+/// `ProvidedBuffer` dropped after its runtime has shut down skips recycling
 /// instead of touching freed memory. The data itself must not be read after
 /// the runtime is gone.
-pub struct ReadBuffer {
+pub struct ProvidedBuffer {
     offset: u32,
     bid: u32,
     len: u32,
     generation: NonZeroU32,
 }
 
-impl ReadBuffer {
+impl ProvidedBuffer {
     pub(crate) fn new(offset: u32, bid: u32, len: u32, generation: NonZeroU32) -> Self {
         Self {
             offset,
@@ -257,7 +257,7 @@ impl ReadBuffer {
     fn data(&self) -> &[u8] {
         assert!(
             active_gen_matches(self.generation),
-            "ReadBuffer used outside the runtime that owns it"
+            "ProvidedBuffer used outside the runtime that owns it"
         );
         with_runtime(|r| unsafe {
             core::slice::from_raw_parts(
@@ -269,20 +269,20 @@ impl ReadBuffer {
 
     fn recycle(&mut self) {
         if active_gen_matches(self.generation) {
-            let level = bid_level(self.bid) as usize;
+            let class = bid_class(self.bid) as usize;
             let local = bid_local(self.bid) as u16;
-            with_runtime(|r| r.buffer_pools[level].recycle_buffer(local));
+            with_runtime(|r| r.provided_pools[class].recycle_buffer(local));
         }
     }
 }
 
-impl Drop for ReadBuffer {
+impl Drop for ProvidedBuffer {
     fn drop(&mut self) {
         self.recycle();
     }
 }
 
-impl Deref for ReadBuffer {
+impl Deref for ProvidedBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
@@ -290,7 +290,7 @@ impl Deref for ReadBuffer {
     }
 }
 
-impl AsRef<[u8]> for ReadBuffer {
+impl AsRef<[u8]> for ProvidedBuffer {
     fn as_ref(&self) -> &[u8] {
         self.deref()
     }
@@ -301,9 +301,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_buffer_is_16_bytes_with_niche() {
-        assert_eq!(size_of::<ReadBuffer>(), 16);
-        assert_eq!(size_of::<Option<ReadBuffer>>(), 16);
+    fn provided_buffer_is_16_bytes_with_niche() {
+        assert_eq!(size_of::<ProvidedBuffer>(), 16);
+        assert_eq!(size_of::<Option<ProvidedBuffer>>(), 16);
     }
 
     fn tmpfile() -> i32 {

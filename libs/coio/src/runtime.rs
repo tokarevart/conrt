@@ -5,11 +5,17 @@ use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
 use core::task::Waker;
+use std::alloc::Layout;
+use std::alloc::alloc;
+use std::alloc::dealloc;
+use std::alloc::handle_alloc_error;
 use std::ptr::NonNull;
 
-use crate::levels::DEFAULT_LEVELS;
-use crate::levels::Level;
-use crate::levels::layout_levels;
+use crate::buf::BufferPool;
+use crate::classes::BUFFER_MAX_ALIGN;
+use crate::classes::DEFAULT_SIZE_CLASSES;
+use crate::classes::SizeClass;
+use crate::classes::layout_classes;
 use crate::pbuf::ProvidedBufferPool;
 use crate::task::IoSlot;
 use crate::task::IoUserData;
@@ -19,7 +25,6 @@ use crate::task::NO_JOINER;
 use crate::task::Task;
 use crate::task::TaskContext;
 use crate::task::TaskSlab;
-use crate::wbuf::WriteBufferPool;
 
 thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
@@ -119,11 +124,14 @@ pub(crate) struct Runtime {
     pub io_slab: Vec<IoSlot>,
     /// Indices of reusable io slab slots.
     pub free_io_slots: Vec<u32>,
-    pub slab: Vec<u8>,
-    pub read_levels: Vec<Level>,
-    pub buffer_pools: Vec<ProvidedBufferPool>,
-    pub write_levels: Vec<Level>,
-    pub write_pools: Vec<WriteBufferPool>,
+    /// Start of the shared buffer slab, allocated aligned to at most one page.
+    pub slab: NonNull<u8>,
+    /// The layout of the slab allocation, used to free it on drop.
+    slab_layout: Layout,
+    pub provided_classes: Vec<SizeClass>,
+    pub provided_pools: Vec<ProvidedBufferPool>,
+    pub fixed_classes: Vec<SizeClass>,
+    pub fixed_pools: Vec<BufferPool>,
     pub ring: io_uring::IoUring,
     pub make_fut: *const (),
 }
@@ -133,10 +141,11 @@ impl Drop for Runtime {
         // Unregister every provided buffer ring and the fixed write buffer
         // slab while the io_uring fd is still open; the pools and slabs are
         // dropped afterwards along with the other fields.
-        for pool in &self.buffer_pools {
+        for pool in &self.provided_pools {
             let _ = pool.unregister(&self.ring);
         }
         let _ = self.ring.submitter().unregister_buffers();
+        unsafe { dealloc(self.slab.as_ptr(), self.slab_layout) };
     }
 }
 
@@ -323,11 +332,11 @@ impl Runtime {
 pub struct RuntimeParams<'a> {
     pub tasks_capacity: u32,
     pub ring_entries: u32,
-    /// Per-direction buffer levels for reads. Each `count` must be a power of
+    /// Provided-buffer size classes for reads. Each `count` must be a power of
     /// two no larger than 32768.
-    pub read_levels: &'a [Level],
-    /// Per-direction buffer levels for writes.
-    pub write_levels: &'a [Level],
+    pub provided_size_classes: &'a [SizeClass],
+    /// Fixed-buffer size classes for writes and op-argument allocations.
+    pub size_classes: &'a [SizeClass],
 }
 
 impl<'a> Default for RuntimeParams<'a> {
@@ -335,48 +344,81 @@ impl<'a> Default for RuntimeParams<'a> {
         Self {
             tasks_capacity: 1024,
             ring_entries: 1024,
-            read_levels: &DEFAULT_LEVELS,
-            write_levels: &DEFAULT_LEVELS,
+            provided_size_classes: &DEFAULT_SIZE_CLASSES,
+            size_classes: &DEFAULT_SIZE_CLASSES,
         }
     }
 }
 
-/// The shared buffer slab plus the level tables and pools built over it.
+/// The shared buffer slab allocation plus the class tables and pools built
+/// over it.
 type BuiltPools = (
-    Vec<u8>,
-    Vec<Level>,
+    NonNull<u8>,
+    Layout,
+    Vec<SizeClass>,
     Vec<ProvidedBufferPool>,
-    Vec<Level>,
-    Vec<WriteBufferPool>,
+    Vec<SizeClass>,
+    Vec<BufferPool>,
 );
 
-/// Builds both directions' pools over one shared slab: the read levels occupy
-/// the start of the slab, the write levels follow them. Each read level gets a
-/// provided-buffer ring registered under `bgid = level index`; the write
-/// levels get free-stack pools, and the whole slab is registered once as fixed
-/// buffer index 0 so writes can address any slot by its absolute offset.
-/// Returns the slab, both sorted level tables, and both pool lists.
-fn build_pools(ring: &io_uring::IoUring, read_spec: &[Level], write_spec: &[Level]) -> BuiltPools {
-    let read_layout = layout_levels(read_spec, true);
-    let write_layout = layout_levels(write_spec, false);
-    let read_total = read_layout.last().map(|l| l.total).unwrap();
-    let total = read_total + write_layout.last().map(|l| l.total).unwrap();
+/// Builds both directions' pools over one shared slab: the provided classes
+/// occupy the start of the slab, the fixed classes follow them. Each provided
+/// class gets a provided-buffer ring registered under `bgid = class index`;
+/// the fixed classes get free-stack pools, and the whole slab is registered
+/// once as fixed buffer index 0 so writes can address any slot by its absolute
+/// offset. Returns the slab, both sorted class tables, and both pool lists.
+///
+/// The slab is allocated aligned to at most one page (4 KiB) and the classes
+/// are laid out on offsets aligned to their own sizes capped at that page
+/// alignment, so every buffer is aligned to `min(size, 4096)` and no buffer
+/// claims an alignment beyond a page. Class sizes must be powers of two (the
+/// allocator only guarantees power-of-two alignment).
+fn build_pools(
+    ring: &io_uring::IoUring,
+    provided_spec: &[SizeClass],
+    fixed_spec: &[SizeClass],
+) -> BuiltPools {
+    let provided_layout = layout_classes(provided_spec, true);
+    let fixed_layout = layout_classes(fixed_spec, false);
+    let provided_total = provided_layout.last().map(|l| l.total).unwrap();
+    // The slab is aligned to at most one page: larger classes still land on
+    // page-aligned offsets, so no buffer ever exceeds a page's alignment.
+    let align = provided_spec
+        .iter()
+        .chain(fixed_spec)
+        .map(|class| class.size.min(BUFFER_MAX_ALIGN) as usize)
+        .max()
+        .expect("at least one size class is required");
+    assert!(
+        align.is_power_of_two(),
+        "buffer size class sizes must be powers of two so buffers can be aligned to their size"
+    );
+    // Start the fixed region on an offset aligned to `align` (hence to every
+    // class size): the provided region's total need not be a multiple of the
+    // fixed class sizes.
+    let fixed_start = provided_total.div_ceil(u64::from(align as u32)) * u64::from(align as u32);
+    let total = fixed_start + fixed_layout.last().map(|l| l.total).unwrap();
     assert!(
         total <= u64::from(u32::MAX),
-        "the combined read+write slab exceeds the 4 GiB offset range"
+        "the combined provided+fixed slab exceeds the 4 GiB offset range"
     );
-    let mut slab = vec![0u8; total as usize];
-    let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
 
-    let read_levels: Vec<Level> = read_layout
+    let layout = Layout::from_size_align(total as usize, align).unwrap();
+    let slab = unsafe { alloc(layout) };
+    if slab.is_null() {
+        handle_alloc_error(layout);
+    }
+    let base = unsafe { NonNull::new_unchecked(slab) };
+
+    let provided_classes: Vec<SizeClass> = provided_layout
         .iter()
-        .map(|l| Level {
+        .map(|l| SizeClass {
             size: l.size,
             count: l.count,
         })
         .collect();
-    let mut buffer_pools = Vec::with_capacity(read_layout.len());
-    for (i, l) in read_layout.iter().enumerate() {
+    let mut provided_pools = Vec::with_capacity(provided_layout.len());
+    for (i, l) in provided_layout.iter().enumerate() {
         let pool = ProvidedBufferPool::new(
             base,
             l.base_offset as usize,
@@ -386,22 +428,22 @@ fn build_pools(ring: &io_uring::IoUring, read_spec: &[Level], write_spec: &[Leve
         );
         pool.register(ring)
             .expect("failed to register the provided buffer ring");
-        buffer_pools.push(pool);
+        provided_pools.push(pool);
     }
 
-    let write_levels: Vec<Level> = write_layout
+    let fixed_classes: Vec<SizeClass> = fixed_layout
         .iter()
-        .map(|l| Level {
+        .map(|l| SizeClass {
             size: l.size,
             count: l.count,
         })
         .collect();
-    let write_pools = write_layout
+    let fixed_pools = fixed_layout
         .iter()
         .map(|l| {
-            WriteBufferPool::new(
+            BufferPool::new(
                 base,
-                read_total as usize + l.base_offset as usize,
+                fixed_start as usize + l.base_offset as usize,
                 l.size,
                 l.count,
             )
@@ -409,13 +451,20 @@ fn build_pools(ring: &io_uring::IoUring, read_spec: &[Level], write_spec: &[Leve
         .collect();
 
     let iovec = libc::iovec {
-        iov_base: slab.as_mut_ptr().cast::<libc::c_void>(),
-        iov_len: slab.len(),
+        iov_base: base.as_ptr().cast::<libc::c_void>(),
+        iov_len: total as usize,
     };
     unsafe { ring.submitter().register_buffers(&[iovec]) }
         .expect("failed to register the buffer slab");
 
-    (slab, read_levels, buffer_pools, write_levels, write_pools)
+    (
+        base,
+        layout,
+        provided_classes,
+        provided_pools,
+        fixed_classes,
+        fixed_pools,
+    )
 }
 
 pub fn block_on_default<S, F, T, R>(make_fut: S, user_data: T) -> R
@@ -444,8 +493,8 @@ where
             io_uring::IoUring::new(params.ring_entries).expect("failed to create io_uring")
         });
 
-    let (slab, read_levels, buffer_pools, write_levels, write_pools) =
-        build_pools(&ring, params.read_levels, params.write_levels);
+    let (slab, slab_layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+        build_pools(&ring, params.provided_size_classes, params.size_classes);
 
     let mut rt = Runtime {
         tasks: TaskSlab::new::<F, R>(params.tasks_capacity),
@@ -453,10 +502,11 @@ where
         io_slab: Vec::new(),
         free_io_slots: Vec::new(),
         slab,
-        read_levels,
-        buffer_pools,
-        write_levels,
-        write_pools,
+        slab_layout,
+        provided_classes,
+        provided_pools,
+        fixed_classes,
+        fixed_pools,
         ring,
         make_fut: &raw const make_fut as *const (),
     };
@@ -600,41 +650,47 @@ impl<T, R> RuntimeContext<T, R> {
 #[cfg(test)]
 mod tests {
     use core::future::Ready;
+    use core::mem::MaybeUninit;
     use core::pin::pin;
     use core::task::Context;
     use core::task::Poll;
     use core::task::Waker;
 
     use super::*;
+    use crate::buf::Buffer;
+    use crate::buf::BufferBytes;
+    use crate::classes::SizeClass;
+    use crate::classes::pack_bid;
+    use crate::io::MAX_CTRL_CAP;
+    use crate::io::MAX_IOV_CAP;
+    use crate::io::Msg;
     use crate::io::await_cqe;
-    use crate::io::write_buffer;
+    use crate::io::cmsg_space;
     use crate::io::yield_now;
-    use crate::levels::Level;
-    use crate::levels::pack_bid;
-    use crate::pbuf::ReadBuffer;
+    use crate::pbuf::ProvidedBuffer;
     use crate::task::IoUserData;
     use crate::task::IoVec;
     use crate::task::Task;
     use crate::task::TaskSlab;
-    use crate::wbuf::WriteBuffer;
 
     fn test_runtime_data(capacity: u32) -> Runtime {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, read_levels, buffer_pools, write_levels, write_pools) =
-            build_pools(&ring, &[Level { size: 16, count: 4 }], &[Level {
-                size: 16,
-                count: 4,
-            }]);
+        let (slab, slab_layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
+                SizeClass { size: 16, count: 4 },
+                SizeClass { size: 64, count: 4 },
+            ]);
         Runtime {
             tasks: TaskSlab::new::<Ready<()>, ()>(capacity),
             wakeups: Vec::new(),
             io_slab: Vec::new(),
             free_io_slots: Vec::new(),
             slab,
-            read_levels,
-            buffer_pools,
-            write_levels,
-            write_pools,
+            slab_layout,
+            provided_classes,
+            provided_pools,
+            fixed_classes,
+            fixed_pools,
             ring,
             make_fut: core::ptr::null(),
         }
@@ -694,24 +750,95 @@ mod tests {
     }
 
     #[test]
-    fn shared_slab_write_region_follows_read_region() {
+    fn shared_slab_fixed_region_follows_provided_region() {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let (_slab, _rl, read_pools, _wl, write_pools) =
-            build_pools(&ring, &[Level { size: 16, count: 4 }], &[Level {
+        let (slab, _layout, _pc, provided_pools, _fc, fixed_pools) =
+            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
                 size: 32,
                 count: 2,
             }]);
-        // The read region is 4 x 16 = 64 bytes; the write level starts right
-        // after it in the same slab.
-        assert_eq!(read_pools[0].slot_offset(3), 48);
-        assert_eq!(write_pools[0].slot_offset(0), 64);
-        assert_eq!(write_pools[0].slot_offset(1), 96);
+        // The provided region is 4 x 16 = 64 bytes; the fixed class starts
+        // right after it in the same slab.
+        assert_eq!(provided_pools[0].slot_offset(3), 48);
+        assert_eq!(fixed_pools[0].slot_offset(0), 64);
+        assert_eq!(fixed_pools[0].slot_offset(1), 96);
+        // Every slot address is aligned to its class's buffer size.
+        let base = slab.as_ptr() as usize;
+        assert_eq!((base + provided_pools[0].slot_offset(3) as usize) % 16, 0);
+        assert_eq!((base + fixed_pools[0].slot_offset(0) as usize) % 32, 0);
+        assert_eq!((base + fixed_pools[0].slot_offset(1) as usize) % 32, 0);
     }
 
-    // ── ReadBuffer ────────────────────────────────────────────────────
+    #[test]
+    fn build_pools_aligns_every_slot_to_its_size() {
+        let ring = io_uring::IoUring::new(8).unwrap();
+        let (slab, _layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
+                SizeClass { size: 64, count: 2 },
+                SizeClass {
+                    size: 128,
+                    count: 2,
+                },
+            ]);
+        // The provided region is 4 x 16 = 64 bytes, not a multiple of the
+        // fixed classes' sizes: the fixed region must start padded to the
+        // largest size, or the 128-byte class would land 64 bytes off.
+        let base = slab.as_ptr() as usize;
+        assert_eq!(base % 128, 0, "slab base is aligned to the largest class");
+        for (class, pool) in provided_classes.iter().zip(&provided_pools) {
+            for local in 0..class.count {
+                let addr = base + pool.slot_offset(local as u16) as usize;
+                assert_eq!(
+                    addr % class.size as usize,
+                    0,
+                    "provided slot {local} of size {} is misaligned",
+                    class.size
+                );
+            }
+        }
+        for (class, pool) in fixed_classes.iter().zip(&fixed_pools) {
+            for local in 0..class.count {
+                let addr = base + pool.slot_offset(local) as usize;
+                assert_eq!(
+                    addr % class.size.min(BUFFER_MAX_ALIGN) as usize,
+                    0,
+                    "fixed slot {local} of size {} is misaligned",
+                    class.size
+                );
+            }
+        }
+    }
 
     #[test]
-    fn read_buffer_drop_recycles_slot() {
+    fn build_pools_caps_alignment_at_one_page() {
+        let ring = io_uring::IoUring::new(8).unwrap();
+        let (slab, _layout, _pc, provided_pools, _fc, fixed_pools) =
+            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
+                size: 8192,
+                count: 2,
+            }]);
+        // The 16-byte provided region is 64 bytes; the fixed class must start
+        // padded to a page, and the 8 KiB slots are page-aligned — not aligned
+        // to their full size, since alignment never exceeds one page.
+        let base = slab.as_ptr() as usize;
+        assert_eq!(base % 4096, 0, "slab base is aligned to at most one page");
+        assert_eq!(fixed_pools[0].slot_offset(0), 4096);
+        assert_eq!(fixed_pools[0].slot_offset(1), 12288);
+        for local in 0..2 {
+            let addr = base + fixed_pools[0].slot_offset(local) as usize;
+            assert_eq!(addr % 4096, 0, "slot {local} is page-aligned");
+        }
+        // Small classes still get full alignment to their own size.
+        for local in 0..4 {
+            let addr = base + provided_pools[0].slot_offset(local as u16) as usize;
+            assert_eq!(addr % 16, 0, "provided slot {local} is 16-byte aligned");
+        }
+    }
+
+    // ── ProvidedBuffer ─────────────────────────────────────────────────
+
+    #[test]
+    fn provided_buffer_drop_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -724,16 +851,16 @@ mod tests {
 
         let generation = _gen.get();
         let local = 1u16;
-        let offset = data.buffer_pools[0].slot_offset(local);
-        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        let offset = data.provided_pools[0].slot_offset(local);
+        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pools[0].ring_tail(), 4);
         drop(buf);
-        assert_eq!(data.buffer_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pools[0].ring_tail(), 5);
     }
 
     #[test]
-    fn read_buffer_stale_generation_skips_recycle() {
+    fn provided_buffer_stale_generation_skips_recycle() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -746,16 +873,16 @@ mod tests {
 
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         let local = 1u16;
-        let offset = data.buffer_pools[0].slot_offset(local);
-        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        let offset = data.provided_pools[0].slot_offset(local);
+        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pools[0].ring_tail(), 4);
         drop(buf);
-        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pools[0].ring_tail(), 4);
     }
 
     #[test]
-    fn read_buffer_into_vec_recycles_slot() {
+    fn provided_buffer_into_vec_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -768,19 +895,19 @@ mod tests {
 
         let generation = _gen.get();
         let local = 1u16;
-        let offset = data.buffer_pools[0].slot_offset(local);
-        let buf = ReadBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        let offset = data.provided_pools[0].slot_offset(local);
+        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
 
-        assert_eq!(data.buffer_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pools[0].ring_tail(), 4);
         let bytes = buf.into_vec();
         assert_eq!(bytes.len(), 5);
-        assert_eq!(data.buffer_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pools[0].ring_tail(), 5);
     }
 
-    // ── WriteBuffer ───────────────────────────────────────────────────
+    // ── BufferBytes ───────────────────────────────────────────────────
 
     #[test]
-    fn write_buffer_drop_recycles_slot() {
+    fn buffer_bytes_drop_recycles_slot() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -792,17 +919,17 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let generation = _gen.get();
-        let local = data.write_pools[0].acquire().unwrap();
-        let offset = data.write_pools[0].slot_offset(local);
-        let buf = WriteBuffer::new(offset, pack_bid(0, local), generation);
+        let local = data.fixed_pools[0].acquire().unwrap();
+        let offset = data.fixed_pools[0].slot_offset(local);
+        let buf = BufferBytes::new(offset, pack_bid(0, local), generation);
 
-        assert_eq!(data.write_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
-        assert_eq!(data.write_pools[0].free_count(), 4);
+        assert_eq!(data.fixed_pools[0].free_count(), 4);
     }
 
     #[test]
-    fn write_buffer_stale_generation_skips_recycle() {
+    fn buffer_bytes_stale_generation_skips_recycle() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -813,18 +940,18 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let local = data.write_pools[0].acquire().unwrap();
-        let offset = data.write_pools[0].slot_offset(local);
+        let local = data.fixed_pools[0].acquire().unwrap();
+        let offset = data.fixed_pools[0].slot_offset(local);
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        let buf = WriteBuffer::new(offset, pack_bid(0, local), generation);
+        let buf = BufferBytes::new(offset, pack_bid(0, local), generation);
 
-        assert_eq!(data.write_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
-        assert_eq!(data.write_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pools[0].free_count(), 3);
     }
 
     #[test]
-    fn write_buffer_helper_returns_slot_capacity() {
+    fn alloc_bytes_helper_returns_slot_capacity() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -835,17 +962,17 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.write_pools[0].free_count();
-        let buf = write_buffer(ctx, 5).unwrap();
+        let before = data.fixed_pools[0].free_count();
+        let buf = ctx.alloc_bytes(5).unwrap();
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 0);
-        assert_eq!(data.write_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
         drop(buf);
-        assert_eq!(data.write_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
     }
 
     #[test]
-    fn write_buffer_as_mut_set_len_clear() {
+    fn alloc_bytes_as_mut_set_len_clear() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -856,7 +983,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut buf = write_buffer(ctx, 5).unwrap();
+        let mut buf = ctx.alloc_bytes(5).unwrap();
         assert_eq!(buf.as_mut().len(), 16);
         buf.as_mut()[..5].copy_from_slice(b"hello");
         buf.set_len(5);
@@ -873,7 +1000,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceeds capacity")]
-    fn write_buffer_set_len_above_capacity_panics() {
+    fn alloc_bytes_set_len_above_capacity_panics() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -884,7 +1011,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut buf = write_buffer(ctx, 5).unwrap();
+        let mut buf = ctx.alloc_bytes(5).unwrap();
         buf.set_len(17);
     }
 
@@ -1101,7 +1228,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let bgid = ctx.with_runtime(|r| r.buffer_pools[0].bgid());
+        let bgid = ctx.with_runtime(|r| r.provided_pools[0].bgid());
         assert_eq!(bgid, 0);
     }
 
@@ -1217,5 +1344,298 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(data.tasks.task(index_a).ready);
+    }
+
+    // ── Buffer ────────────────────────────────────────────────────────
+
+    #[test]
+    fn alloc_drop_recycles_slot() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let before = data.fixed_pools[0].free_count();
+        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        drop(alloc);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    #[test]
+    fn alloc_cast_preserves_slot() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        // Casting strips the outer `MaybeUninit` but names the same slot.
+        let orig = ctx.alloc::<[u8; 16]>().unwrap();
+        let orig_ptr = orig.as_ptr();
+        let before = data.fixed_pools[0].free_count();
+        let casted: Buffer<[u8; 16]> = unsafe { orig.cast() };
+        assert_eq!(orig_ptr.cast::<u8>(), casted.as_ptr().cast::<u8>());
+
+        // The cast transfers the slot: it must not recycle it (which would
+        // hand the same slot out twice on the next alloc).
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+
+        // The slot still recycles on drop after the cast, exactly once.
+        drop(casted);
+        assert_eq!(data.fixed_pools[0].free_count(), before + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero-sized")]
+    fn alloc_zst_panics() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let _ = ctx.alloc::<()>();
+    }
+
+    #[test]
+    fn alloc_stale_generation_leaks_on_drop() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let gen_guard = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        let before = data.fixed_pools[0].free_count();
+        // The runtime shuts down: the drop must leak, not recycle.
+        drop(gen_guard);
+        drop(alloc);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the runtime")]
+    fn alloc_as_ptr_stale_generation_panics() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        // context_for sets the current runtime; only its side effect is needed.
+        let _ctx = data.context_for(index);
+
+        let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
+        let alloc: Buffer<MaybeUninit<[u8; 16]>> = Buffer::new(pack_bid(0, 0), stale);
+        let _ = alloc.as_ptr();
+    }
+
+    // ── Msg ───────────────────────────────────────────────────────
+
+    #[test]
+    fn msg_slot_zero_iov_ctrl_wires_null() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut slot = Msg::<0, 0>::new(ctx).unwrap();
+        {
+            let msg = slot.msg();
+            assert!(msg.msg_iov.is_null());
+            assert_eq!(msg.msg_iovlen, 0);
+            assert!(msg.msg_control.is_null());
+            assert_eq!(msg.msg_controllen, 0);
+        }
+        assert!(slot.iov(0).is_none());
+        assert!(slot.ctrl().is_none());
+        // Zero-capacity vecs reject every push.
+        assert!(!slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }));
+        assert!(!slot.push_cmsg(1, 2, &[0u8; 4]));
+        assert!(!slot.push_scm_rights(&[0]));
+    }
+
+    #[test]
+    fn msg_slot_wires_iov_to_pooled_memory() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut slot = Msg::<4, 0>::new(ctx).unwrap();
+        let msg_iov = {
+            let msg = slot.msg();
+            assert_eq!(msg.msg_iovlen, 0);
+            assert!(msg.msg_control.is_null());
+            assert_eq!(msg.msg_controllen, 0);
+            msg.msg_iov as *mut libc::iovec
+        };
+        // Nothing pushed yet: the accessor exposes no entries.
+        assert!(slot.iov(0).is_none());
+        assert!(!msg_iov.is_null());
+        // Pushes land in the pooled array and advance msg_iovlen.
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 5,
+        }));
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 6,
+        }));
+        assert_eq!(msg_iov, slot.iov(0).unwrap() as *mut libc::iovec);
+        assert_eq!(slot.msg().msg_iovlen, 2);
+        assert!(slot.iov(1).is_some());
+        assert!(slot.iov(2).is_none());
+        // Writes through the accessor land in the pooled memory.
+        slot.iov(0).unwrap().iov_len = 7;
+        assert_eq!(unsafe { (*msg_iov).iov_len }, 7);
+    }
+
+    #[test]
+    fn msg_slot_push_iov_rejects_past_capacity() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut slot = Msg::<2, 0>::new(ctx).unwrap();
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 1,
+        }));
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 2,
+        }));
+        assert!(!slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 3,
+        }));
+        assert_eq!(slot.msg().msg_iovlen, 2);
+    }
+
+    #[test]
+    fn msg_slot_wires_ctrl_to_pooled_memory() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut slot = Msg::<0, 64>::new(ctx).unwrap();
+        let msg_control = {
+            let msg = slot.msg();
+            assert!(msg.msg_iov.is_null());
+            assert_eq!(msg.msg_iovlen, 0);
+            assert_eq!(msg.msg_controllen, 0);
+            msg.msg_control as *mut u8
+        };
+        assert_eq!(msg_control, slot.ctrl().unwrap().as_mut_ptr());
+        // push_cmsg wires msg_controllen to CMSG_SPACE of the pushed payload.
+        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]));
+        assert_eq!(slot.msg().msg_controllen, cmsg_space(4));
+        // A zero MAX_IOV still requires the mandatory msghdr allocation.
+        assert!(slot.msg().msg_control as usize != 0);
+    }
+
+    #[test]
+    fn msg_slot_push_cmsg_accumulates_and_overflows() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let mut slot = Msg::<0, 64>::new(ctx).unwrap();
+        let payload = [1u8, 2, 3, 4];
+        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload));
+        // The cmsg bytes land at the start of the pooled control buffer.
+        let ctrl = slot.ctrl().unwrap();
+        let hdr = ctrl.as_ptr() as *const libc::cmsghdr;
+        unsafe {
+            assert_eq!((*hdr).cmsg_level, libc::SOL_SOCKET);
+            assert_eq!((*hdr).cmsg_type, libc::SCM_RIGHTS);
+            assert_eq!((*hdr).cmsg_len, size_of::<libc::cmsghdr>() + payload.len());
+        }
+        // A second cmsg of the same size fits and accumulates its space.
+        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &payload));
+        assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
+        assert_eq!(slot.ctrl().unwrap().len(), 2 * cmsg_space(4));
+        // A cmsg that would exceed MAX_CTRL is rejected, lengths unchanged.
+        assert!(!slot.push_cmsg(1, 2, &[0u8; 16]));
+        assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
+    }
+
+    #[test]
+    fn msg_slot_default_caps_are_kernel_maxima() {
+        // The caps are the kernel's limits, not the pool's: UIO_MAXIOV
+        // (1024 iovecs) and CMSG_SPACE of SCM_MAX_FD (253 fds).
+        assert_eq!(MAX_IOV_CAP, 1024);
+        assert_eq!(MAX_CTRL_CAP, cmsg_space(253 * size_of::<libc::c_int>()));
+        assert_eq!(size_of::<Msg>(), 24);
+        // The bare type `Msg` resolves to the max-caps instantiation
+        // (the default generic args). This only compiles when the two
+        // spellings name the same type.
+        let _same_type = |slot: Msg| -> Msg<MAX_IOV_CAP, MAX_CTRL_CAP> { slot };
+
+        // The test runtime's largest fixed class is 16 bytes, so a max-caps
+        // slot cannot be constructed: the pool is the runtime limit, the caps
+        // the kernel's.
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+        assert!(Msg::<MAX_IOV_CAP, MAX_CTRL_CAP>::new(ctx).is_none());
     }
 }

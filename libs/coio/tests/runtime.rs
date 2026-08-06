@@ -1,4 +1,4 @@
-use coio::Level;
+use coio::SizeClass;
 use coio::runtime::RuntimeContext;
 use coio::runtime::RuntimeParams;
 use coio::runtime::block_on;
@@ -19,8 +19,8 @@ fn block_on_trivial() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(rt, |_, _, _data: ()| async move {}, ());
 }
@@ -30,8 +30,8 @@ fn block_on_with_spawn() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -49,8 +49,8 @@ fn block_on_spawn_chain() {
     let rt = RuntimeParams {
         tasks_capacity: 16,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -77,8 +77,8 @@ fn stale_runtime_context_panics_outside_block_on() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -111,8 +111,8 @@ fn stale_task_context_panics_outside_block_on() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -145,8 +145,8 @@ fn stale_runtime_context_from_previous_run_panics() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -159,8 +159,8 @@ fn stale_runtime_context_from_previous_run_panics() {
     let rt2 = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt2,
@@ -198,8 +198,8 @@ fn block_on_read_from_file() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -228,8 +228,8 @@ fn block_on_read_full_buffer() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -246,8 +246,8 @@ fn block_on_returns_main_output() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     let out = block_on(rt, |_, _rt, data: u32| async move { data + 1 }, 41);
     assert_eq!(out, 42);
@@ -258,8 +258,8 @@ fn join_yields_task_output() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     let out = block_on(
         rt,
@@ -282,8 +282,8 @@ fn join_after_cancel_returns_none() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     let out = block_on(
         rt,
@@ -307,8 +307,8 @@ fn into_handle_resumes_later_join() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -345,8 +345,8 @@ fn block_on_read_many_recycles() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -358,6 +358,243 @@ fn block_on_read_many_recycles() {
         },
         fd,
     );
+}
+
+// ── sendmsg/recvmsg ───────────────────────────────────────────────
+
+/// `CMSG_LEN(n)`: the length of a `cmsghdr` plus its `n` payload bytes, as
+/// recorded in `cmsg_len`.
+fn cmsg_len(payload: usize) -> usize {
+    size_of::<libc::cmsghdr>() + payload
+}
+
+fn socketpair(stream: bool) -> (i32, i32) {
+    let mut fds = [0i32; 2];
+    let ty = if stream {
+        libc::SOCK_STREAM
+    } else {
+        libc::SOCK_DGRAM
+    };
+    assert_eq!(
+        unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) },
+        0
+    );
+    (fds[0], fds[1])
+}
+
+fn rt() -> RuntimeParams<'static> {
+    RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[
+            SizeClass { size: 16, count: 4 },
+            SizeClass { size: 64, count: 4 },
+            SizeClass {
+                size: 128,
+                count: 2,
+            },
+        ],
+    }
+}
+
+#[test]
+fn block_on_sendmsg_recvmsg_roundtrip() {
+    use coio::io::Msg;
+    use coio::io::recvmsg;
+    use coio::io::sendmsg;
+
+    let (a, b) = socketpair(true);
+    block_on(
+        rt(),
+        |ctx, _rt, (a, b): (i32, i32)| async move {
+            let mut snd = Msg::<1, 0>::new(ctx).unwrap();
+            snd.push_iov(libc::iovec {
+                iov_base: b"hello".as_ptr().cast_mut().cast(),
+                iov_len: 5,
+            });
+            let n = sendmsg(ctx, a, &mut snd).await.unwrap();
+            assert_eq!(n, 5);
+
+            let mut rcv = Msg::<1, 0>::new(ctx).unwrap();
+            let mut buf = [0u8; 16];
+            rcv.push_iov(libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            });
+            let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(&buf[..5], b"hello");
+        },
+        (a, b),
+    );
+    unsafe { libc::close(a) };
+    unsafe { libc::close(b) };
+}
+
+#[test]
+fn block_on_sendmsg_subset_of_iovecs() {
+    use coio::io::Msg;
+    use coio::io::recvmsg;
+    use coio::io::sendmsg;
+
+    let (a, b) = socketpair(true);
+    block_on(
+        rt(),
+        |ctx, _rt, (a, b): (i32, i32)| async move {
+            // A <2, 0> slot with only the first iovec filled: only that one
+            // segment is declared (msg_iovlen == 1) and handed to the kernel,
+            // so the uninitialized second segment is never exposed.
+            let mut snd = Msg::<2, 0>::new(ctx).unwrap();
+            snd.push_iov(libc::iovec {
+                iov_base: b"ab".as_ptr().cast_mut().cast(),
+                iov_len: 1,
+            });
+            let n = sendmsg(ctx, a, &mut snd).await.unwrap();
+            assert_eq!(n, 1);
+
+            let mut rcv = Msg::<1, 0>::new(ctx).unwrap();
+            let mut buf = [0u8; 8];
+            rcv.push_iov(libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            });
+            let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], b'a');
+        },
+        (a, b),
+    );
+    unsafe { libc::close(a) };
+    unsafe { libc::close(b) };
+}
+
+#[test]
+fn block_on_fd_passing_without_iov() {
+    use std::os::fd::AsRawFd;
+
+    use coio::io::Msg;
+    use coio::io::recvmsg;
+    use coio::io::sendmsg;
+
+    // A file to pass; the receiver must get a new fd to the same file.
+    let sent_file = tmpfile();
+    let sent_fd = sent_file.as_raw_fd();
+    std::mem::forget(sent_file);
+
+    let (a, b) = socketpair(false);
+    block_on(
+        rt(),
+        |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
+            // Sender: a cmsg carrying `sent_fd`, with no data iovec.
+            let mut snd = Msg::<0, 128>::new(ctx).unwrap();
+            assert!(snd.push_scm_rights(&[sent_fd]));
+            let n = sendmsg(ctx, a, &mut snd).await.unwrap();
+            assert_eq!(n, 0);
+
+            // Receiver: read the cmsg back out of the pooled control buffer.
+            let mut rcv = Msg::<0, 128>::new(ctx).unwrap();
+            let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
+            assert_eq!(n, 0);
+
+            let (recv_fd,) = {
+                let msg = rcv.msg();
+                assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0);
+                assert!(msg.msg_controllen >= cmsg_len(size_of::<i32>()));
+                let hdr = msg.msg_control as *const libc::cmsghdr;
+                unsafe {
+                    let hdr = &*hdr;
+                    assert_eq!(hdr.cmsg_level, libc::SOL_SOCKET);
+                    assert_eq!(hdr.cmsg_type, libc::SCM_RIGHTS);
+                    assert_eq!(hdr.cmsg_len, cmsg_len(size_of::<i32>()));
+                    let data = (hdr as *const libc::cmsghdr as *const u8)
+                        .add(size_of::<libc::cmsghdr>())
+                        as *const i32;
+                    (*data,)
+                }
+            };
+
+            // A distinct fd to the same file.
+            assert_ne!(recv_fd, sent_fd);
+            let mut st1: libc::stat = unsafe { core::mem::zeroed() };
+            let mut st2: libc::stat = unsafe { core::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(sent_fd, &mut st1) }, 0);
+            assert_eq!(unsafe { libc::fstat(recv_fd, &mut st2) }, 0);
+            assert_eq!(st1.st_dev, st2.st_dev);
+            assert_eq!(st1.st_ino, st2.st_ino);
+            unsafe { libc::close(recv_fd) };
+        },
+        (a, b, sent_fd),
+    );
+    unsafe { libc::close(a) };
+    unsafe { libc::close(b) };
+    unsafe { libc::close(sent_fd) };
+}
+
+#[test]
+fn block_on_fd_passing_with_data() {
+    use std::os::fd::AsRawFd;
+
+    use coio::io::Msg;
+    use coio::io::recvmsg;
+    use coio::io::sendmsg;
+
+    let sent_file = tmpfile();
+    let sent_fd = sent_file.as_raw_fd();
+    std::mem::forget(sent_file);
+
+    let (a, b) = socketpair(true);
+    block_on(
+        rt(),
+        |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
+            let mut snd = Msg::<1, 128>::new(ctx).unwrap();
+            snd.push_iov(libc::iovec {
+                iov_base: b"x".as_ptr().cast_mut().cast(),
+                iov_len: 1,
+            });
+            assert!(snd.push_scm_rights(&[sent_fd]));
+            let n = sendmsg(ctx, a, &mut snd).await.unwrap();
+            assert_eq!(n, 1);
+
+            let mut rcv = Msg::<1, 128>::new(ctx).unwrap();
+            let mut buf = [0u8; 16];
+            rcv.push_iov(libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len(),
+            });
+            let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], b'x');
+
+            let recv_fd = {
+                let msg = rcv.msg();
+                assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0);
+                let hdr = msg.msg_control as *const libc::cmsghdr;
+                unsafe {
+                    let hdr = &*hdr;
+                    assert_eq!(hdr.cmsg_level, libc::SOL_SOCKET);
+                    assert_eq!(hdr.cmsg_type, libc::SCM_RIGHTS);
+                    let data = (hdr as *const libc::cmsghdr as *const u8)
+                        .add(size_of::<libc::cmsghdr>())
+                        as *const i32;
+                    *data
+                }
+            };
+
+            assert_ne!(recv_fd, sent_fd);
+            let mut st1: libc::stat = unsafe { core::mem::zeroed() };
+            let mut st2: libc::stat = unsafe { core::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(sent_fd, &mut st1) }, 0);
+            assert_eq!(unsafe { libc::fstat(recv_fd, &mut st2) }, 0);
+            assert_eq!(st1.st_dev, st2.st_dev);
+            assert_eq!(st1.st_ino, st2.st_ino);
+            unsafe { libc::close(recv_fd) };
+        },
+        (a, b, sent_fd),
+    );
+    unsafe { libc::close(a) };
+    unsafe { libc::close(b) };
+    unsafe { libc::close(sent_fd) };
 }
 
 #[test]
@@ -377,8 +614,8 @@ fn block_on_read_into_vec() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -399,7 +636,6 @@ fn block_on_write_to_file() {
     use std::os::fd::AsRawFd;
 
     use coio::io::write;
-    use coio::io::write_buffer;
 
     let mut file = tmpfile();
     let fd = file.as_raw_fd();
@@ -407,13 +643,13 @@ fn block_on_write_to_file() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = write_buffer(ctx, 5).unwrap();
+            let mut wb = ctx.alloc_bytes(5).unwrap();
             wb.as_mut()[..5].copy_from_slice(b"hello");
             wb.set_len(5);
             let n = write(ctx, fd, wb).await.unwrap();
@@ -436,7 +672,6 @@ fn block_on_write_full_slot() {
     use std::os::fd::AsRawFd;
 
     use coio::io::write;
-    use coio::io::write_buffer;
 
     // The whole slot (buf_size) can be used for a single write.
     let mut file = tmpfile();
@@ -445,13 +680,13 @@ fn block_on_write_full_slot() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = write_buffer(ctx, 16).unwrap();
+            let mut wb = ctx.alloc_bytes(16).unwrap();
             assert_eq!(wb.capacity(), 16);
             wb.as_mut().fill(0xAB);
             wb.set_len(16);
@@ -475,7 +710,6 @@ fn block_on_write_many_recycles() {
     use std::os::fd::AsRawFd;
 
     use coio::io::write;
-    use coio::io::write_buffer;
 
     // More writes than the pool holds, exercising slot recycling.
     // Writes use an absolute offset of 0, so each write overwrites the file.
@@ -485,14 +719,14 @@ fn block_on_write_many_recycles() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
             for i in 0..8u32 {
-                let mut wb = write_buffer(ctx, 8).unwrap();
+                let mut wb = ctx.alloc_bytes(8).unwrap();
                 let payload = format!("chunk{i:03}");
                 wb.as_mut()[..8].copy_from_slice(payload.as_bytes());
                 wb.set_len(8);
@@ -528,8 +762,11 @@ fn block_on_read_uses_proportional_levels() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 8, count: 4 }, Level { size: 64, count: 2 }],
-        write_levels: &[Level { size: 8, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 8, count: 4 }, SizeClass {
+            size: 64,
+            count: 2,
+        }],
+        size_classes: &[SizeClass { size: 8, count: 4 }],
     };
     block_on(
         rt,
@@ -554,7 +791,6 @@ fn block_on_write_uses_proportional_levels() {
     use std::os::fd::AsRawFd;
 
     use coio::io::write;
-    use coio::io::write_buffer;
 
     // An 11-byte write needs the 64-byte level; its capacity is 64.
     let mut file = tmpfile();
@@ -563,13 +799,16 @@ fn block_on_write_uses_proportional_levels() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 8, count: 4 }],
-        write_levels: &[Level { size: 8, count: 4 }, Level { size: 64, count: 2 }],
+        provided_size_classes: &[SizeClass { size: 8, count: 4 }],
+        size_classes: &[SizeClass { size: 8, count: 4 }, SizeClass {
+            size: 64,
+            count: 2,
+        }],
     };
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = write_buffer(ctx, 11).unwrap();
+            let mut wb = ctx.alloc_bytes(11).unwrap();
             assert_eq!(wb.capacity(), 64);
             wb.as_mut()[..11].copy_from_slice(b"hello world");
             wb.set_len(11);
@@ -597,8 +836,8 @@ fn block_on_read_oversized_errors() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
@@ -611,10 +850,8 @@ fn block_on_read_oversized_errors() {
 }
 
 #[test]
-fn block_on_write_buffer_oversized_errors() {
+fn block_on_alloc_bytes_oversized_errors() {
     use std::os::fd::AsRawFd;
-
-    use coio::io::write_buffer;
 
     let file = tmpfile();
     let fd = file.as_raw_fd();
@@ -622,13 +859,13 @@ fn block_on_write_buffer_oversized_errors() {
     let rt = RuntimeParams {
         tasks_capacity: 4,
         ring_entries: 8,
-        read_levels: &[Level { size: 16, count: 4 }],
-        write_levels: &[Level { size: 16, count: 4 }],
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }],
+        size_classes: &[SizeClass { size: 16, count: 4 }],
     };
     block_on(
         rt,
         |ctx, _rt, _fd| async move {
-            let err = write_buffer(ctx, 17).err().unwrap();
+            let err = ctx.alloc_bytes(17).err().unwrap();
             assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
         },
         fd,
