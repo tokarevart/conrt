@@ -3,9 +3,10 @@
 //!
 //! Each direction's pool memory is split into a user-defined set of size
 //! classes; a class is a run of equal-sized slots. A
-//! [`crate::pbuf::ProvidedBuffer`]/[`crate::buf::BufferBytes`] smart
-//! pointer identifies its slot with a packed `bid`: the top byte is the class
-//! index and the low 24 bits are the slot's id within that class.
+//! [`crate::buf::Bytes`]/[`crate::buf::BytesMut`] smart pointer identifies its
+//! slot with a packed `bid`: bit 31 is the provided-pool flag, the next seven
+//! bits are the class index, and the low 24 bits are the slot's id within that
+//! class.
 
 /// A run of equal-sized buffer slots.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -45,6 +46,10 @@ pub const DEFAULT_SIZE_CLASSES: [SizeClass; 6] = [
 ];
 
 pub(crate) const BID_CLASS_SHIFT: u32 = 24;
+pub(crate) const BID_PROVIDED_FLAG: u32 = 1 << 31;
+/// Masks the 7 class bits out of a packed `bid` after the provided flag is
+/// removed, i.e. `bid >> BID_CLASS_SHIFT` when `bid_provided` is false.
+pub(crate) const BID_CLASS_MASK: u32 = 0x7F;
 pub(crate) const BID_LOCAL_MASK: u32 = 0x00FF_FFFF;
 
 /// The maximum alignment any buffer can have, in bytes: one page. A buffer's
@@ -53,16 +58,24 @@ pub(crate) const BID_LOCAL_MASK: u32 = 0x00FF_FFFF;
 pub(crate) const BUFFER_MAX_ALIGN: u32 = 4096;
 
 /// Packs a class index and a local slot id into the global `bid` carried by a
-/// buffer smart pointer.
-pub(crate) fn pack_bid(class: u32, local: u32) -> u32 {
-    debug_assert!(class < 256);
-    debug_assert!(local <= BID_LOCAL_MASK);
-    (class << BID_CLASS_SHIFT) | local
+/// buffer smart pointer. The class index is limited to 7 bits: bit 31 is
+/// reserved for the provided-pool flag, the next seven bits carry the class,
+/// and the low 24 bits carry the local slot id. The class is masked down to
+/// its 7-bit field so a class byte with the top bit set can never spill into
+/// the provided flag, and the local id is masked into its low 24 bits.
+pub(crate) fn pack_bid(provided: bool, class: u8, local: u32) -> u32 {
+    let provided = if provided { BID_PROVIDED_FLAG } else { 0 };
+    provided | ((u32::from(class) & BID_CLASS_MASK) << BID_CLASS_SHIFT) | (local & BID_LOCAL_MASK)
 }
 
-/// The class index stored in the top byte of a packed `bid`.
-pub(crate) fn bid_class(bid: u32) -> u32 {
-    bid >> BID_CLASS_SHIFT
+/// Whether the `bid` names a slot in a provided buffer pool (vs. a fixed pool).
+pub(crate) fn bid_provided(bid: u32) -> bool {
+    bid & BID_PROVIDED_FLAG != 0
+}
+
+/// The class index stored in bits 24–30 of a packed `bid`.
+pub(crate) fn bid_class(bid: u32) -> u8 {
+    ((bid >> BID_CLASS_SHIFT) & BID_CLASS_MASK) as u8
 }
 
 /// The slot's id within its class, stored in the low 24 bits of a packed `bid`.
@@ -72,9 +85,13 @@ pub(crate) fn bid_local(bid: u32) -> u32 {
 
 /// Returns the index of the smallest class whose slot size is at least `size`.
 ///
-/// `classes` must be sorted by ascending size.
-pub(crate) fn class_for(classes: &[SizeClass], size: usize) -> Option<usize> {
-    classes.iter().position(|class| class.size as usize >= size)
+/// `classes` must be sorted by ascending size. The returned index fits in a
+/// `u8`: [`layout_classes`] rejects more than 128 classes.
+pub(crate) fn class_for(classes: &[SizeClass], size: usize) -> Option<u8> {
+    classes
+        .iter()
+        .position(|class| class.size as usize >= size)
+        .map(|index| index as u8)
 }
 
 /// The validated layout of one class inside a direction's shared slab.
@@ -112,8 +129,8 @@ pub(crate) fn layout_classes(
         "at least one buffer size class is required"
     );
     assert!(
-        classes.len() <= 256,
-        "no more than 256 buffer size classes are supported (the packed bid has one class byte)"
+        classes.len() <= 128,
+        "no more than 128 buffer size classes are supported (the packed bid has 7 class bits)"
     );
 
     let mut sorted: Vec<SizeClass> = classes.to_vec();
@@ -191,15 +208,34 @@ mod tests {
 
     #[test]
     fn packed_bid_roundtrip() {
-        for class in 0..256u32 {
+        for class in 0..128u8 {
             for local in [0u32, 1, BID_LOCAL_MASK] {
-                let bid = pack_bid(class, local);
+                let bid = pack_bid(false, class, local);
+                assert!(!bid_provided(bid));
+                assert_eq!(bid_class(bid), class);
+                assert_eq!(bid_local(bid), local);
+                let bid = pack_bid(true, class, local);
+                assert!(bid_provided(bid));
                 assert_eq!(bid_class(bid), class);
                 assert_eq!(bid_local(bid), local);
             }
         }
-        assert_eq!(pack_bid(0, 1), 1);
-        assert_eq!(pack_bid(1, 0), 1 << 24);
+        assert_eq!(pack_bid(false, 0, 1), 1);
+        assert_eq!(pack_bid(false, 1, 0), 1 << 24);
+        assert_eq!(pack_bid(true, 0, 0), 1 << 31);
+        assert_eq!(pack_bid(true, 127, BID_LOCAL_MASK), u32::MAX);
+    }
+
+    #[test]
+    fn pack_bid_masks_class_and_local_into_their_fields() {
+        // A class byte with the top bit set must not spill into the provided
+        // flag: it is masked down to the 7-bit class field.
+        assert!(!bid_provided(pack_bid(false, 128, 0)));
+        assert!(!bid_provided(pack_bid(false, 200, 0)));
+        assert_eq!(bid_class(pack_bid(false, 128, 0)), 0);
+        assert_eq!(bid_class(pack_bid(false, 200, 0)), 72);
+        // A local id beyond the low 24 bits is masked down as well.
+        assert_eq!(bid_local(pack_bid(false, 0, 1 << 25)), 0);
     }
 
     #[test]

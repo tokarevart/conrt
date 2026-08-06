@@ -15,6 +15,9 @@ use crate::buf::BufferPool;
 use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::DEFAULT_SIZE_CLASSES;
 use crate::classes::SizeClass;
+use crate::classes::bid_class;
+use crate::classes::bid_local;
+use crate::classes::bid_provided;
 use crate::classes::layout_classes;
 use crate::pbuf::ProvidedBufferPool;
 use crate::task::IoSlot;
@@ -97,6 +100,106 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 /// Join futures use it to register their waiter in the target's waiter list.
 pub(crate) fn current_task_index() -> Option<u32> {
     CURRENT_TASK_INDEX.with(|c| c.get())
+}
+
+// ── View routing ─────────────────────────────────────────────────────
+//
+// The [`crate::buf`] view types never reach into the pools directly: every
+// borrow operation is dispatched here on the packed `bid` (provided vs. fixed
+// pool). A view whose generation no longer matches the active runtime is
+// stale — its runtime has shut down and its slot may have been freed — so
+// drop and clone are no-ops (the slot is leaked rather than touched), while
+// resolve and the exclusive transitions panic.
+
+/// Resolves a view's guarded slot to the start of its memory plus the view's
+/// sub-slot byte `offset`. Panics when called outside the runtime that owns
+/// the slot.
+pub(crate) fn resolve_ptr(bid: u32, generation: NonZeroU32, offset: u32) -> *mut u8 {
+    assert!(
+        active_gen_matches(generation),
+        "resolve_ptr called outside the runtime that owns this buffer"
+    );
+    with_runtime(|r| {
+        let class = usize::from(bid_class(bid));
+        let local = bid_local(bid);
+        let base = if bid_provided(bid) {
+            r.provided_pools[class].slot_ptr(local as u16).as_ptr()
+        } else {
+            r.fixed_pools[class].slot_ptr(local).as_ptr()
+        };
+        unsafe { base.add(offset as usize) }
+    })
+}
+
+/// Registers one more shared borrower: a cloned [`crate::buf::Ref`]. A stale
+/// view is dropped after its runtime shut down and leaks its slot.
+pub(crate) fn clone_view(bid: u32, generation: NonZeroU32) {
+    if !active_gen_matches(generation) {
+        return;
+    }
+    with_runtime(|r| {
+        let class = usize::from(bid_class(bid));
+        let local = bid_local(bid);
+        if bid_provided(bid) {
+            r.provided_pools[class].clone_shared(local as u16);
+        } else {
+            r.fixed_pools[class].clone_shared(local);
+        }
+    })
+}
+
+/// Releases one borrower of a view's slot, recycling the slot when the last
+/// view drops. `exclusive` selects the exclusive (`RefMut`/`SliceMut`) vs.
+/// shared (`Ref`/`Slice`) release. A stale view leaks its slot instead.
+pub(crate) fn drop_view(bid: u32, generation: NonZeroU32, exclusive: bool) {
+    if !active_gen_matches(generation) {
+        return;
+    }
+    with_runtime(|r| {
+        let class = usize::from(bid_class(bid));
+        let local = bid_local(bid);
+        if bid_provided(bid) {
+            r.provided_pools[class].drop_view(exclusive, local as u16);
+        } else {
+            r.fixed_pools[class].drop_view(exclusive, local);
+        }
+    })
+}
+
+/// Flips a sole shared `Ref` to an exclusive `RefMut`. Panics unless the slot
+/// has exactly one shared holder.
+pub(crate) fn upgrade_view(bid: u32, generation: NonZeroU32) {
+    assert!(
+        active_gen_matches(generation),
+        "upgrade_view called outside the runtime that owns this buffer"
+    );
+    with_runtime(|r| {
+        let class = usize::from(bid_class(bid));
+        let local = bid_local(bid);
+        if bid_provided(bid) {
+            r.provided_pools[class].upgrade(local as u16);
+        } else {
+            r.fixed_pools[class].upgrade(local);
+        }
+    })
+}
+
+/// Flips a sole exclusive `RefMut` to a shared `Ref`. Panics unless the slot
+/// has exactly one exclusive holder.
+pub(crate) fn downgrade_view(bid: u32, generation: NonZeroU32) {
+    assert!(
+        active_gen_matches(generation),
+        "downgrade_view called outside the runtime that owns this buffer"
+    );
+    with_runtime(|r| {
+        let class = usize::from(bid_class(bid));
+        let local = bid_local(bid);
+        if bid_provided(bid) {
+            r.provided_pools[class].downgrade(local as u16);
+        } else {
+            r.fixed_pools[class].downgrade(local);
+        }
+    })
 }
 
 /// Runs a closure exactly once when dropped, even on panic unwind.
@@ -657,17 +760,19 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
-    use crate::buf::Buffer;
-    use crate::buf::BufferBytes;
+    use crate::buf::Ref;
+    use crate::buf::RefMut;
+    use crate::buf::Slice;
+    use crate::buf::SliceMut;
     use crate::classes::SizeClass;
     use crate::classes::pack_bid;
     use crate::io::MAX_CTRL_CAP;
     use crate::io::MAX_IOV_CAP;
     use crate::io::Msg;
+    use crate::io::MsgMut;
     use crate::io::await_cqe;
     use crate::io::cmsg_space;
     use crate::io::yield_now;
-    use crate::pbuf::ProvidedBuffer;
     use crate::task::IoUserData;
     use crate::task::IoVec;
     use crate::task::Task;
@@ -675,10 +780,21 @@ mod tests {
 
     fn test_runtime_data(capacity: u32) -> Runtime {
         let ring = io_uring::IoUring::new(8).unwrap();
+        // Class 0 (16) and 1 (64) feed the small-slot tests; class 2 (2048)
+        // fits MAX_CTRL_CAP and class 3 (16384) fits the MAX_IOV_CAP iov array
+        // that a non-generic Msg always allocates.
         let (slab, slab_layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
             build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
                 SizeClass { size: 16, count: 4 },
                 SizeClass { size: 64, count: 4 },
+                SizeClass {
+                    size: 2048,
+                    count: 4,
+                },
+                SizeClass {
+                    size: 16384,
+                    count: 2,
+                },
             ]);
         Runtime {
             tasks: TaskSlab::new::<Ready<()>, ()>(capacity),
@@ -835,7 +951,7 @@ mod tests {
         }
     }
 
-    // ── ProvidedBuffer ─────────────────────────────────────────────────
+    // ── Bytes (provided pool) ─────────────────────────────────────────
 
     #[test]
     fn provided_buffer_drop_recycles_slot() {
@@ -851,8 +967,11 @@ mod tests {
 
         let generation = _gen.get();
         let local = 1u16;
-        let offset = data.provided_pools[0].slot_offset(local);
-        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        data.provided_pools[0].mark_selected(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
         drop(buf);
@@ -873,8 +992,11 @@ mod tests {
 
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         let local = 1u16;
-        let offset = data.provided_pools[0].slot_offset(local);
-        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        data.provided_pools[0].mark_selected(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
         drop(buf);
@@ -895,8 +1017,11 @@ mod tests {
 
         let generation = _gen.get();
         let local = 1u16;
-        let offset = data.provided_pools[0].slot_offset(local);
-        let buf = ProvidedBuffer::new(offset, pack_bid(0, u32::from(local)), 5, generation);
+        data.provided_pools[0].mark_selected(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
         let bytes = buf.into_vec();
@@ -904,7 +1029,104 @@ mod tests {
         assert_eq!(data.provided_pools[0].ring_tail(), 5);
     }
 
-    // ── BufferBytes ───────────────────────────────────────────────────
+    #[test]
+    fn provided_bytes_into_mut_and_into_bytes_roundtrip() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let local = 1u16;
+        data.provided_pools[0].mark_selected(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
+        assert_eq!(data.provided_pools[0].borrows(local), 1);
+
+        // Upgrade to an exclusive, writable view.
+        let mut buf = buf.into_mut();
+        assert_eq!(data.provided_pools[0].borrows(local), -1);
+        assert_eq!(buf.capacity(), 16);
+        buf.as_mut()[..5].copy_from_slice(b"hello");
+        buf.set_len(5);
+
+        // Downgrade back to a shared read buffer and read the data back.
+        let buf = buf.into_bytes();
+        assert_eq!(data.provided_pools[0].borrows(local), 1);
+        assert_eq!(buf.as_ref(), b"hello");
+
+        drop(buf);
+        assert_eq!(data.provided_pools[0].borrows(local), 0);
+        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+    }
+
+    #[test]
+    fn provided_bytesmut_split_at_recycles_after_both_halves_drop() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let local = 1u16;
+        data.provided_pools[0].mark_selected(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
+        let buf = buf.into_mut();
+        let (head, tail) = buf.split_at(2).unwrap();
+        assert_eq!(data.provided_pools[0].borrows(local), -2);
+        drop(head);
+        assert_eq!(data.provided_pools[0].borrows(local), -1);
+        assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        drop(tail);
+        assert_eq!(data.provided_pools[0].borrows(local), 0);
+        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+    }
+
+    #[test]
+    fn provided_upgrade_panics_unless_sole_shared_holder() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let generation = _gen.get();
+        let local = 1u16;
+        data.provided_pools[0].mark_selected(local);
+        data.provided_pools[0].clone_shared(local);
+        let buf: Slice<u8> = Slice::new(
+            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+            5,
+        );
+        assert_eq!(data.provided_pools[0].borrows(local), 2);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.into_mut()));
+        assert!(result.is_err());
+        // The failed upgrade left the borrows intact; the unwind dropped
+        // `buf`, releasing one of the two shared holders.
+        assert_eq!(data.provided_pools[0].borrows(local), 1);
+    }
+
+    // ── BytesMut ─────────────────────────────────────────────────────
 
     #[test]
     fn buffer_bytes_drop_recycles_slot() {
@@ -920,8 +1142,8 @@ mod tests {
 
         let generation = _gen.get();
         let local = data.fixed_pools[0].acquire().unwrap();
-        let offset = data.fixed_pools[0].slot_offset(local);
-        let buf = BufferBytes::new(offset, pack_bid(0, local), generation);
+        let buf: SliceMut<u8> =
+            SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16);
 
         assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
@@ -941,9 +1163,9 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = data.fixed_pools[0].acquire().unwrap();
-        let offset = data.fixed_pools[0].slot_offset(local);
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        let buf = BufferBytes::new(offset, pack_bid(0, local), generation);
+        let buf: SliceMut<u8> =
+            SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16);
 
         assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
@@ -965,7 +1187,7 @@ mod tests {
         let before = data.fixed_pools[0].free_count();
         let buf = ctx.alloc_bytes(5).unwrap();
         assert_eq!(buf.capacity(), 16);
-        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.len(), 16);
         assert_eq!(data.fixed_pools[0].free_count(), before - 1);
         drop(buf);
         assert_eq!(data.fixed_pools[0].free_count(), before);
@@ -1346,7 +1568,7 @@ mod tests {
         assert!(data.tasks.task(index_a).ready);
     }
 
-    // ── Buffer ────────────────────────────────────────────────────────
+    // ── Ref ───────────────────────────────────────────────────────────
 
     #[test]
     fn alloc_drop_recycles_slot() {
@@ -1383,7 +1605,7 @@ mod tests {
         let orig = ctx.alloc::<[u8; 16]>().unwrap();
         let orig_ptr = orig.as_ptr();
         let before = data.fixed_pools[0].free_count();
-        let casted: Buffer<[u8; 16]> = unsafe { orig.cast() };
+        let casted: Ref<[u8; 16]> = unsafe { orig.cast() };
         assert_eq!(orig_ptr.cast::<u8>(), casted.as_ptr().cast::<u8>());
 
         // The cast transfers the slot: it must not recycle it (which would
@@ -1446,14 +1668,12 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        let alloc: Buffer<MaybeUninit<[u8; 16]>> = Buffer::new(pack_bid(0, 0), stale);
+        let alloc: Ref<MaybeUninit<[u8; 16]>> = Ref::new(pack_bid(false, 0, 0), stale, 0);
         let _ = alloc.as_ptr();
     }
 
-    // ── Msg ───────────────────────────────────────────────────────
-
     #[test]
-    fn msg_slot_zero_iov_ctrl_wires_null() {
+    fn ref_clone_adds_and_drops_shared_borrows() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -1464,23 +1684,100 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut slot = Msg::<0, 0>::new(ctx).unwrap();
+        let before = data.fixed_pools[0].free_count();
+        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        assert_eq!(data.fixed_pools[0].borrows(0), 1);
+        let clone = alloc.clone();
+        assert_eq!(data.fixed_pools[0].borrows(0), 2);
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        drop(alloc);
+        // One borrower left: the slot is still held by the clone.
+        assert_eq!(data.fixed_pools[0].borrows(0), 1);
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        drop(clone);
+        assert_eq!(data.fixed_pools[0].borrows(0), 0);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    #[test]
+    fn ref_upgrade_and_downgrade_sole_holder() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        let before = data.fixed_pools[0].free_count();
+        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        assert_eq!(data.fixed_pools[0].borrows(0), 1);
+        let exclusive = alloc.into_mut();
+        assert_eq!(data.fixed_pools[0].borrows(0), -1);
+        let shared: Ref<[u8; 8]> = unsafe { exclusive.into_ref().cast() };
+        assert_eq!(data.fixed_pools[0].borrows(0), 1);
+        drop(shared);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    // ── Msg / MsgMut ─────────────────────────────────────────────────
+
+    #[test]
+    fn msg_new_wires_iov_and_ctrl_to_pooled_memory() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        // A Msg always allocates the mandatory msghdr plus the full iov array
+        // and control buffer, all in pooled memory, starting empty.
+        let mut slot = Msg::new(ctx).unwrap();
         {
             let msg = slot.msg();
-            assert!(msg.msg_iov.is_null());
             assert_eq!(msg.msg_iovlen, 0);
-            assert!(msg.msg_control.is_null());
             assert_eq!(msg.msg_controllen, 0);
+            assert!(!msg.msg_iov.is_null());
+            assert!(!msg.msg_control.is_null());
         }
         assert!(slot.iov(0).is_none());
-        assert!(slot.ctrl().is_none());
-        // Zero-capacity vecs reject every push.
-        assert!(!slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        }));
-        assert!(!slot.push_cmsg(1, 2, &[0u8; 4]));
-        assert!(!slot.push_scm_rights(&[0]));
+        assert!(slot.ctrl().unwrap().is_empty());
+    }
+
+    #[test]
+    fn msg_drop_recycles_all_slots() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let ctx = data.context_for(index);
+
+        // The msghdr (56 B) lands in class 1 (64), the ctrl array
+        // (MAX_CTRL_CAP) in class 2 (2048) and the iov array (MAX_IOV_CAP *
+        // 16) in class 3 (16384).
+        let (free1, free2, free3) = (
+            data.fixed_pools[1].free_count(),
+            data.fixed_pools[2].free_count(),
+            data.fixed_pools[3].free_count(),
+        );
+        let slot = Msg::new(ctx).unwrap();
+        assert_eq!(data.fixed_pools[1].free_count(), free1 - 1);
+        assert_eq!(data.fixed_pools[2].free_count(), free2 - 1);
+        assert_eq!(data.fixed_pools[3].free_count(), free3 - 1);
+        drop(slot);
+        assert_eq!(data.fixed_pools[1].free_count(), free1);
+        assert_eq!(data.fixed_pools[2].free_count(), free2);
+        assert_eq!(data.fixed_pools[3].free_count(), free3);
     }
 
     #[test]
@@ -1495,11 +1792,10 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut slot = Msg::<4, 0>::new(ctx).unwrap();
+        let mut slot = Msg::new(ctx).unwrap();
         let msg_iov = {
             let msg = slot.msg();
             assert_eq!(msg.msg_iovlen, 0);
-            assert!(msg.msg_control.is_null());
             assert_eq!(msg.msg_controllen, 0);
             msg.msg_iov as *mut libc::iovec
         };
@@ -1536,20 +1832,18 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut slot = Msg::<2, 0>::new(ctx).unwrap();
-        assert!(slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 1,
-        }));
-        assert!(slot.push_iov(libc::iovec {
+        let mut slot = Msg::new(ctx).unwrap();
+        for _ in 0..MAX_IOV_CAP {
+            assert!(slot.push_iov(libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 1,
+            }));
+        }
+        assert!(!slot.push_iov(libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 2,
         }));
-        assert!(!slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 3,
-        }));
-        assert_eq!(slot.msg().msg_iovlen, 2);
+        assert_eq!(slot.msg().msg_iovlen, MAX_IOV_CAP);
     }
 
     #[test]
@@ -1564,11 +1858,9 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut slot = Msg::<0, 64>::new(ctx).unwrap();
+        let mut slot = Msg::new(ctx).unwrap();
         let msg_control = {
             let msg = slot.msg();
-            assert!(msg.msg_iov.is_null());
-            assert_eq!(msg.msg_iovlen, 0);
             assert_eq!(msg.msg_controllen, 0);
             msg.msg_control as *mut u8
         };
@@ -1576,7 +1868,6 @@ mod tests {
         // push_cmsg wires msg_controllen to CMSG_SPACE of the pushed payload.
         assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]));
         assert_eq!(slot.msg().msg_controllen, cmsg_space(4));
-        // A zero MAX_IOV still requires the mandatory msghdr allocation.
         assert!(slot.msg().msg_control as usize != 0);
     }
 
@@ -1592,7 +1883,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let mut slot = Msg::<0, 64>::new(ctx).unwrap();
+        let mut slot = Msg::new(ctx).unwrap();
         let payload = [1u8, 2, 3, 4];
         assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload));
         // The cmsg bytes land at the start of the pooled control buffer.
@@ -1607,26 +1898,24 @@ mod tests {
         assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &payload));
         assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
         assert_eq!(slot.ctrl().unwrap().len(), 2 * cmsg_space(4));
-        // A cmsg that would exceed MAX_CTRL is rejected, lengths unchanged.
-        assert!(!slot.push_cmsg(1, 2, &[0u8; 16]));
+        // A cmsg that would exceed MAX_CTRL_CAP is rejected, lengths unchanged.
+        let huge = vec![0u8; MAX_CTRL_CAP];
+        assert!(!slot.push_cmsg(1, 2, &huge));
         assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
     }
 
     #[test]
-    fn msg_slot_default_caps_are_kernel_maxima() {
-        // The caps are the kernel's limits, not the pool's: UIO_MAXIOV
-        // (1024 iovecs) and CMSG_SPACE of SCM_MAX_FD (253 fds).
+    fn msg_caps_and_sizes_are_kernel_maxima() {
+        // The caps are the kernel's limits: UIO_MAXIOV (1024 iovecs) and
+        // CMSG_SPACE of SCM_MAX_FD (253 fds).
         assert_eq!(MAX_IOV_CAP, 1024);
         assert_eq!(MAX_CTRL_CAP, cmsg_space(253 * size_of::<libc::c_int>()));
-        assert_eq!(size_of::<Msg>(), 24);
-        // The bare type `Msg` resolves to the max-caps instantiation
-        // (the default generic args). This only compiles when the two
-        // spellings name the same type.
-        let _same_type = |slot: Msg| -> Msg<MAX_IOV_CAP, MAX_CTRL_CAP> { slot };
+        assert_eq!(size_of::<Msg>(), 36);
+        assert_eq!(size_of::<MsgMut>(), 36);
+    }
 
-        // The test runtime's largest fixed class is 16 bytes, so a max-caps
-        // slot cannot be constructed: the pool is the runtime limit, the caps
-        // the kernel's.
+    #[test]
+    fn msgmut_take_iov_copies_and_resets() {
         let task = Task::new();
         let mut data = test_runtime_data(64);
         let index = data
@@ -1636,6 +1925,22 @@ mod tests {
 
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
-        assert!(Msg::<MAX_IOV_CAP, MAX_CTRL_CAP>::new(ctx).is_none());
+
+        let mut slot = MsgMut::new(ctx).unwrap();
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 3,
+        }));
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 4,
+        }));
+        let iovs = slot.take_iov();
+        assert_eq!(iovs.len(), 2);
+        assert_eq!(iovs[0].iov_len, 3);
+        assert_eq!(iovs[1].iov_len, 4);
+        // The pooled array is reset, so nothing remains to offer the kernel.
+        assert_eq!(slot.msg().msg_iovlen, 0);
+        assert!(slot.iov(0).is_none());
     }
 }

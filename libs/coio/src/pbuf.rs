@@ -8,11 +8,14 @@
 //! submitted with `IOSQE_BUFFER_SELECT` let the kernel pick a buffer from the
 //! pool and report which one via `cqueue::buffer_select`; the caller must then
 //! recycle the buffer back into the pool.
+//!
+//! Borrow tracking: the kernel consumes a buffer when it selects one, and the
+//! pool hands it out as a view (the `Bytes` returned by
+//! [`crate::io::read`]). [`ProvidedBufferPool::mark_selected`] records the
+//! hand-off (`0 → +1`); the count is positive while shared views hold the
+//! buffer and negative while exclusive views do. Each drop of a view releases
+//! one borrower, and the buffer returns to the ring when the count hits zero.
 
-#![allow(dead_code)]
-
-use core::num::NonZeroU32;
-use core::ops::Deref;
 use std::alloc::Layout;
 use std::alloc::alloc_zeroed;
 use std::alloc::dealloc;
@@ -22,11 +25,6 @@ use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 
 use io_uring::IoUring;
-
-use crate::classes::bid_class;
-use crate::classes::bid_local;
-use crate::runtime::active_gen_matches;
-use crate::runtime::with_runtime;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -68,6 +66,10 @@ pub struct ProvidedBufferPool {
     ring_ptr: NonNull<u8>,
     ring_size: usize,
     tail: u16,
+    /// Per-slot borrow count: `0` means free (in the ring), positive values
+    /// count shared views holding the buffer out of the ring, negative values
+    /// count exclusive views.
+    borrows: Vec<i32>,
 }
 
 impl ProvidedBufferPool {
@@ -125,6 +127,7 @@ impl ProvidedBufferPool {
             ring_ptr: unsafe { NonNull::new_unchecked(ring_raw as *mut u8) },
             ring_size,
             tail: count,
+            borrows: vec![0; count as usize],
         }
     }
 
@@ -148,6 +151,7 @@ impl ProvidedBufferPool {
         ring.submitter().unregister_buf_ring(self.bgid)
     }
 
+    #[cfg(test)]
     pub fn bgid(&self) -> u16 {
         self.bgid
     }
@@ -155,6 +159,11 @@ impl ProvidedBufferPool {
     /// The byte offset of slot `local` within the shared slab.
     pub(crate) fn slot_offset(&self, local: u16) -> u32 {
         self.base_offset + u32::from(local) * self.buf_size
+    }
+
+    /// The slot size of this class, in bytes.
+    pub(crate) fn slot_size(&self) -> u32 {
+        self.buf_size
     }
 
     /// Recycles buffer `local` back to the kernel so it can be selected again.
@@ -186,7 +195,89 @@ impl ProvidedBufferPool {
         }
     }
 
+    /// Records that the kernel handed slot `local` to a read result: the
+    /// buffer leaves the ring until its last view drops. Panics if the slot is
+    /// already borrowed (a double selection).
+    pub fn mark_selected(&mut self, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert_eq!(
+            *borrow, 0,
+            "mark_selected: buffer {local} is already borrowed"
+        );
+        *borrow = 1;
+    }
+
+    /// Releases one borrower of `local`, recycling the buffer back to the
+    /// ring when the last view drops. `exclusive` selects the exclusive
+    /// (`RefMut`/`SliceMut`) vs. shared (`Ref`/`Slice`) release. Panics on a
+    /// count mismatch (an over-release, a double-drop, or releasing the wrong
+    /// kind of borrow).
+    pub fn drop_view(&mut self, exclusive: bool, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert!(*borrow != 0, "drop_view: buffer {local} is not borrowed");
+        if exclusive {
+            assert!(
+                *borrow < 0,
+                "drop_view: exclusive release of a shared borrow on buffer {local}"
+            );
+            *borrow += 1;
+        } else {
+            assert!(
+                *borrow > 0,
+                "drop_view: shared release of an exclusive borrow on buffer {local}"
+            );
+            *borrow -= 1;
+        }
+        if *borrow == 0 {
+            self.recycle_buffer(local);
+        }
+    }
+
+    /// Flips a sole shared borrower into an exclusive one, so a `Bytes` that
+    /// is the only view of its slot can be upgraded to a `BytesMut`. Panics
+    /// unless this buffer has exactly one shared holder.
+    pub fn upgrade(&mut self, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert_eq!(
+            *borrow, 1,
+            "upgrade: buffer {local} must have exactly one shared holder"
+        );
+        *borrow = -1;
+    }
+
+    /// Flips a sole exclusive borrower into a shared one, so a `BytesMut`
+    /// that is the only view of its slot can be downgraded to a `Bytes`.
+    /// Panics unless this buffer has exactly one exclusive holder.
+    pub fn downgrade(&mut self, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert_eq!(
+            *borrow, -1,
+            "downgrade: buffer {local} must have exactly one exclusive holder"
+        );
+        *borrow = 1;
+    }
+
+    /// Registers one more exclusive borrower (a split of an exclusive view).
+    /// Panics if the buffer is not currently exclusively borrowed.
+    pub fn split_exclusive(&mut self, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert!(
+            *borrow < 0,
+            "split_exclusive: buffer {local} is not exclusively borrowed"
+        );
+        *borrow -= 1;
+    }
+
+    /// Registers one more shared borrower (a cloned view). Panics if the slot
+    /// is not currently shared.
+    pub fn clone_shared(&mut self, local: u16) {
+        let borrow = &mut self.borrows[local as usize];
+        assert!(*borrow > 0, "clone_shared: buffer {local} is not shared");
+        *borrow += 1;
+    }
+
     /// Returns the bytes of buffer `local`. `len` must not exceed `buf_size`.
+    #[cfg(test)]
     pub fn get_slice(&self, local: u16, len: usize) -> &[u8] {
         let start = self.slot_offset(local) as usize;
         unsafe { core::slice::from_raw_parts(self.slab_base.as_ptr().add(start), len) }
@@ -207,6 +298,11 @@ impl ProvidedBufferPool {
     pub(crate) fn ring_tail(&self) -> u16 {
         self.tail
     }
+
+    #[cfg(test)]
+    pub(crate) fn borrows(&self, local: u16) -> i32 {
+        self.borrows[local as usize]
+    }
 }
 
 impl Drop for ProvidedBufferPool {
@@ -220,91 +316,9 @@ impl Drop for ProvidedBufferPool {
     }
 }
 
-/// A zero-copy view of a buffer selected from the runtime's provided buffer
-/// pools by [`crate::io::read`].
-///
-/// The caller owns the buffer until this value is dropped, at which point the
-/// pool slot is recycled. The slot is reached through the thread-local runtime
-/// pointer, guarded by the generation the buffer was created in: a
-/// `ProvidedBuffer` dropped after its runtime has shut down skips recycling
-/// instead of touching freed memory. The data itself must not be read after
-/// the runtime is gone.
-pub struct ProvidedBuffer {
-    offset: u32,
-    bid: u32,
-    len: u32,
-    generation: NonZeroU32,
-}
-
-impl ProvidedBuffer {
-    pub(crate) fn new(offset: u32, bid: u32, len: u32, generation: NonZeroU32) -> Self {
-        Self {
-            offset,
-            bid,
-            len,
-            generation,
-        }
-    }
-
-    /// Copies the buffer into an owned `Vec` and recycles the pool slot.
-    pub fn into_vec(mut self) -> Vec<u8> {
-        let data = self.data().to_vec();
-        self.recycle();
-        core::mem::forget(self);
-        data
-    }
-
-    fn data(&self) -> &[u8] {
-        assert!(
-            active_gen_matches(self.generation),
-            "ProvidedBuffer used outside the runtime that owns it"
-        );
-        with_runtime(|r| unsafe {
-            core::slice::from_raw_parts(
-                r.slab.as_ptr().add(self.offset as usize),
-                self.len as usize,
-            )
-        })
-    }
-
-    fn recycle(&mut self) {
-        if active_gen_matches(self.generation) {
-            let class = bid_class(self.bid) as usize;
-            let local = bid_local(self.bid) as u16;
-            with_runtime(|r| r.provided_pools[class].recycle_buffer(local));
-        }
-    }
-}
-
-impl Drop for ProvidedBuffer {
-    fn drop(&mut self) {
-        self.recycle();
-    }
-}
-
-impl Deref for ProvidedBuffer {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        self.data()
-    }
-}
-
-impl AsRef<[u8]> for ProvidedBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.deref()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provided_buffer_is_16_bytes_with_niche() {
-        assert_eq!(size_of::<ProvidedBuffer>(), 16);
-        assert_eq!(size_of::<Option<ProvidedBuffer>>(), 16);
-    }
 
     fn tmpfile() -> i32 {
         let path = b"/tmp/conrt-pbuf-test.dat\0";
@@ -358,5 +372,78 @@ mod tests {
         unsafe { libc::close(fd) };
 
         pool.unregister(&ring).unwrap();
+    }
+
+    #[test]
+    fn pbuf_borrow_tracks_selection_and_release() {
+        let mut slab = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, 4, 16, 0);
+
+        assert_eq!(pool.borrows(1), 0);
+        pool.mark_selected(1);
+        assert_eq!(pool.borrows(1), 1);
+        assert_eq!(pool.ring_tail(), 4);
+        // A cloned view holds a second borrower; the buffer stays out of the
+        // ring until both drop.
+        pool.clone_shared(1);
+        assert_eq!(pool.borrows(1), 2);
+        pool.drop_view(false, 1);
+        assert_eq!(pool.borrows(1), 1);
+        assert_eq!(pool.ring_tail(), 4);
+        pool.drop_view(false, 1);
+        assert_eq!(pool.borrows(1), 0);
+        assert_eq!(pool.ring_tail(), 5);
+    }
+
+    #[test]
+    fn pbuf_upgrade_downgrade_roundtrip() {
+        let mut slab = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, 4, 16, 0);
+
+        pool.mark_selected(1);
+        pool.upgrade(1);
+        assert_eq!(pool.borrows(1), -1);
+        // The buffer stays out of the ring through the exclusive phase.
+        assert_eq!(pool.ring_tail(), 4);
+        pool.downgrade(1);
+        assert_eq!(pool.borrows(1), 1);
+        pool.drop_view(false, 1);
+        assert_eq!(pool.borrows(1), 0);
+        assert_eq!(pool.ring_tail(), 5);
+    }
+
+    #[test]
+    fn pbuf_exclusive_split_and_release() {
+        let mut slab = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, 4, 16, 0);
+
+        pool.mark_selected(1);
+        pool.upgrade(1);
+        pool.split_exclusive(1);
+        assert_eq!(pool.borrows(1), -2);
+        // An exclusive release of one split half still leaves a holder.
+        pool.drop_view(true, 1);
+        assert_eq!(pool.borrows(1), -1);
+        assert_eq!(pool.ring_tail(), 4);
+        pool.drop_view(true, 1);
+        assert_eq!(pool.borrows(1), 0);
+        assert_eq!(pool.ring_tail(), 5);
+    }
+
+    #[test]
+    fn pbuf_double_selection_panics() {
+        let mut slab = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, 4, 16, 0);
+        pool.mark_selected(0);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.mark_selected(0);
+            }))
+            .is_err()
+        );
     }
 }

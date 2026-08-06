@@ -394,6 +394,14 @@ fn rt() -> RuntimeParams<'static> {
                 size: 128,
                 count: 2,
             },
+            SizeClass {
+                size: 2048,
+                count: 2,
+            },
+            SizeClass {
+                size: 16384,
+                count: 2,
+            },
         ],
     }
 }
@@ -401,6 +409,7 @@ fn rt() -> RuntimeParams<'static> {
 #[test]
 fn block_on_sendmsg_recvmsg_roundtrip() {
     use coio::io::Msg;
+    use coio::io::MsgMut;
     use coio::io::recvmsg;
     use coio::io::sendmsg;
 
@@ -408,7 +417,7 @@ fn block_on_sendmsg_recvmsg_roundtrip() {
     block_on(
         rt(),
         |ctx, _rt, (a, b): (i32, i32)| async move {
-            let mut snd = Msg::<1, 0>::new(ctx).unwrap();
+            let mut snd = Msg::new(ctx).unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"hello".as_ptr().cast_mut().cast(),
                 iov_len: 5,
@@ -416,7 +425,7 @@ fn block_on_sendmsg_recvmsg_roundtrip() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 5);
 
-            let mut rcv = Msg::<1, 0>::new(ctx).unwrap();
+            let mut rcv = MsgMut::new(ctx).unwrap();
             let mut buf = [0u8; 16];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -435,6 +444,7 @@ fn block_on_sendmsg_recvmsg_roundtrip() {
 #[test]
 fn block_on_sendmsg_subset_of_iovecs() {
     use coio::io::Msg;
+    use coio::io::MsgMut;
     use coio::io::recvmsg;
     use coio::io::sendmsg;
 
@@ -445,7 +455,7 @@ fn block_on_sendmsg_subset_of_iovecs() {
             // A <2, 0> slot with only the first iovec filled: only that one
             // segment is declared (msg_iovlen == 1) and handed to the kernel,
             // so the uninitialized second segment is never exposed.
-            let mut snd = Msg::<2, 0>::new(ctx).unwrap();
+            let mut snd = Msg::new(ctx).unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"ab".as_ptr().cast_mut().cast(),
                 iov_len: 1,
@@ -453,7 +463,7 @@ fn block_on_sendmsg_subset_of_iovecs() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 1);
 
-            let mut rcv = Msg::<1, 0>::new(ctx).unwrap();
+            let mut rcv = MsgMut::new(ctx).unwrap();
             let mut buf = [0u8; 8];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -474,6 +484,7 @@ fn block_on_fd_passing_without_iov() {
     use std::os::fd::AsRawFd;
 
     use coio::io::Msg;
+    use coio::io::MsgMut;
     use coio::io::recvmsg;
     use coio::io::sendmsg;
 
@@ -487,13 +498,13 @@ fn block_on_fd_passing_without_iov() {
         rt(),
         |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
             // Sender: a cmsg carrying `sent_fd`, with no data iovec.
-            let mut snd = Msg::<0, 128>::new(ctx).unwrap();
+            let mut snd = Msg::new(ctx).unwrap();
             assert!(snd.push_scm_rights(&[sent_fd]));
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 0);
 
             // Receiver: read the cmsg back out of the pooled control buffer.
-            let mut rcv = Msg::<0, 128>::new(ctx).unwrap();
+            let mut rcv = MsgMut::new(ctx).unwrap();
             let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
             assert_eq!(n, 0);
 
@@ -536,6 +547,7 @@ fn block_on_fd_passing_with_data() {
     use std::os::fd::AsRawFd;
 
     use coio::io::Msg;
+    use coio::io::MsgMut;
     use coio::io::recvmsg;
     use coio::io::sendmsg;
 
@@ -547,7 +559,7 @@ fn block_on_fd_passing_with_data() {
     block_on(
         rt(),
         |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
-            let mut snd = Msg::<1, 128>::new(ctx).unwrap();
+            let mut snd = Msg::new(ctx).unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"x".as_ptr().cast_mut().cast(),
                 iov_len: 1,
@@ -556,7 +568,7 @@ fn block_on_fd_passing_with_data() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 1);
 
-            let mut rcv = Msg::<1, 128>::new(ctx).unwrap();
+            let mut rcv = MsgMut::new(ctx).unwrap();
             let mut buf = [0u8; 16];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -652,7 +664,7 @@ fn block_on_write_to_file() {
             let mut wb = ctx.alloc_bytes(5).unwrap();
             wb.as_mut()[..5].copy_from_slice(b"hello");
             wb.set_len(5);
-            let n = write(ctx, fd, wb).await.unwrap();
+            let n = write(ctx, fd, wb.into_bytes()).await.unwrap();
             assert_eq!(n, 5);
         },
         fd,
@@ -690,7 +702,7 @@ fn block_on_write_full_slot() {
             assert_eq!(wb.capacity(), 16);
             wb.as_mut().fill(0xAB);
             wb.set_len(16);
-            let n = write(ctx, fd, wb).await.unwrap();
+            let n = write(ctx, fd, wb.into_bytes()).await.unwrap();
             assert_eq!(n, 16);
         },
         fd,
@@ -730,7 +742,7 @@ fn block_on_write_many_recycles() {
                 let payload = format!("chunk{i:03}");
                 wb.as_mut()[..8].copy_from_slice(payload.as_bytes());
                 wb.set_len(8);
-                let n = write(ctx, fd, wb).await.unwrap();
+                let n = write(ctx, fd, wb.into_bytes()).await.unwrap();
                 assert_eq!(n, 8);
             }
         },
@@ -812,7 +824,7 @@ fn block_on_write_uses_proportional_levels() {
             assert_eq!(wb.capacity(), 64);
             wb.as_mut()[..11].copy_from_slice(b"hello world");
             wb.set_len(11);
-            let n = write(ctx, fd, wb).await.unwrap();
+            let n = write(ctx, fd, wb.into_bytes()).await.unwrap();
             assert_eq!(n, 11);
         },
         fd,
