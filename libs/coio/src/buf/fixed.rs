@@ -17,6 +17,7 @@ use crate::buf::Ref;
 use crate::buf::RefMut;
 use crate::buf::Slice;
 use crate::buf::SliceMut;
+use crate::buf::pool::Slab;
 use crate::buf::tracker::BorrowTracker;
 use crate::classes::pack_bid;
 use crate::runtime::active_gen;
@@ -55,21 +56,6 @@ impl FixedSlab {
             slab_base,
             free,
             tracker: BorrowTracker::new(count as usize),
-        }
-    }
-
-    pub fn slot_size(&self) -> u32 {
-        self.size
-    }
-
-    /// Returns a raw pointer to the start of slot `local`'s slab memory.
-    pub fn slot_ptr(&self, local: u32) -> NonNull<u8> {
-        unsafe {
-            NonNull::new_unchecked(
-                self.slab_base
-                    .as_ptr()
-                    .add(local as usize * self.size as usize),
-            )
         }
     }
 
@@ -186,18 +172,32 @@ impl FixedSlab {
         self.acquire_slice_mut::<u8>()
     }
 
-    /// Releases one borrower of `local`, pushing the slot back onto the free
-    /// stack when the last view is dropped. Panics on a count mismatch
-    /// (over-release, a double-drop, or releasing the wrong kind of borrow).
-    pub fn drop_view(&mut self, exclusive: bool, local: u32) {
-        if self.tracker.drop_view(exclusive, local) {
-            self.free.push(local);
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn free_count(&self) -> usize {
         self.free.len()
+    }
+}
+
+impl Slab for FixedSlab {
+    /// The slot size of this class, in bytes.
+    fn slot_size(&self) -> u32 {
+        self.size
+    }
+
+    /// The start of this slab's slot 0, aligned to `min(slot_size,
+    /// BUFFER_MAX_ALIGN)`.
+    fn base(&self) -> NonNull<u8> {
+        self.slab_base
+    }
+
+    /// Returns `local` to the pool by pushing it back onto the free stack.
+    fn recycle(&mut self, local: u32) {
+        self.free.push(local);
+    }
+
+    /// The slab's mutable per-slot borrow tracker.
+    fn tracker_mut(&mut self) -> &mut BorrowTracker {
+        &mut self.tracker
     }
 }
 

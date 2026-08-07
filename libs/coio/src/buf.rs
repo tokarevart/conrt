@@ -1,12 +1,14 @@
-//! Buffers: the slabs that hold buffer memory and the views over their slots.
+//! Buffers: the slabs that hold buffer memory, the pools that collect them,
+//! and the views over the slots.
 //!
 //! A *slab* is one size class's run of equal-sized slots carved out of the
 //! runtime's shared buffer slab: [`fixed::FixedSlab`] for the registered
 //! write buffers (`IORING_REGISTER_BUFFERS`) and [`provided::ProvidedSlab`]
 //! for the provided-buffer rings (`IORING_REGISTER_PBUF_RING`). A *pool* is a
-//! collection of slabs across the size classes of one direction; the runtime
-//! currently stores each pool as a `Vec<FixedSlab>`/`Vec<ProvidedSlab>`
-//! rather than a dedicated type.
+//! collection of slabs across the size classes of one direction, stored by
+//! [`pool::Pool`]: [`FixedPool`] and [`ProvidedPool`] are the runtime's two
+//! pools. Pool operations are class-indexed and forward to the slab of the
+//! chosen class.
 //!
 //! Slab slots are borrow-tracked by the shared [`tracker::BorrowTracker`]: a
 //! slot is shared (count `+1`, `+2`, …) while [`Ref`]/[`Slice`] views borrow
@@ -22,8 +24,12 @@
 //! instead of touching freed memory.
 
 pub(crate) mod fixed;
+pub(crate) mod pool;
 pub(crate) mod provided;
 pub(crate) mod tracker;
+
+pub(crate) type FixedPool = pool::Pool<fixed::FixedSlab>;
+pub(crate) type ProvidedPool = pool::Pool<provided::ProvidedSlab>;
 
 use core::marker::PhantomData;
 use core::num::NonZeroU32;
@@ -576,8 +582,6 @@ impl AsMut<[u8]> for BytesMut {
 }
 
 fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
-    use crate::classes::bid_class;
-    use crate::classes::bid_provided;
     use crate::runtime::active_gen_matches;
     use crate::runtime::with_runtime;
     assert!(
@@ -585,11 +589,11 @@ fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
         "capacity() called outside the runtime that owns this buffer"
     );
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
-        if bid_provided(bid) {
-            r.provided_pools[class].slot_size()
+        let class = classes::bid_class(bid);
+        if classes::bid_provided(bid) {
+            r.provided_pool.slot_size(class)
         } else {
-            r.fixed_pools[class].slot_size()
+            r.fixed_pool.slot_size(class)
         }
     })
 }
@@ -600,12 +604,12 @@ fn split_exclusive(bid: u32, generation: NonZeroU32) {
     }
 
     runtime::with_runtime(|r| {
-        let class = usize::from(classes::bid_class(bid));
+        let class = classes::bid_class(bid);
         let local = classes::bid_local(bid);
         if classes::bid_provided(bid) {
-            r.provided_pools[class].tracker.split_exclusive(local as _);
+            r.provided_pool.tracker_mut(class).split_exclusive(local);
         } else {
-            r.fixed_pools[class].tracker.split_exclusive(local);
+            r.fixed_pool.tracker_mut(class).split_exclusive(local);
         }
     })
 }

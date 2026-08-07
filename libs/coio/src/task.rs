@@ -19,7 +19,6 @@ use crate::buf::Bytes;
 use crate::buf::BytesMut;
 use crate::buf::Ref;
 use crate::buf::RefMut;
-use crate::classes::class_for;
 use crate::runtime;
 use crate::runtime::Runtime;
 
@@ -403,8 +402,8 @@ impl TaskContext {
             "alloc: zero-sized types cannot be pooled"
         );
         self.with_runtime(|r| {
-            let class = class_for(&r.fixed_classes, core::mem::size_of::<T>())?;
-            r.fixed_pools[class as usize].acquire_ref::<MaybeUninit<T>>()
+            let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
+            r.fixed_pool.acquire_ref::<MaybeUninit<T>>(class)
         })
     }
 
@@ -422,8 +421,8 @@ impl TaskContext {
             "alloc_mut: zero-sized types cannot be pooled"
         );
         self.with_runtime(|r| {
-            let class = class_for(&r.fixed_classes, core::mem::size_of::<T>())?;
-            r.fixed_pools[class as usize].acquire_mut::<MaybeUninit<T>>()
+            let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
+            r.fixed_pool.acquire_mut::<MaybeUninit<T>>(class)
         })
     }
 
@@ -437,10 +436,12 @@ impl TaskContext {
     /// slot is recycled when the buffer is dropped.
     pub fn alloc_bytes(&self, size: usize) -> io::Result<BytesMut> {
         self.with_runtime(|r| -> io::Result<BytesMut> {
-            let class = class_for(&r.fixed_classes, size)
+            let class = r
+                .fixed_pool
+                .class_for(size)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-            r.fixed_pools[class as usize]
-                .acquire_bytes_mut()
+            r.fixed_pool
+                .acquire_bytes_mut(class)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))
         })
     }
@@ -467,7 +468,7 @@ impl TaskContext {
     /// Everything else is checked: `class` out of range panics, and using the
     /// returned view outside the runtime that owns it panics on access.
     pub fn provided_bytes(&self, class: u8, local: u16, len: u32) -> Bytes {
-        self.with_runtime(|r| r.provided_pools[class as usize].select(local, len))
+        self.with_runtime(|r| r.provided_pool.select(class, local, len))
     }
 
     pub fn wake(&self) {

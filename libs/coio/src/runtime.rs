@@ -11,7 +11,9 @@ use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
 use std::ptr::NonNull;
 
+use crate::buf::FixedPool;
 use crate::buf::FixedSlab;
+use crate::buf::ProvidedPool;
 use crate::buf::ProvidedSlab;
 use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::DEFAULT_SIZE_CLASSES;
@@ -120,12 +122,12 @@ pub(crate) fn resolve_ptr(bid: u32, generation: NonZeroU32, offset: u32) -> *mut
         "resolve_ptr called outside the runtime that owns this buffer"
     );
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
+        let class = bid_class(bid);
         let local = bid_local(bid);
         let base = if bid_provided(bid) {
-            r.provided_pools[class].slot_ptr(local as u16).as_ptr()
+            r.provided_pool.slot_ptr(class, local).as_ptr()
         } else {
-            r.fixed_pools[class].slot_ptr(local).as_ptr()
+            r.fixed_pool.slot_ptr(class, local).as_ptr()
         };
         unsafe { base.add(offset as usize) }
     })
@@ -138,12 +140,12 @@ pub(crate) fn clone_view(bid: u32, generation: NonZeroU32) {
         return;
     }
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
+        let class = bid_class(bid);
         let local = bid_local(bid);
         if bid_provided(bid) {
-            r.provided_pools[class].tracker.clone_shared(local as _);
+            r.provided_pool.tracker_mut(class).clone_shared(local);
         } else {
-            r.fixed_pools[class].tracker.clone_shared(local);
+            r.fixed_pool.tracker_mut(class).clone_shared(local);
         }
     })
 }
@@ -156,12 +158,12 @@ pub(crate) fn drop_view(bid: u32, generation: NonZeroU32, exclusive: bool) {
         return;
     }
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
+        let class = bid_class(bid);
         let local = bid_local(bid);
         if bid_provided(bid) {
-            r.provided_pools[class].drop_view(exclusive, local as u16);
+            r.provided_pool.drop_view(class, exclusive, local);
         } else {
-            r.fixed_pools[class].drop_view(exclusive, local);
+            r.fixed_pool.drop_view(class, exclusive, local);
         }
     })
 }
@@ -174,12 +176,12 @@ pub(crate) fn upgrade_view(bid: u32, generation: NonZeroU32) {
         "upgrade_view called outside the runtime that owns this buffer"
     );
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
+        let class = bid_class(bid);
         let local = bid_local(bid);
         if bid_provided(bid) {
-            r.provided_pools[class].tracker.upgrade(local as _);
+            r.provided_pool.tracker_mut(class).upgrade(local);
         } else {
-            r.fixed_pools[class].tracker.upgrade(local);
+            r.fixed_pool.tracker_mut(class).upgrade(local);
         }
     })
 }
@@ -192,12 +194,12 @@ pub(crate) fn downgrade_view(bid: u32, generation: NonZeroU32) {
         "downgrade_view called outside the runtime that owns this buffer"
     );
     with_runtime(|r| {
-        let class = usize::from(bid_class(bid));
+        let class = bid_class(bid);
         let local = bid_local(bid);
         if bid_provided(bid) {
-            r.provided_pools[class].tracker.downgrade(local as _);
+            r.provided_pool.tracker_mut(class).downgrade(local);
         } else {
-            r.fixed_pools[class].tracker.downgrade(local);
+            r.fixed_pool.tracker_mut(class).downgrade(local);
         }
     })
 }
@@ -231,10 +233,8 @@ pub(crate) struct Runtime {
     pub slab: NonNull<u8>,
     /// The layout of the slab allocation, used to free it on drop.
     slab_layout: Layout,
-    pub provided_classes: Vec<SizeClass>,
-    pub provided_pools: Vec<ProvidedSlab>,
-    pub fixed_classes: Vec<SizeClass>,
-    pub fixed_pools: Vec<FixedSlab>,
+    pub provided_pool: ProvidedPool,
+    pub fixed_pool: FixedPool,
     pub ring: io_uring::IoUring,
     pub make_fut: *const (),
 }
@@ -244,9 +244,7 @@ impl Drop for Runtime {
         // Unregister every provided buffer ring and the fixed write buffer
         // slab while the io_uring fd is still open; the pools and slabs are
         // dropped afterwards along with the other fields.
-        for slab in &self.provided_pools {
-            let _ = slab.unregister(&self.ring);
-        }
+        let _ = self.provided_pool.unregister_all(&self.ring);
         let _ = self.ring.submitter().unregister_buffers();
         unsafe { dealloc(self.slab.as_ptr(), self.slab_layout) };
     }
@@ -453,23 +451,15 @@ impl<'a> Default for RuntimeParams<'a> {
     }
 }
 
-/// The shared buffer slab allocation plus the class tables and pools built
-/// over it.
-type BuiltPools = (
-    NonNull<u8>,
-    Layout,
-    Vec<SizeClass>,
-    Vec<ProvidedSlab>,
-    Vec<SizeClass>,
-    Vec<FixedSlab>,
-);
+/// The shared buffer slab allocation plus the pools built over it.
+type BuiltPools = (NonNull<u8>, Layout, ProvidedPool, FixedPool);
 
 /// Builds both directions' pools over one shared slab: the provided classes
 /// occupy the start of the slab, the fixed classes follow them. Each provided
 /// class gets a provided-buffer ring registered under `bgid = class index`;
-/// the fixed classes get free-stack pools, and the whole slab is registered
+/// the fixed classes get free-stack slabs, and the whole slab is registered
 /// once as fixed buffer index 0 so writes can address any slot by its absolute
-/// offset. Returns the slab, both sorted class tables, and both pool lists.
+/// offset. Returns the slab and both pools.
 ///
 /// The slab is allocated aligned to at most one page (4 KiB) and the classes
 /// are laid out on offsets aligned to their own sizes capped at that page
@@ -520,7 +510,7 @@ fn build_pools(
             count: l.count,
         })
         .collect();
-    let mut provided_pools = Vec::with_capacity(provided_layout.len());
+    let mut provided_slabs = Vec::with_capacity(provided_layout.len());
     for (i, l) in provided_layout.iter().enumerate() {
         let class_base = unsafe { base.as_ptr().add(l.base_offset as usize) };
         let slab = ProvidedSlab::new(
@@ -529,10 +519,12 @@ fn build_pools(
             l.size,
             i as _,
         );
-        slab.register(ring)
-            .expect("failed to register the provided buffer ring");
-        provided_pools.push(slab);
+        provided_slabs.push(slab);
     }
+    let provided_pool = ProvidedPool::new(provided_classes, provided_slabs);
+    provided_pool
+        .register_all(ring)
+        .expect("failed to register the provided buffer rings");
 
     let fixed_classes: Vec<SizeClass> = fixed_layout
         .iter()
@@ -541,7 +533,7 @@ fn build_pools(
             count: l.count,
         })
         .collect();
-    let fixed_pools = fixed_layout
+    let fixed_slabs = fixed_layout
         .iter()
         .enumerate()
         .map(|(i, l)| {
@@ -557,6 +549,7 @@ fn build_pools(
             )
         })
         .collect();
+    let fixed_pool = FixedPool::new(fixed_classes, fixed_slabs);
 
     let iovec = libc::iovec {
         iov_base: base.as_ptr().cast::<libc::c_void>(),
@@ -565,14 +558,7 @@ fn build_pools(
     unsafe { ring.submitter().register_buffers(&[iovec]) }
         .expect("failed to register the buffer slab");
 
-    (
-        base,
-        layout,
-        provided_classes,
-        provided_pools,
-        fixed_classes,
-        fixed_pools,
-    )
+    (base, layout, provided_pool, fixed_pool)
 }
 
 pub fn block_on_default<S, F, T, R>(make_fut: S, user_data: T) -> R
@@ -601,7 +587,7 @@ where
             io_uring::IoUring::new(params.ring_entries).expect("failed to create io_uring")
         });
 
-    let (slab, slab_layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+    let (slab, slab_layout, provided_pool, fixed_pool) =
         build_pools(&ring, params.provided_size_classes, params.size_classes);
 
     let mut rt = Runtime {
@@ -611,10 +597,8 @@ where
         free_io_slots: Vec::new(),
         slab,
         slab_layout,
-        provided_classes,
-        provided_pools,
-        fixed_classes,
-        fixed_pools,
+        provided_pool,
+        fixed_pool,
         ring,
         make_fut: &raw const make_fut as *const (),
     };
@@ -771,6 +755,7 @@ mod tests {
     use crate::buf::RefMut;
     use crate::buf::Slice;
     use crate::buf::SliceMut;
+    use crate::buf::pool::Slab;
     use crate::classes::SizeClass;
     use crate::classes::pack_bid;
     use crate::io::MAX_CTRL_CAP;
@@ -790,7 +775,7 @@ mod tests {
         // Class 0 (16) and 1 (64) feed the small-slot tests; class 2 (2048)
         // fits MAX_CTRL_CAP and class 3 (16384) fits the MAX_IOV_CAP iov array
         // that a non-generic Msg always allocates.
-        let (slab, slab_layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+        let (slab, slab_layout, provided_pool, fixed_pool) =
             build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
                 SizeClass { size: 16, count: 4 },
                 SizeClass { size: 64, count: 4 },
@@ -810,10 +795,8 @@ mod tests {
             free_io_slots: Vec::new(),
             slab,
             slab_layout,
-            provided_classes,
-            provided_pools,
-            fixed_classes,
-            fixed_pools,
+            provided_pool,
+            fixed_pool,
             ring,
             make_fut: core::ptr::null(),
         }
@@ -875,7 +858,7 @@ mod tests {
     #[test]
     fn shared_slab_fixed_region_follows_provided_region() {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, _pc, provided_pools, _fc, fixed_pools) =
+        let (slab, _layout, provided_pool, fixed_pool) =
             build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
                 size: 32,
                 count: 2,
@@ -883,19 +866,19 @@ mod tests {
         // The provided region is 4 x 16 = 64 bytes; the fixed class starts
         // right after it in the same slab.
         let base = slab.as_ptr() as usize;
-        assert_eq!(provided_pools[0].slot_ptr(3).as_ptr() as usize - base, 48);
-        assert_eq!(fixed_pools[0].slot_ptr(0).as_ptr() as usize - base, 64);
-        assert_eq!(fixed_pools[0].slot_ptr(1).as_ptr() as usize - base, 96);
+        assert_eq!(provided_pool.slot_ptr(0, 3).as_ptr() as usize - base, 48);
+        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize - base, 64);
+        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize - base, 96);
         // Every slot address is aligned to its class's buffer size.
-        assert_eq!(provided_pools[0].slot_ptr(3).as_ptr() as usize % 16, 0);
-        assert_eq!(fixed_pools[0].slot_ptr(0).as_ptr() as usize % 32, 0);
-        assert_eq!(fixed_pools[0].slot_ptr(1).as_ptr() as usize % 32, 0);
+        assert_eq!(provided_pool.slot_ptr(0, 3).as_ptr() as usize % 16, 0);
+        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize % 32, 0);
+        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize % 32, 0);
     }
 
     #[test]
     fn build_pools_aligns_every_slot_to_its_size() {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, provided_classes, provided_pools, fixed_classes, fixed_pools) =
+        let (slab, _layout, provided_pool, fixed_pool) =
             build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
                 SizeClass { size: 64, count: 2 },
                 SizeClass {
@@ -908,9 +891,9 @@ mod tests {
         // largest size, or the 128-byte class would land 64 bytes off.
         let base = slab.as_ptr() as usize;
         assert_eq!(base % 128, 0, "slab base is aligned to the largest class");
-        for (class, slab) in provided_classes.iter().zip(&provided_pools) {
+        for (class, slab) in provided_pool.classes().iter().zip(provided_pool.slabs()) {
             for local in 0..class.count {
-                let addr = slab.slot_ptr(local as u16).as_ptr() as usize;
+                let addr = slab.slot_ptr(local).as_ptr() as usize;
                 assert_eq!(
                     addr % class.size as usize,
                     0,
@@ -919,7 +902,7 @@ mod tests {
                 );
             }
         }
-        for (class, slab) in fixed_classes.iter().zip(&fixed_pools) {
+        for (class, slab) in fixed_pool.classes().iter().zip(fixed_pool.slabs()) {
             for local in 0..class.count {
                 let addr = slab.slot_ptr(local).as_ptr() as usize;
                 assert_eq!(
@@ -935,7 +918,7 @@ mod tests {
     #[test]
     fn build_pools_caps_alignment_at_one_page() {
         let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, _pc, provided_pools, _fc, fixed_pools) =
+        let (slab, _layout, provided_pool, fixed_pool) =
             build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
                 size: 8192,
                 count: 2,
@@ -945,15 +928,15 @@ mod tests {
         // to their full size, since alignment never exceeds one page.
         let base = slab.as_ptr() as usize;
         assert_eq!(base % 4096, 0, "slab base is aligned to at most one page");
-        assert_eq!(fixed_pools[0].slot_ptr(0).as_ptr() as usize - base, 4096);
-        assert_eq!(fixed_pools[0].slot_ptr(1).as_ptr() as usize - base, 12288);
+        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize - base, 4096);
+        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize - base, 12288);
         for local in 0..2 {
-            let addr = fixed_pools[0].slot_ptr(local).as_ptr() as usize;
+            let addr = fixed_pool.slot_ptr(0, local).as_ptr() as usize;
             assert_eq!(addr % 4096, 0, "slot {local} is page-aligned");
         }
         // Small classes still get full alignment to their own size.
         for local in 0..4 {
-            let addr = provided_pools[0].slot_ptr(local as u16).as_ptr() as usize;
+            let addr = provided_pool.slot_ptr(0, local).as_ptr() as usize;
             assert_eq!(addr % 16, 0, "provided slot {local} is 16-byte aligned");
         }
     }
@@ -973,13 +956,13 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let buf = data.provided_pools[0].select(local, 5);
+        let buf = data.provided_pool.select(0, local, 5);
 
-        assert_eq!(data.provided_pools[0].ring_tail(), 4);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 1);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
         drop(buf);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 0);
-        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
     #[test]
@@ -996,7 +979,7 @@ mod tests {
 
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         let local = 1u16;
-        data.provided_pools[0].tracker.take_shared(local as _);
+        data.provided_pool.tracker_mut(0).take_shared(local as _);
         // SAFETY: take_shared above registered a shared borrow on the slot,
         // so 5 bytes stay within the class-0 slot size.
         let buf: Slice<u8> = unsafe {
@@ -1006,9 +989,9 @@ mod tests {
             )
         };
 
-        assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
         drop(buf);
-        assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
     }
 
     #[test]
@@ -1024,12 +1007,12 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let buf = data.provided_pools[0].select(local, 5);
+        let buf = data.provided_pool.select(0, local, 5);
 
-        assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
         let bytes = buf.into_vec();
         assert_eq!(bytes.len(), 5);
-        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
     #[test]
@@ -1045,24 +1028,24 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let buf = data.provided_pools[0].select(local, 5);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 1);
+        let buf = data.provided_pool.select(0, local, 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
 
         // Upgrade to an exclusive, writable view.
         let mut buf = buf.into_mut();
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), -1);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
         assert_eq!(buf.capacity(), 16);
         buf.as_mut()[..5].copy_from_slice(b"hello");
         buf.set_len(5);
 
         // Downgrade back to a shared read buffer and read the data back.
         let buf = buf.into_bytes();
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 1);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
         assert_eq!(buf.as_ref(), b"hello");
 
         drop(buf);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 0);
-        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
     #[test]
@@ -1078,16 +1061,16 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let buf = data.provided_pools[0].select(local, 5);
+        let buf = data.provided_pool.select(0, local, 5);
         let buf = buf.into_mut();
         let (head, tail) = buf.split_at(2).unwrap();
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), -2);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -2);
         drop(head);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), -1);
-        assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
         drop(tail);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 0);
-        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
     #[test]
@@ -1103,15 +1086,15 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let buf = data.provided_pools[0].select(local, 5);
-        data.provided_pools[0].tracker.clone_shared(local as _);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 2);
+        let buf = data.provided_pool.select(0, local, 5);
+        data.provided_pool.tracker_mut(0).clone_shared(local as _);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 2);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.into_mut()));
         assert!(result.is_err());
         // The failed upgrade left the borrows intact; the unwind dropped
         // `buf`, releasing one of the two shared holders.
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 1);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
     }
 
     #[test]
@@ -1127,15 +1110,15 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let local = 1u16;
-        let mut buf = data.provided_pools[0].select_mut(local, 5);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), -1);
+        let mut buf = data.provided_pool.select_mut(0, local, 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 5);
         buf.as_mut()[..5].copy_from_slice(b"hello");
 
         drop(buf);
-        assert_eq!(data.provided_pools[0].tracker.borrows(local as _), 0);
-        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
     #[test]
@@ -1150,13 +1133,13 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let buf = data.provided_pools[0].select(1, 5);
+        let buf = data.provided_pool.select(0, 1, 5);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            data.provided_pools[0].select(1, 5);
+            data.provided_pool.select(0, 1, 5);
         }));
         assert!(result.is_err());
         drop(buf);
-        assert_eq!(data.provided_pools[0].tracker.borrows(1), 0);
+        assert_eq!(data.provided_pool.tracker_mut(0).borrows(1), 0);
     }
 
     // ── BytesMut ─────────────────────────────────────────────────────
@@ -1173,11 +1156,11 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let buf = data.fixed_pools[0].acquire_bytes_mut().unwrap();
+        let buf = data.fixed_pool.acquire_bytes_mut(0).unwrap();
 
-        assert_eq!(data.fixed_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
         drop(buf);
-        assert_eq!(data.fixed_pools[0].free_count(), 4);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), 4);
     }
 
     #[test]
@@ -1192,16 +1175,16 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let local = data.fixed_pools[0].acquire_slot().unwrap();
+        let local = data.fixed_pool.slab_mut(0).acquire_slot().unwrap();
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         // SAFETY: the borrow is registered via acquire, but the generation is
         // deliberately stale so drop leaks the slot instead of recycling it.
         let buf: SliceMut<u8> =
             unsafe { SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16) };
 
-        assert_eq!(data.fixed_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
         drop(buf);
-        assert_eq!(data.fixed_pools[0].free_count(), 3);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
     }
 
     #[test]
@@ -1216,15 +1199,15 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
-        let view: Ref<[u8; 16]> = data.fixed_pools[0].acquire_ref().unwrap();
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        let before = data.fixed_pool.slab(0).free_count();
+        let view: Ref<[u8; 16]> = data.fixed_pool.acquire_ref(0).unwrap();
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         let cloned = view.clone();
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 2);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 2);
         drop(cloned);
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
         drop(view);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1239,12 +1222,12 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
-        let view: RefMut<[u8; 16]> = data.fixed_pools[0].acquire_mut().unwrap();
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), -1);
+        let before = data.fixed_pool.slab(0).free_count();
+        let view: RefMut<[u8; 16]> = data.fixed_pool.acquire_mut(0).unwrap();
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), -1);
         drop(view);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1259,25 +1242,25 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
-        let bytes: Bytes = data.fixed_pools[0].acquire_bytes().unwrap();
+        let before = data.fixed_pool.slab(0).free_count();
+        let bytes: Bytes = data.fixed_pool.acquire_bytes(0).unwrap();
         assert_eq!(bytes.len(), 16);
         drop(bytes);
 
-        let bytes_mut: BytesMut = data.fixed_pools[0].acquire_bytes_mut().unwrap();
+        let bytes_mut: BytesMut = data.fixed_pool.acquire_bytes_mut(0).unwrap();
         assert_eq!(bytes_mut.len(), 16);
         assert_eq!(bytes_mut.capacity(), 16);
         drop(bytes_mut);
 
-        let slice: Slice<u32> = data.fixed_pools[0].acquire_slice().unwrap();
+        let slice: Slice<u32> = data.fixed_pool.acquire_slice(0).unwrap();
         assert_eq!(slice.len(), 4);
         drop(slice);
 
-        let slice_mut: SliceMut<u64> = data.fixed_pools[0].acquire_slice_mut().unwrap();
+        let slice_mut: SliceMut<u64> = data.fixed_pool.acquire_slice_mut(0).unwrap();
         assert_eq!(slice_mut.len(), 2);
         drop(slice_mut);
 
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1292,13 +1275,13 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         let buf = ctx.alloc_bytes(5).unwrap();
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 16);
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(buf);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1558,7 +1541,7 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let bgid = ctx.with_runtime(|r| r.provided_pools[0].bgid());
+        let bgid = ctx.with_runtime(|r| r.provided_pool.slab(0).bgid());
         assert_eq!(bgid, 0);
     }
 
@@ -1690,11 +1673,11 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(alloc);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1712,17 +1695,17 @@ mod tests {
         // Casting strips the outer `MaybeUninit` but names the same slot.
         let orig = ctx.alloc::<[u8; 16]>().unwrap();
         let orig_ptr = orig.as_ptr();
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         let casted: Ref<[u8; 16]> = unsafe { orig.cast() };
         assert_eq!(orig_ptr.cast::<u8>(), casted.as_ptr().cast::<u8>());
 
         // The cast transfers the slot: it must not recycle it (which would
         // hand the same slot out twice on the next alloc).
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
 
         // The slot still recycles on drop after the cast, exactly once.
         drop(casted);
-        assert_eq!(data.fixed_pools[0].free_count(), before + 1);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before + 1);
     }
 
     #[test]
@@ -1754,11 +1737,11 @@ mod tests {
         let ctx = data.context_for(index);
 
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         // The runtime shuts down: the drop must leak, not recycle.
         drop(gen_guard);
         drop(alloc);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1796,19 +1779,19 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
         let clone = alloc.clone();
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 2);
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 2);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(alloc);
         // One borrower left: the slot is still held by the clone.
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 1);
-        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(clone);
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 0);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 0);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     #[test]
@@ -1823,15 +1806,15 @@ mod tests {
         let _gen = enter_active_gen();
         let ctx = data.context_for(index);
 
-        let before = data.fixed_pools[0].free_count();
+        let before = data.fixed_pool.slab(0).free_count();
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
         let exclusive = alloc.into_mut();
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), -1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), -1);
         let shared: Ref<[u8; 8]> = unsafe { exclusive.into_ref().cast() };
-        assert_eq!(data.fixed_pools[0].tracker.borrows(0), 1);
+        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
         drop(shared);
-        assert_eq!(data.fixed_pools[0].free_count(), before);
+        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
     // ── Msg / MsgMut ─────────────────────────────────────────────────
@@ -1878,18 +1861,18 @@ mod tests {
         // (MAX_CTRL_CAP) in class 2 (2048) and the iov array (MAX_IOV_CAP *
         // 16) in class 3 (16384).
         let (free1, free2, free3) = (
-            data.fixed_pools[1].free_count(),
-            data.fixed_pools[2].free_count(),
-            data.fixed_pools[3].free_count(),
+            data.fixed_pool.slab(1).free_count(),
+            data.fixed_pool.slab(2).free_count(),
+            data.fixed_pool.slab(3).free_count(),
         );
         let slot = Msg::new(ctx).unwrap();
-        assert_eq!(data.fixed_pools[1].free_count(), free1 - 1);
-        assert_eq!(data.fixed_pools[2].free_count(), free2 - 1);
-        assert_eq!(data.fixed_pools[3].free_count(), free3 - 1);
+        assert_eq!(data.fixed_pool.slab(1).free_count(), free1 - 1);
+        assert_eq!(data.fixed_pool.slab(2).free_count(), free2 - 1);
+        assert_eq!(data.fixed_pool.slab(3).free_count(), free3 - 1);
         drop(slot);
-        assert_eq!(data.fixed_pools[1].free_count(), free1);
-        assert_eq!(data.fixed_pools[2].free_count(), free2);
-        assert_eq!(data.fixed_pools[3].free_count(), free3);
+        assert_eq!(data.fixed_pool.slab(1).free_count(), free1);
+        assert_eq!(data.fixed_pool.slab(2).free_count(), free2);
+        assert_eq!(data.fixed_pool.slab(3).free_count(), free3);
     }
 
     #[test]

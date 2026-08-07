@@ -14,7 +14,6 @@ use std::os::fd::RawFd;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
-use crate::classes::class_for;
 use crate::task::TaskContext;
 
 /// Submits `entry` for the caller's task and awaits its CQE result, releasing
@@ -60,7 +59,8 @@ fn release_io(ctx: TaskContext, slot: u32) {
 /// must still be alive while the buffer is in use.
 pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Bytes> {
     let class = ctx.with_runtime(|r| -> io::Result<u8> {
-        class_for(&r.provided_classes, max_len)
+        r.provided_pool
+            .class_for(max_len)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))
     })?;
 

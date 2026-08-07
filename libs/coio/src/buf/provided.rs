@@ -32,6 +32,7 @@ use crate::buf::Ref;
 use crate::buf::RefMut;
 use crate::buf::Slice;
 use crate::buf::SliceMut;
+use crate::buf::pool::Slab;
 use crate::buf::tracker::BorrowTracker;
 use crate::classes::pack_bid;
 use crate::runtime::active_gen;
@@ -152,17 +153,12 @@ impl ProvidedSlab {
         self.class
     }
 
-    /// The slot size of this class, in bytes.
-    pub(crate) fn slot_size(&self) -> u32 {
-        self.size
-    }
-
     /// Recycles buffer `local` back to the kernel so it can be selected again.
     /// Safe to call out of order, as results are consumed.
     pub fn recycle_buffer(&mut self, local: u16) {
         let mask = self.buf_count - 1;
         let ring_idx = (self.tail & mask) as usize;
-        let buf_addr = self.slot_ptr(local).as_ptr() as u64;
+        let buf_addr = self.slot_ptr(local as u32).as_ptr() as u64;
 
         // `resv` is left untouched: for ring index 0 it overlaps the `tail`
         // the kernel reads, so writing it would transiently clobber the tail.
@@ -241,37 +237,38 @@ impl ProvidedSlab {
         }
     }
 
-    /// Releases one borrower of `local`, recycling the buffer back to the
-    /// ring when the last view drops. `exclusive` selects the exclusive
-    /// (`RefMut`/`SliceMut`) vs. shared (`Ref`/`Slice`) release. Panics on a
-    /// count mismatch (an over-release, a double-drop, or releasing the wrong
-    /// kind of borrow).
-    pub fn drop_view(&mut self, exclusive: bool, local: u16) {
-        if self.tracker.drop_view(exclusive, local as _) {
-            self.recycle_buffer(local);
-        }
-    }
-
     /// Returns the bytes of buffer `local`. `len` must not exceed `size`.
     #[cfg(test)]
     pub fn get_slice(&self, local: u16, len: usize) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.slot_ptr(local).as_ptr(), len) }
-    }
-
-    /// Returns a raw pointer to the start of slot `local`'s slab memory.
-    pub fn slot_ptr(&self, local: u16) -> NonNull<u8> {
-        unsafe {
-            NonNull::new_unchecked(
-                self.slab_base
-                    .as_ptr()
-                    .add(local as usize * self.size as usize),
-            )
-        }
+        unsafe { core::slice::from_raw_parts(self.slot_ptr(local as u32).as_ptr(), len) }
     }
 
     #[cfg(test)]
     pub(crate) fn ring_tail(&self) -> u16 {
         self.tail
+    }
+}
+
+impl Slab for ProvidedSlab {
+    /// The slot size of this class, in bytes.
+    fn slot_size(&self) -> u32 {
+        self.size
+    }
+
+    /// The start of this slab's slot 0, aligned to `min(slot_size,
+    /// BUFFER_MAX_ALIGN)`.
+    fn base(&self) -> NonNull<u8> {
+        self.slab_base
+    }
+
+    /// Returns `local` to the pool by recycling it back to the kernel's ring.
+    fn recycle(&mut self, local: u32) {
+        self.recycle_buffer(local as u16);
+    }
+
+    /// The slab's mutable per-slot borrow tracker.
+    fn tracker_mut(&mut self) -> &mut BorrowTracker {
+        &mut self.tracker
     }
 }
 
