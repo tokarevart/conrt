@@ -22,6 +22,8 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 
+use crate::classes::pack_bid;
+use crate::runtime::active_gen;
 use crate::runtime::clone_view;
 use crate::runtime::downgrade_view;
 use crate::runtime::drop_view;
@@ -30,6 +32,9 @@ use crate::runtime::upgrade_view;
 
 pub struct BufferPool {
     size: u32,
+    /// This class's index in the runtime's fixed-pool table, packed into the
+    /// high bits of every view this pool hands out.
+    class: u8,
     /// Byte offset of this class's first slot within the shared slab.
     base_offset: u32,
     /// Start of the shared slab this class's slots live in.
@@ -45,7 +50,13 @@ impl BufferPool {
     /// the slot range `[base_offset, base_offset + count*size)` of the
     /// caller-owned slab at `slab_base`. The slab is registered with the ring
     /// once, by the runtime.
-    pub(crate) fn new(slab_base: NonNull<u8>, base_offset: usize, size: u32, count: u32) -> Self {
+    pub(crate) fn new(
+        slab_base: NonNull<u8>,
+        base_offset: usize,
+        size: u32,
+        count: u32,
+        class: u8,
+    ) -> Self {
         assert!(size > 0);
         assert!(count > 0);
 
@@ -56,6 +67,7 @@ impl BufferPool {
 
         Self {
             size,
+            class,
             base_offset: base_offset as u32,
             slab_base,
             free,
@@ -95,7 +107,7 @@ impl BufferPool {
     /// `None` when the class is exhausted. This is the root of an exclusive
     /// view, e.g. a `BytesMut` handed to
     /// [`crate::task::TaskContext::alloc_bytes`].
-    pub fn acquire(&mut self) -> Option<u32> {
+    pub fn acquire_slot(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
         self.borrows[local as usize] = -1;
         Some(local)
@@ -104,10 +116,97 @@ impl BufferPool {
     /// Pops a free slot and marks it shared (`+1`). This is the root of a
     /// shared view, e.g. the `Ref` handed to
     /// [`crate::task::TaskContext::alloc`] for pooled op arguments.
-    pub fn acquire_shared(&mut self) -> Option<u32> {
+    pub fn acquire_slot_shared(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
         self.borrows[local as usize] = 1;
         Some(local)
+    }
+
+    /// Pops a free slot and builds a shared [`Ref<T>`] over it, capturing the
+    /// live generation. This pool's slots hold at least `size_of::<T>()` bytes
+    /// (the caller selects this pool with [`crate::classes::class_for`]).
+    /// `None` when the class is exhausted. Panics if `T` is zero-sized.
+    pub fn acquire_ref<T>(&mut self) -> Option<Ref<T>> {
+        assert!(
+            core::mem::size_of::<T>() > 0,
+            "acquire_ref: zero-sized types cannot be pooled"
+        );
+        let local = self.acquire_slot_shared()?;
+        let generation = active_gen().expect("acquire_ref outside an active runtime");
+        // SAFETY: acquire_shared registered a shared borrow on the slot and the
+        // generation is the live one.
+        Some(unsafe { Ref::new(pack_bid(false, self.class, local), generation, 0) })
+    }
+
+    /// Pops a free slot and builds an exclusive [`RefMut<T>`] over it,
+    /// capturing the live generation. This pool's slots hold at least
+    /// `size_of::<T>()` bytes (the caller selects this pool with
+    /// [`crate::classes::class_for`]). `None` when the class is exhausted.
+    /// Panics if `T` is zero-sized.
+    pub fn acquire_mut<T>(&mut self) -> Option<RefMut<T>> {
+        assert!(
+            core::mem::size_of::<T>() > 0,
+            "acquire_mut: zero-sized types cannot be pooled"
+        );
+        let local = self.acquire_slot()?;
+        let generation = active_gen().expect("acquire_mut outside an active runtime");
+        // SAFETY: acquire registered an exclusive borrow on the slot and the
+        // generation is the live one.
+        Some(unsafe { RefMut::new(pack_bid(false, self.class, local), generation, 0) })
+    }
+
+    /// Pops a free slot and builds a shared [`Slice<T>`] covering the whole
+    /// slot as `T` elements, capturing the live generation. `None` when the
+    /// class is exhausted.
+    ///
+    /// No caller yet: the shared typed-slice root for future receive paths.
+    #[allow(dead_code)]
+    pub fn acquire_slice<T>(&mut self) -> Option<Slice<T>> {
+        let local = self.acquire_slot_shared()?;
+        let generation = active_gen().expect("acquire_slice outside an active runtime");
+        let elements = self.size / core::mem::size_of::<T>() as u32;
+        // SAFETY: acquire_shared registered a shared borrow on the slot and the
+        // generation is the live one; `elements` covers exactly the slot.
+        Some(unsafe {
+            Slice::new(
+                Ref::new(pack_bid(false, self.class, local), generation, 0),
+                elements,
+            )
+        })
+    }
+
+    /// Pops a free slot and builds an exclusive [`SliceMut<T>`] covering the
+    /// whole slot as `T` elements, capturing the live generation. `None` when
+    /// the class is exhausted.
+    pub fn acquire_slice_mut<T>(&mut self) -> Option<SliceMut<T>> {
+        let local = self.acquire_slot()?;
+        let generation = active_gen().expect("acquire_slice_mut outside an active runtime");
+        let elements = self.size / core::mem::size_of::<T>() as u32;
+        // SAFETY: acquire registered an exclusive borrow on the slot and the
+        // generation is the live one; `elements` covers exactly the slot.
+        Some(unsafe {
+            SliceMut::new(
+                RefMut::new(pack_bid(false, self.class, local), generation, 0),
+                elements,
+            )
+        })
+    }
+
+    /// Pops a free slot and builds a shared [`Bytes`] covering the whole
+    /// slot, capturing the live generation. `None` when the class is
+    /// exhausted.
+    ///
+    /// No caller yet: the shared bytes root for future receive paths.
+    #[allow(dead_code)]
+    pub fn acquire_bytes(&mut self) -> Option<Bytes> {
+        self.acquire_slice::<u8>()
+    }
+
+    /// Pops a free slot and builds an exclusive [`BytesMut`] covering the
+    /// whole slot, capturing the live generation. `None` when the class is
+    /// exhausted.
+    pub fn acquire_bytes_mut(&mut self) -> Option<BytesMut> {
+        self.acquire_slice_mut::<u8>()
     }
 
     /// Registers one more shared borrower (a cloned [`Ref`]). Panics if the
@@ -216,7 +315,16 @@ const _: () = assert!(size_of::<Ref<u8>>() == 12);
 const _: () = assert!(size_of::<Option<Ref<u8>>>() == 12);
 
 impl<T> Ref<T> {
-    pub(crate) fn new(bid: u32, generation: NonZeroU32, offset: u32) -> Self {
+    /// Creates a view over an already-borrowed slot, `offset` bytes into it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must already hold the slot's shared borrow (or exclusively
+    /// own it as the sole view): building a `Ref` without the borrow lets the
+    /// pool recycle the slot while the view is alive and hand it out twice.
+    /// `generation` must be the runtime generation the borrow was taken in,
+    /// and `offset` must be within the slot's size.
+    pub(crate) unsafe fn new(bid: u32, generation: NonZeroU32, offset: u32) -> Self {
         Self {
             bid,
             generation,
@@ -314,7 +422,17 @@ const _: () = assert!(size_of::<RefMut<u8>>() == 12);
 const _: () = assert!(size_of::<Option<RefMut<u8>>>() == 12);
 
 impl<T> RefMut<T> {
-    pub(crate) fn new(bid: u32, generation: NonZeroU32, offset: u32) -> Self {
+    /// Creates an exclusive view over an already-borrowed slot, `offset`
+    /// bytes into it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must already hold the slot's exclusive borrow (or
+    /// exclusively own it as the sole view): building a `RefMut` without the
+    /// borrow lets the pool recycle the slot while the view is alive and hand
+    /// it out twice. `generation` must be the runtime generation the borrow
+    /// was taken in, and `offset` must be within the slot's size.
+    pub(crate) unsafe fn new(bid: u32, generation: NonZeroU32, offset: u32) -> Self {
         Self {
             bid,
             generation,
@@ -385,7 +503,16 @@ const _: () = assert!(size_of::<Slice<u8>>() == 16);
 const _: () = assert!(size_of::<Option<Slice<u8>>>() == 16);
 
 impl<T> Slice<T> {
-    pub(crate) fn new(base: Ref<T>, len: u32) -> Self {
+    /// Creates a slice view over `len` elements of a slot, transferring the
+    /// base view's borrow to the slice.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be a live view whose borrow is transferred to the slice
+    /// (the caller must not use `base` again — it is dropped without releasing
+    /// the borrow), and `base.offset + len * size_of::<T>()` must not exceed
+    /// the slot's size, or reads through the slice run past the slot.
+    pub(crate) unsafe fn new(base: Ref<T>, len: u32) -> Self {
         Self { base, len }
     }
 
@@ -428,10 +555,15 @@ impl<T> Slice<T> {
         );
         let base = unsafe { core::ptr::read(&self.base) };
         core::mem::forget(self);
-        Slice::new(
-            Ref::new(base.bid, base.generation, base.offset),
-            (bytes / size_of::<U>()) as u32,
-        )
+        // SAFETY: `base`'s borrow is transferred to the returned slice (the
+        // byte length is at most the slot's, enforced at construction), so no
+        // count changes and the covered range stays in bounds.
+        unsafe {
+            Slice::new(
+                Ref::new(base.bid, base.generation, base.offset),
+                (bytes / size_of::<U>()) as u32,
+            )
+        }
     }
 }
 
@@ -455,14 +587,19 @@ impl Bytes {
             return None;
         }
         clone_view(self.base.bid, self.base.generation);
-        Some(Slice::new(
-            Ref::new(
-                self.base.bid,
-                self.base.generation,
-                self.base.offset + a as u32,
-            ),
-            (b - a) as u32,
-        ))
+        // SAFETY: clone_view registered one more shared borrower, so the
+        // borrow is held; the checked `a <= b <= len` keeps the sub-slice
+        // within the slot.
+        Some(unsafe {
+            Slice::new(
+                Ref::new(
+                    self.base.bid,
+                    self.base.generation,
+                    self.base.offset + a as u32,
+                ),
+                (b - a) as u32,
+            )
+        })
     }
 
     /// Copies the covered bytes into an owned `Vec` and releases the slot.
@@ -478,13 +615,12 @@ impl Bytes {
     /// can be handed to a send or modified in place. Panics unless this view
     /// is the only shared borrower of its slot.
     pub fn into_mut(self) -> BytesMut {
-        upgrade_view(self.base.bid, self.base.generation);
-        let result = SliceMut::new(
-            RefMut::new(self.base.bid, self.base.generation, self.base.offset),
-            self.len,
-        );
-        core::mem::forget(self);
-        result
+        let len = self.len;
+        // SAFETY: into_ref transfers the shared borrow held by `self` to the
+        // returned `Ref`; Ref::into_mut upgrades that sole shared borrow to
+        // exclusive (panicking otherwise), so the borrow is held and `len` is
+        // within the slot.
+        unsafe { SliceMut::new(self.into_ref().into_mut(), len) }
     }
 }
 
@@ -513,7 +649,17 @@ const _: () = assert!(size_of::<SliceMut<u8>>() == 16);
 const _: () = assert!(size_of::<Option<SliceMut<u8>>>() == 16);
 
 impl<T> SliceMut<T> {
-    pub(crate) fn new(base: RefMut<T>, len: u32) -> Self {
+    /// Creates an exclusive slice view over `len` elements of a slot,
+    /// transferring the base view's borrow to the slice.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be a live view whose borrow is transferred to the slice
+    /// (the caller must not use `base` again — it is dropped without
+    /// releasing the borrow), and `base.offset + len * size_of::<T>()` must
+    /// not exceed the slot's size, or accesses through the slice run past the
+    /// slot.
+    pub(crate) unsafe fn new(base: RefMut<T>, len: u32) -> Self {
         Self { base, len }
     }
 
@@ -553,10 +699,16 @@ impl<T> SliceMut<T> {
         );
         let base = unsafe { core::ptr::read(&self.base) };
         core::mem::forget(self);
-        SliceMut::new(
-            RefMut::new(base.bid, base.generation, base.offset),
-            (bytes / size_of::<U>()) as u32,
-        )
+        // SAFETY: `base`'s exclusive borrow is transferred to the returned
+        // slice (the byte length is at most the slot's, enforced at
+        // construction), so no count changes and the covered range stays in
+        // bounds.
+        unsafe {
+            SliceMut::new(
+                RefMut::new(base.bid, base.generation, base.offset),
+                (bytes / size_of::<U>()) as u32,
+            )
+        }
     }
 }
 
@@ -607,16 +759,23 @@ impl BytesMut {
         split_exclusive(self.base.bid, self.base.generation);
         let base = unsafe { core::ptr::read(&self.base) };
         core::mem::forget(self);
-        let head = SliceMut::new(
-            RefMut::new(base.bid, base.generation, base.offset),
-            mid as u32,
-        );
-        let tail = SliceMut::new(
-            RefMut::new(base.bid, base.generation, base.offset + mid as u32),
-            (len - mid) as u32,
-        );
-        // The copied `base` is a live local: forget it so its `Drop` does not
-        // release the exclusive borrow while both halves still claim it.
+        // SAFETY: split_exclusive registered a second exclusive borrower, and
+        // both halves lie within the original covered range, so the slot's
+        // borrow is held and the halves stay in bounds. The copied `base` is
+        // a live local: forget it so its `Drop` does not release the borrow
+        // while both halves still claim it.
+        let head = unsafe {
+            SliceMut::new(
+                RefMut::new(base.bid, base.generation, base.offset),
+                mid as u32,
+            )
+        };
+        let tail = unsafe {
+            SliceMut::new(
+                RefMut::new(base.bid, base.generation, base.offset + mid as u32),
+                (len - mid) as u32,
+            )
+        };
         core::mem::forget(base);
         Some((head, tail))
     }
@@ -630,7 +789,9 @@ impl BytesMut {
         let len = self.len;
         let base = unsafe { core::ptr::read(&self.base) };
         core::mem::forget(self);
-        Slice::new(base.into_ref(), len)
+        // SAFETY: into_ref flips this sole exclusive borrow to shared, so the
+        // borrow is held; `self.len` is within the slot.
+        unsafe { Slice::new(base.into_ref(), len) }
     }
 }
 
@@ -721,34 +882,34 @@ mod tests {
     fn make_pool(count: u32, size: u32) -> (BufferPool, Vec<u8>) {
         let mut slab = vec![0u8; count as usize * size as usize];
         let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        (BufferPool::new(base, 0, size, count), slab)
+        (BufferPool::new(base, 0, size, count, 0), slab)
     }
 
     #[test]
     fn acquire_drop_roundtrip() {
         let (mut pool, _slab) = make_pool(4, 16);
-        let a = pool.acquire().unwrap();
-        let b = pool.acquire().unwrap();
+        let a = pool.acquire_slot().unwrap();
+        let b = pool.acquire_slot().unwrap();
         assert_ne!(a, b);
         pool.drop_view(true, a);
-        assert_eq!(pool.acquire().unwrap(), a);
+        assert_eq!(pool.acquire_slot().unwrap(), a);
     }
 
     #[test]
     fn acquire_exhaustion() {
         let (mut pool, _slab) = make_pool(4, 16);
         for _ in 0..4 {
-            assert!(pool.acquire().is_some());
+            assert!(pool.acquire_slot().is_some());
         }
-        assert_eq!(pool.acquire(), None);
+        assert_eq!(pool.acquire_slot(), None);
         pool.drop_view(true, 2);
-        assert_eq!(pool.acquire(), Some(2));
+        assert_eq!(pool.acquire_slot(), Some(2));
     }
 
     #[test]
     fn shared_borrow_returns_to_free_at_zero() {
         let (mut pool, _slab) = make_pool(2, 16);
-        let slot = pool.acquire_shared().unwrap();
+        let slot = pool.acquire_slot_shared().unwrap();
         pool.clone_shared(slot);
         assert_eq!(pool.borrows(slot), 2);
         assert_eq!(pool.free_count(), 1);
@@ -763,7 +924,7 @@ mod tests {
     #[test]
     fn exclusive_split_requires_both_drops() {
         let (mut pool, _slab) = make_pool(2, 16);
-        let slot = pool.acquire().unwrap();
+        let slot = pool.acquire_slot().unwrap();
         pool.split_exclusive(slot);
         assert_eq!(pool.borrows(slot), -2);
         assert_eq!(pool.free_count(), 1);
@@ -778,7 +939,7 @@ mod tests {
     #[test]
     fn upgrade_downgrade_sole_holder() {
         let (mut pool, _slab) = make_pool(2, 16);
-        let slot = pool.acquire_shared().unwrap();
+        let slot = pool.acquire_slot_shared().unwrap();
         pool.upgrade(slot);
         assert_eq!(pool.borrows(slot), -1);
         pool.downgrade(slot);
@@ -788,7 +949,7 @@ mod tests {
     #[test]
     fn clone_shared_panics_on_exclusive() {
         let (mut pool, _slab) = make_pool(2, 16);
-        let slot = pool.acquire().unwrap();
+        let slot = pool.acquire_slot().unwrap();
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pool.clone_shared(slot);
@@ -800,7 +961,7 @@ mod tests {
     #[test]
     fn drop_view_over_release_panics() {
         let (mut pool, _slab) = make_pool(2, 16);
-        let slot = pool.acquire_shared().unwrap();
+        let slot = pool.acquire_slot_shared().unwrap();
         pool.drop_view(false, slot);
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -813,7 +974,7 @@ mod tests {
     #[test]
     fn get_slice_mut_writes_within_slot() {
         let (mut pool, _slab) = make_pool(2, 8);
-        let slot = pool.acquire().unwrap();
+        let slot = pool.acquire_slot().unwrap();
         pool.get_slice_mut(slot)[..5].copy_from_slice(b"hello");
         let back = pool.get_slice_mut(slot);
         assert_eq!(&back[..5], b"hello");
@@ -823,8 +984,8 @@ mod tests {
     #[test]
     fn slots_are_isolated() {
         let (mut pool, _slab) = make_pool(2, 8);
-        let a = pool.acquire().unwrap();
-        let b = pool.acquire().unwrap();
+        let a = pool.acquire_slot().unwrap();
+        let b = pool.acquire_slot().unwrap();
         pool.get_slice_mut(a)[0] = 1;
         pool.get_slice_mut(b)[0] = 2;
         assert_eq!(pool.get_slice_mut(a)[0], 1);

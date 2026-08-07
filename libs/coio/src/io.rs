@@ -83,10 +83,10 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Byt
     });
     ctx.with_task(|task| task.io.remove_value(slot));
 
-    // SAFETY: the kernel handed `local` to the just-completed BUFFER_SELECT
-    // read above, and `result` is the number of bytes it produced, which fits
-    // in the class's slot size.
-    Ok(unsafe { ctx.provided_bytes(class, local, result as u32) })
+    // The kernel handed `local` to the just-completed BUFFER_SELECT read
+    // above, and `result` is the number of bytes it produced, which fits in
+    // the class's slot size.
+    Ok(ctx.provided_bytes(class, local, result as u32))
 }
 
 /// Writes the contents of `buf` to `fd` via `IORING_OP_WRITE_FIXED`. The

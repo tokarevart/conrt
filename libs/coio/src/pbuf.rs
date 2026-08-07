@@ -26,6 +26,15 @@ use std::sync::atomic::Ordering;
 
 use io_uring::IoUring;
 
+use crate::buf::Bytes;
+use crate::buf::BytesMut;
+use crate::buf::Ref;
+use crate::buf::RefMut;
+use crate::buf::Slice;
+use crate::buf::SliceMut;
+use crate::classes::pack_bid;
+use crate::runtime::active_gen;
+
 const PAGE_SIZE: usize = 4096;
 
 fn page_align(n: usize) -> usize {
@@ -62,7 +71,7 @@ pub struct ProvidedBufferPool {
     base_offset: u32,
     /// Start of the shared slab this class's slots live in.
     slab_base: NonNull<u8>,
-    bgid: u16,
+    class: u8,
     ring_ptr: NonNull<u8>,
     ring_size: usize,
     tail: u16,
@@ -83,12 +92,13 @@ impl ProvidedBufferPool {
         base_offset: usize,
         count: u16,
         size: u32,
-        bgid: u16,
+        class: u8,
     ) -> Self {
         assert!(count.is_power_of_two());
         assert!(count > 0 && count <= 32768);
         assert!(size > 0);
         assert!(base_offset as u64 <= u64::from(u32::MAX));
+        assert!(class < 128);
 
         let base_offset = base_offset as u32;
 
@@ -123,7 +133,7 @@ impl ProvidedBufferPool {
             buf_size: size,
             base_offset,
             slab_base,
-            bgid,
+            class,
             ring_ptr: unsafe { NonNull::new_unchecked(ring_raw as *mut u8) },
             ring_size,
             tail: count,
@@ -139,7 +149,7 @@ impl ProvidedBufferPool {
             ring.submitter().register_buf_ring_with_flags(
                 self.ring_ptr.as_ptr() as u64,
                 self.buf_count,
-                self.bgid,
+                self.class as _,
                 0,
             )
         }
@@ -148,12 +158,12 @@ impl ProvidedBufferPool {
     /// Unregisters the pool from `ring`. Must be called before the pool is
     /// dropped and the ring is closed.
     pub fn unregister(&self, ring: &IoUring) -> io::Result<()> {
-        ring.submitter().unregister_buf_ring(self.bgid)
+        ring.submitter().unregister_buf_ring(self.class as _)
     }
 
     #[cfg(test)]
-    pub fn bgid(&self) -> u16 {
-        self.bgid
+    pub fn bgid(&self) -> u8 {
+        self.class
     }
 
     /// The byte offset of slot `local` within the shared slab.
@@ -205,6 +215,68 @@ impl ProvidedBufferPool {
             "mark_selected: buffer {local} is already borrowed"
         );
         *borrow = 1;
+    }
+
+    /// Hands the kernel-selected buffer `local` out as a shared [`Bytes`]
+    /// view covering `len` bytes, capturing the live generation. `local` is
+    /// the buffer id the kernel reported on a `BUFFER_SELECT` read result and
+    /// `len` is the op's byte count. The view borrows the slot: it stays out
+    /// of the ring until the last view drops.
+    ///
+    /// # Panics
+    ///
+    /// - If `len` exceeds the slot size.
+    /// - On a double selection: `local` is already out (the kernel cannot hand
+    ///   a buffer out twice).
+    /// - Outside an active runtime.
+    pub fn select(&mut self, local: u16, len: u32) -> Bytes {
+        let generation = active_gen().expect("select outside an active runtime");
+        assert!(len <= self.buf_size, "select: len exceeds the slot size");
+        self.mark_selected(local);
+        // SAFETY: mark_selected registered a shared borrow on the slot, the
+        // generation is the live one, and `len` is asserted within the slot
+        // size above.
+        unsafe {
+            Slice::new(
+                Ref::new(pack_bid(true, self.class, u32::from(local)), generation, 0),
+                len,
+            )
+        }
+    }
+
+    /// Hands the kernel-selected buffer `local` out as an exclusive
+    /// [`BytesMut`] view covering `len` bytes, capturing the live generation.
+    /// `local` is the buffer id the kernel reported on a `BUFFER_SELECT` read
+    /// result and `len` is the op's byte count. The view borrows the slot
+    /// exclusively: it stays out of the ring until the view drops.
+    ///
+    /// # Panics
+    ///
+    /// - If `len` exceeds the slot size.
+    /// - On a double selection: `local` is already out (the kernel cannot hand
+    ///   a buffer out twice).
+    /// - Outside an active runtime.
+    ///
+    /// No caller yet: the exclusive variant for future receive paths that
+    /// write in place.
+    #[allow(dead_code)]
+    pub fn select_mut(&mut self, local: u16, len: u32) -> BytesMut {
+        let generation = active_gen().expect("select_mut outside an active runtime");
+        assert!(
+            len <= self.buf_size,
+            "select_mut: len exceeds the slot size"
+        );
+        self.mark_selected(local);
+        self.upgrade(local);
+        // SAFETY: mark_selected and upgrade above left the slot exclusively
+        // borrowed, the generation is the live one, and `len` is asserted
+        // within the slot size above.
+        unsafe {
+            SliceMut::new(
+                RefMut::new(pack_bid(true, self.class, u32::from(local)), generation, 0),
+                len,
+            )
+        }
     }
 
     /// Releases one borrower of `local`, recycling the buffer back to the
@@ -337,7 +409,7 @@ mod tests {
     fn pbuf_ring_select_and_recycle() {
         const BUF_SIZE: u32 = 16;
         const BUF_COUNT: u16 = 4;
-        const BGID: u16 = 0;
+        const BGID: u8 = 0;
 
         let fd = tmpfile();
         let written = unsafe { libc::write(fd, b"hello world".as_ptr().cast(), 11) };
@@ -352,7 +424,7 @@ mod tests {
 
         let read_entry = || {
             io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), BUF_SIZE)
-                .buf_group(BGID)
+                .buf_group(BGID as _)
                 .build()
                 .flags(io_uring::squeue::Flags::BUFFER_SELECT)
         };
@@ -445,5 +517,18 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn pbuf_select_outside_runtime_panics() {
+        let mut slab = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
+        let mut pool = ProvidedBufferPool::new(base, 0, 4, 16, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.select(1, 5);
+        }));
+        assert!(result.is_err());
+        // The panic fired before any borrow was registered.
+        assert_eq!(pool.borrows(1), 0);
     }
 }

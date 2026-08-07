@@ -522,13 +522,8 @@ fn build_pools(
         .collect();
     let mut provided_pools = Vec::with_capacity(provided_layout.len());
     for (i, l) in provided_layout.iter().enumerate() {
-        let pool = ProvidedBufferPool::new(
-            base,
-            l.base_offset as usize,
-            l.count as u16,
-            l.size,
-            i as u16,
-        );
+        let pool =
+            ProvidedBufferPool::new(base, l.base_offset as usize, l.count as u16, l.size, i as _);
         pool.register(ring)
             .expect("failed to register the provided buffer ring");
         provided_pools.push(pool);
@@ -543,12 +538,14 @@ fn build_pools(
         .collect();
     let fixed_pools = fixed_layout
         .iter()
-        .map(|l| {
+        .enumerate()
+        .map(|(i, l)| {
             BufferPool::new(
                 base,
                 fixed_start as usize + l.base_offset as usize,
                 l.size,
                 l.count,
+                i as u8,
             )
         })
         .collect();
@@ -760,6 +757,8 @@ mod tests {
     use core::task::Waker;
 
     use super::*;
+    use crate::buf::Bytes;
+    use crate::buf::BytesMut;
     use crate::buf::Ref;
     use crate::buf::RefMut;
     use crate::buf::Slice;
@@ -965,16 +964,13 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
         let local = 1u16;
-        data.provided_pools[0].mark_selected(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
+        let buf = data.provided_pools[0].select(local, 5);
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
+        assert_eq!(data.provided_pools[0].borrows(local), 1);
         drop(buf);
+        assert_eq!(data.provided_pools[0].borrows(local), 0);
         assert_eq!(data.provided_pools[0].ring_tail(), 5);
     }
 
@@ -993,10 +989,14 @@ mod tests {
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         let local = 1u16;
         data.provided_pools[0].mark_selected(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
+        // SAFETY: mark_selected above registered a shared borrow on the slot,
+        // so 5 bytes stay within the class-0 slot size.
+        let buf: Slice<u8> = unsafe {
+            Slice::new(
+                Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
+                5,
+            )
+        };
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
         drop(buf);
@@ -1015,13 +1015,8 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
         let local = 1u16;
-        data.provided_pools[0].mark_selected(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
+        let buf = data.provided_pools[0].select(local, 5);
 
         assert_eq!(data.provided_pools[0].ring_tail(), 4);
         let bytes = buf.into_vec();
@@ -1041,13 +1036,8 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
         let local = 1u16;
-        data.provided_pools[0].mark_selected(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
+        let buf = data.provided_pools[0].select(local, 5);
         assert_eq!(data.provided_pools[0].borrows(local), 1);
 
         // Upgrade to an exclusive, writable view.
@@ -1079,13 +1069,8 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
         let local = 1u16;
-        data.provided_pools[0].mark_selected(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
+        let buf = data.provided_pools[0].select(local, 5);
         let buf = buf.into_mut();
         let (head, tail) = buf.split_at(2).unwrap();
         assert_eq!(data.provided_pools[0].borrows(local), -2);
@@ -1109,14 +1094,9 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
         let local = 1u16;
-        data.provided_pools[0].mark_selected(local);
+        let buf = data.provided_pools[0].select(local, 5);
         data.provided_pools[0].clone_shared(local);
-        let buf: Slice<u8> = Slice::new(
-            Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-            5,
-        );
         assert_eq!(data.provided_pools[0].borrows(local), 2);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.into_mut()));
@@ -1124,6 +1104,51 @@ mod tests {
         // The failed upgrade left the borrows intact; the unwind dropped
         // `buf`, releasing one of the two shared holders.
         assert_eq!(data.provided_pools[0].borrows(local), 1);
+    }
+
+    #[test]
+    fn provided_select_mut_borrows_exclusive_and_recycles() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let local = 1u16;
+        let mut buf = data.provided_pools[0].select_mut(local, 5);
+        assert_eq!(data.provided_pools[0].borrows(local), -1);
+        assert_eq!(buf.capacity(), 16);
+        assert_eq!(buf.len(), 5);
+        buf.as_mut()[..5].copy_from_slice(b"hello");
+
+        drop(buf);
+        assert_eq!(data.provided_pools[0].borrows(local), 0);
+        assert_eq!(data.provided_pools[0].ring_tail(), 5);
+    }
+
+    #[test]
+    fn provided_select_double_selection_panics() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let buf = data.provided_pools[0].select(1, 5);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            data.provided_pools[0].select(1, 5);
+        }));
+        assert!(result.is_err());
+        drop(buf);
+        assert_eq!(data.provided_pools[0].borrows(1), 0);
     }
 
     // ── BytesMut ─────────────────────────────────────────────────────
@@ -1140,10 +1165,7 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let generation = _gen.get();
-        let local = data.fixed_pools[0].acquire().unwrap();
-        let buf: SliceMut<u8> =
-            SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16);
+        let buf = data.fixed_pools[0].acquire_bytes_mut().unwrap();
 
         assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
@@ -1162,14 +1184,92 @@ mod tests {
         let _gen = enter_active_gen();
         let _ctx = data.context_for(index);
 
-        let local = data.fixed_pools[0].acquire().unwrap();
+        let local = data.fixed_pools[0].acquire_slot().unwrap();
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
+        // SAFETY: the borrow is registered via acquire, but the generation is
+        // deliberately stale so drop leaks the slot instead of recycling it.
         let buf: SliceMut<u8> =
-            SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16);
+            unsafe { SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16) };
 
         assert_eq!(data.fixed_pools[0].free_count(), 3);
         drop(buf);
         assert_eq!(data.fixed_pools[0].free_count(), 3);
+    }
+
+    #[test]
+    fn acquire_ref_shared_clone_and_drop() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let before = data.fixed_pools[0].free_count();
+        let view: Ref<[u8; 16]> = data.fixed_pools[0].acquire_ref().unwrap();
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        let cloned = view.clone();
+        assert_eq!(data.fixed_pools[0].borrows(0), 2);
+        drop(cloned);
+        assert_eq!(data.fixed_pools[0].borrows(0), 1);
+        drop(view);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    #[test]
+    fn acquire_mut_exclusive_and_drop() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let before = data.fixed_pools[0].free_count();
+        let view: RefMut<[u8; 16]> = data.fixed_pools[0].acquire_mut().unwrap();
+        assert_eq!(data.fixed_pools[0].free_count(), before - 1);
+        assert_eq!(data.fixed_pools[0].borrows(0), -1);
+        drop(view);
+        assert_eq!(data.fixed_pools[0].free_count(), before);
+    }
+
+    #[test]
+    fn acquire_slices_cover_the_whole_slot() {
+        let task = Task::new();
+        let mut data = test_runtime_data(64);
+        let index = data
+            .tasks
+            .insert(task, |_| core::future::ready(()))
+            .unwrap();
+
+        let _gen = enter_active_gen();
+        let _ctx = data.context_for(index);
+
+        let before = data.fixed_pools[0].free_count();
+        let bytes: Bytes = data.fixed_pools[0].acquire_bytes().unwrap();
+        assert_eq!(bytes.len(), 16);
+        drop(bytes);
+
+        let bytes_mut: BytesMut = data.fixed_pools[0].acquire_bytes_mut().unwrap();
+        assert_eq!(bytes_mut.len(), 16);
+        assert_eq!(bytes_mut.capacity(), 16);
+        drop(bytes_mut);
+
+        let slice: Slice<u32> = data.fixed_pools[0].acquire_slice().unwrap();
+        assert_eq!(slice.len(), 4);
+        drop(slice);
+
+        let slice_mut: SliceMut<u64> = data.fixed_pools[0].acquire_slice_mut().unwrap();
+        assert_eq!(slice_mut.len(), 2);
+        drop(slice_mut);
+
+        assert_eq!(data.fixed_pools[0].free_count(), before);
     }
 
     #[test]
@@ -1668,7 +1768,11 @@ mod tests {
         let _ctx = data.context_for(index);
 
         let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        let alloc: Ref<MaybeUninit<[u8; 16]>> = Ref::new(pack_bid(false, 0, 0), stale, 0);
+        // SAFETY: a deliberately fabricated view over a never-borrowed slot
+        // with a stale generation: resolve panics before touching memory and
+        // drop would leak the slot rather than corrupt the pool.
+        let alloc: Ref<MaybeUninit<[u8; 16]>> =
+            unsafe { Ref::new(pack_bid(false, 0, 0), stale, 0) };
         let _ = alloc.as_ptr();
     }
 

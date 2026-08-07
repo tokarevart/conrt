@@ -19,10 +19,7 @@ use crate::buf::Bytes;
 use crate::buf::BytesMut;
 use crate::buf::Ref;
 use crate::buf::RefMut;
-use crate::buf::Slice;
-use crate::buf::SliceMut;
 use crate::classes::class_for;
-use crate::classes::pack_bid;
 use crate::runtime;
 use crate::runtime::Runtime;
 
@@ -407,9 +404,7 @@ impl TaskContext {
         );
         self.with_runtime(|r| {
             let class = class_for(&r.fixed_classes, core::mem::size_of::<T>())?;
-            let local = r.fixed_pools[class as usize].acquire_shared()?;
-            let generation = runtime::active_gen().expect("alloc called outside an active runtime");
-            Some(Ref::new(pack_bid(false, class, local), generation, 0))
+            r.fixed_pools[class as usize].acquire_ref::<MaybeUninit<T>>()
         })
     }
 
@@ -428,10 +423,7 @@ impl TaskContext {
         );
         self.with_runtime(|r| {
             let class = class_for(&r.fixed_classes, core::mem::size_of::<T>())?;
-            let local = r.fixed_pools[class as usize].acquire()?;
-            let generation =
-                runtime::active_gen().expect("alloc_mut called outside an active runtime");
-            Some(RefMut::new(pack_bid(false, class, local), generation, 0))
+            r.fixed_pools[class as usize].acquire_mut::<MaybeUninit<T>>()
         })
     }
 
@@ -444,18 +436,13 @@ impl TaskContext {
     /// [`BytesMut::set_len`] before passing it to [`crate::io::write`]. The
     /// slot is recycled when the buffer is dropped.
     pub fn alloc_bytes(&self, size: usize) -> io::Result<BytesMut> {
-        let generation =
-            runtime::active_gen().expect("alloc_bytes called outside an active runtime");
-        let (bid, capacity) = self.with_runtime(|r| -> io::Result<(u32, u32)> {
+        self.with_runtime(|r| -> io::Result<BytesMut> {
             let class = class_for(&r.fixed_classes, size)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-            let local = r.fixed_pools[class as usize]
-                .acquire()
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))?;
-            let capacity = r.fixed_pools[class as usize].slot_size();
-            Ok((pack_bid(false, class, local), capacity))
-        })?;
-        Ok(SliceMut::new(RefMut::new(bid, generation, 0), capacity))
+            r.fixed_pools[class as usize]
+                .acquire_bytes_mut()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))
+        })
     }
 
     /// Adopts a provided buffer the kernel just selected for a completed
@@ -470,7 +457,7 @@ impl TaskContext {
     /// an exclusive [`BytesMut`] with [`Bytes::into_mut`] while it is the sole
     /// holder, and dropped back to the ring either way.
     ///
-    /// # Safety
+    /// # Panics
     ///
     /// - `local` must be the buffer id of a *just-completed* `BUFFER_SELECT` op
     ///   on class `class`'s buffer group, so the buffer has left the ring and
@@ -479,21 +466,8 @@ impl TaskContext {
     ///
     /// Everything else is checked: `class` out of range panics, and using the
     /// returned view outside the runtime that owns it panics on access.
-    pub unsafe fn provided_bytes(&self, class: u8, local: u16, len: u32) -> Bytes {
-        let generation =
-            runtime::active_gen().expect("provided_bytes called outside an active runtime");
-        self.with_runtime(|r| {
-            let pool = &mut r.provided_pools[class as usize];
-            debug_assert!(
-                len <= pool.slot_size(),
-                "provided_bytes: len exceeds the slot size"
-            );
-            pool.mark_selected(local);
-        });
-        Slice::new(
-            Ref::new(pack_bid(true, class, u32::from(local)), generation, 0),
-            len,
-        )
+    pub fn provided_bytes(&self, class: u8, local: u16, len: u32) -> Bytes {
+        self.with_runtime(|r| r.provided_pools[class as usize].select(local, len))
     }
 
     pub fn wake(&self) {
