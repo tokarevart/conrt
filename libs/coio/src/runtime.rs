@@ -730,6 +730,8 @@ mod tests {
     use crate::buf::RefMut;
     use crate::buf::Slice;
     use crate::buf::SliceMut;
+    use crate::buf::alloc;
+    use crate::buf::alloc_bytes;
     use crate::classes::SizeClass;
     use crate::classes::pack_bid;
     use crate::io::MAX_CTRL_CAP;
@@ -1332,18 +1334,12 @@ mod tests {
 
     #[test]
     fn alloc_bytes_helper_returns_slot_capacity() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         let before = data.fixed_pool.slab(0).free_count();
-        let buf = ctx.alloc_bytes(5).unwrap();
+        let buf = alloc_bytes(5).unwrap();
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 16);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
@@ -1353,17 +1349,11 @@ mod tests {
 
     #[test]
     fn alloc_bytes_as_mut_set_len_clear() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut buf = ctx.alloc_bytes(5).unwrap();
+        let mut buf = alloc_bytes(5).unwrap();
         assert_eq!(buf.as_mut().len(), 16);
         buf.as_mut()[..5].copy_from_slice(b"hello");
         buf.set_len(5);
@@ -1381,17 +1371,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds capacity")]
     fn alloc_bytes_set_len_above_capacity_panics() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut buf = ctx.alloc_bytes(5).unwrap();
+        let mut buf = alloc_bytes(5).unwrap();
         buf.set_len(17);
     }
 
@@ -1730,18 +1714,12 @@ mod tests {
 
     #[test]
     fn alloc_drop_recycles_slot() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         let before = data.fixed_pool.slab(0).free_count();
-        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        let alloc = alloc::<[u8; 8]>().unwrap();
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(alloc);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before);
@@ -1749,18 +1727,12 @@ mod tests {
 
     #[test]
     fn alloc_cast_preserves_slot() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         // Casting strips the outer `MaybeUninit` but names the same slot.
-        let orig = ctx.alloc::<[u8; 16]>().unwrap();
+        let orig = alloc::<[u8; 16]>().unwrap();
         let orig_ptr = orig.as_ptr();
         let before = data.fixed_pool.slab(0).free_count();
         let casted: Ref<[u8; 16]> = unsafe { orig.cast() };
@@ -1778,32 +1750,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "zero-sized")]
     fn alloc_zst_panics() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let _ = ctx.alloc::<()>();
+        let _ = alloc::<()>();
     }
 
     #[test]
     fn alloc_stale_generation_leaks_on_drop() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let gen_guard = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        let alloc = alloc::<[u8; 8]>().unwrap();
         let before = data.fixed_pool.slab(0).free_count();
         // The runtime shuts down: the drop must leak, not recycle.
         drop(gen_guard);
@@ -1814,16 +1774,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "outside the runtime")]
     fn alloc_as_ptr_stale_generation_panics() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        // context_for sets the current runtime; only its side effect is needed.
-        let _ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         // SAFETY: a deliberately fabricated view over a never-borrowed slot
@@ -1836,18 +1789,12 @@ mod tests {
 
     #[test]
     fn ref_clone_adds_and_drops_shared_borrows() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         let before = data.fixed_pool.slab(0).free_count();
-        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        let alloc = alloc::<[u8; 8]>().unwrap();
         assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         let clone = alloc.clone();
         assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 2);
@@ -1863,18 +1810,12 @@ mod tests {
 
     #[test]
     fn ref_upgrade_and_downgrade_sole_holder() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         let before = data.fixed_pool.slab(0).free_count();
-        let alloc = ctx.alloc::<[u8; 8]>().unwrap();
+        let alloc = alloc::<[u8; 8]>().unwrap();
         assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         let exclusive = alloc.into_mut();
         assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), -1);
@@ -1888,19 +1829,13 @@ mod tests {
 
     #[test]
     fn msg_new_wires_iov_and_ctrl_to_pooled_memory() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         // A Msg always allocates the mandatory msghdr plus the full iov array
         // and control buffer, all in pooled memory, starting empty.
-        let mut slot = Msg::new(ctx).unwrap();
+        let mut slot = Msg::new().unwrap();
         {
             let msg = slot.msg();
             assert_eq!(msg.msg_iovlen, 0);
@@ -1914,15 +1849,9 @@ mod tests {
 
     #[test]
     fn msg_drop_recycles_all_slots() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
         // The msghdr (56 B) lands in class 1 (64), the ctrl array
         // (MAX_CTRL_CAP) in class 2 (2048) and the iov array (MAX_IOV_CAP *
@@ -1932,7 +1861,7 @@ mod tests {
             data.fixed_pool.slab(2).free_count(),
             data.fixed_pool.slab(3).free_count(),
         );
-        let slot = Msg::new(ctx).unwrap();
+        let slot = Msg::new().unwrap();
         assert_eq!(data.fixed_pool.slab(1).free_count(), free1 - 1);
         assert_eq!(data.fixed_pool.slab(2).free_count(), free2 - 1);
         assert_eq!(data.fixed_pool.slab(3).free_count(), free3 - 1);
@@ -1944,17 +1873,11 @@ mod tests {
 
     #[test]
     fn msg_slot_wires_iov_to_pooled_memory() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut slot = Msg::new(ctx).unwrap();
+        let mut slot = Msg::new().unwrap();
         let msg_iov = {
             let msg = slot.msg();
             assert_eq!(msg.msg_iovlen, 0);
@@ -1984,17 +1907,11 @@ mod tests {
 
     #[test]
     fn msg_slot_push_iov_rejects_past_capacity() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut slot = Msg::new(ctx).unwrap();
+        let mut slot = Msg::new().unwrap();
         for _ in 0..MAX_IOV_CAP {
             assert!(slot.push_iov(libc::iovec {
                 iov_base: std::ptr::null_mut(),
@@ -2010,17 +1927,11 @@ mod tests {
 
     #[test]
     fn msg_slot_wires_ctrl_to_pooled_memory() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut slot = Msg::new(ctx).unwrap();
+        let mut slot = Msg::new().unwrap();
         let msg_control = {
             let msg = slot.msg();
             assert_eq!(msg.msg_controllen, 0);
@@ -2035,17 +1946,11 @@ mod tests {
 
     #[test]
     fn msg_slot_push_cmsg_accumulates_and_overflows() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut slot = Msg::new(ctx).unwrap();
+        let mut slot = Msg::new().unwrap();
         let payload = [1u8, 2, 3, 4];
         assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload));
         // The cmsg bytes land at the start of the pooled control buffer.
@@ -2078,17 +1983,11 @@ mod tests {
 
     #[test]
     fn msgmut_take_iov_copies_and_resets() {
-        let task = Task::new();
         let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
         let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
+        set_current_runtime(&mut data);
 
-        let mut slot = MsgMut::new(ctx).unwrap();
+        let mut slot = MsgMut::new().unwrap();
         assert!(slot.push_iov(libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 3,

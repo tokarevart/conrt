@@ -417,7 +417,7 @@ fn block_on_sendmsg_recvmsg_roundtrip() {
     block_on(
         rt(),
         |ctx, _rt, (a, b): (i32, i32)| async move {
-            let mut snd = Msg::new(ctx).unwrap();
+            let mut snd = Msg::new().unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"hello".as_ptr().cast_mut().cast(),
                 iov_len: 5,
@@ -425,7 +425,7 @@ fn block_on_sendmsg_recvmsg_roundtrip() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 5);
 
-            let mut rcv = MsgMut::new(ctx).unwrap();
+            let mut rcv = MsgMut::new().unwrap();
             let mut buf = [0u8; 16];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -455,7 +455,7 @@ fn block_on_sendmsg_subset_of_iovecs() {
             // A <2, 0> slot with only the first iovec filled: only that one
             // segment is declared (msg_iovlen == 1) and handed to the kernel,
             // so the uninitialized second segment is never exposed.
-            let mut snd = Msg::new(ctx).unwrap();
+            let mut snd = Msg::new().unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"ab".as_ptr().cast_mut().cast(),
                 iov_len: 1,
@@ -463,7 +463,7 @@ fn block_on_sendmsg_subset_of_iovecs() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 1);
 
-            let mut rcv = MsgMut::new(ctx).unwrap();
+            let mut rcv = MsgMut::new().unwrap();
             let mut buf = [0u8; 8];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -498,13 +498,13 @@ fn block_on_fd_passing_without_iov() {
         rt(),
         |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
             // Sender: a cmsg carrying `sent_fd`, with no data iovec.
-            let mut snd = Msg::new(ctx).unwrap();
+            let mut snd = Msg::new().unwrap();
             assert!(snd.push_scm_rights(&[sent_fd]));
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 0);
 
             // Receiver: read the cmsg back out of the pooled control buffer.
-            let mut rcv = MsgMut::new(ctx).unwrap();
+            let mut rcv = MsgMut::new().unwrap();
             let n = recvmsg(ctx, b, &mut rcv, 0).await.unwrap();
             assert_eq!(n, 0);
 
@@ -559,7 +559,7 @@ fn block_on_fd_passing_with_data() {
     block_on(
         rt(),
         |ctx, _rt, (a, b, sent_fd): (i32, i32, i32)| async move {
-            let mut snd = Msg::new(ctx).unwrap();
+            let mut snd = Msg::new().unwrap();
             snd.push_iov(libc::iovec {
                 iov_base: b"x".as_ptr().cast_mut().cast(),
                 iov_len: 1,
@@ -568,7 +568,7 @@ fn block_on_fd_passing_with_data() {
             let n = sendmsg(ctx, a, &mut snd).await.unwrap();
             assert_eq!(n, 1);
 
-            let mut rcv = MsgMut::new(ctx).unwrap();
+            let mut rcv = MsgMut::new().unwrap();
             let mut buf = [0u8; 16];
             rcv.push_iov(libc::iovec {
                 iov_base: buf.as_mut_ptr().cast(),
@@ -647,6 +647,7 @@ fn block_on_write_to_file() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
+    use coio::alloc_bytes;
     use coio::io::write;
 
     let mut file = tmpfile();
@@ -661,7 +662,7 @@ fn block_on_write_to_file() {
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = ctx.alloc_bytes(5).unwrap();
+            let mut wb = alloc_bytes(5).unwrap();
             wb.as_mut()[..5].copy_from_slice(b"hello");
             wb.set_len(5);
             let n = write(ctx, fd, wb.into_bytes()).await.unwrap();
@@ -683,6 +684,7 @@ fn block_on_write_full_slot() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
+    use coio::alloc_bytes;
     use coio::io::write;
 
     // The whole slot (buf_size) can be used for a single write.
@@ -698,7 +700,7 @@ fn block_on_write_full_slot() {
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = ctx.alloc_bytes(16).unwrap();
+            let mut wb = alloc_bytes(16).unwrap();
             assert_eq!(wb.capacity(), 16);
             wb.as_mut().fill(0xAB);
             wb.set_len(16);
@@ -721,6 +723,7 @@ fn block_on_write_many_recycles() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
+    use coio::alloc_bytes;
     use coio::io::write;
 
     // More writes than the pool holds, exercising slot recycling.
@@ -738,7 +741,7 @@ fn block_on_write_many_recycles() {
         rt,
         |ctx, _rt, fd| async move {
             for i in 0..8u32 {
-                let mut wb = ctx.alloc_bytes(8).unwrap();
+                let mut wb = alloc_bytes(8).unwrap();
                 let payload = format!("chunk{i:03}");
                 wb.as_mut()[..8].copy_from_slice(payload.as_bytes());
                 wb.set_len(8);
@@ -802,6 +805,7 @@ fn block_on_write_uses_proportional_levels() {
     use std::io::SeekFrom;
     use std::os::fd::AsRawFd;
 
+    use coio::alloc_bytes;
     use coio::io::write;
 
     // An 11-byte write needs the 64-byte level; its capacity is 64.
@@ -820,7 +824,7 @@ fn block_on_write_uses_proportional_levels() {
     block_on(
         rt,
         |ctx, _rt, fd| async move {
-            let mut wb = ctx.alloc_bytes(11).unwrap();
+            let mut wb = alloc_bytes(11).unwrap();
             assert_eq!(wb.capacity(), 64);
             wb.as_mut()[..11].copy_from_slice(b"hello world");
             wb.set_len(11);
@@ -865,6 +869,8 @@ fn block_on_read_oversized_errors() {
 fn block_on_alloc_bytes_oversized_errors() {
     use std::os::fd::AsRawFd;
 
+    use coio::alloc_bytes;
+
     let file = tmpfile();
     let fd = file.as_raw_fd();
 
@@ -876,8 +882,8 @@ fn block_on_alloc_bytes_oversized_errors() {
     };
     block_on(
         rt,
-        |ctx, _rt, _fd| async move {
-            let err = ctx.alloc_bytes(17).err().unwrap();
+        |_ctx, _rt, _fd| async move {
+            let err = alloc_bytes(17).err().unwrap();
             assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
         },
         fd,

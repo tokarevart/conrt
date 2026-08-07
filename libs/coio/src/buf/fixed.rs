@@ -69,7 +69,7 @@ impl FixedSlab {
     /// Pops a free slot and marks it exclusively borrowed (`−1`). Returns
     /// `None` when the class is exhausted. This is the root of an exclusive
     /// view, e.g. a `BytesMut` handed to
-    /// [`crate::task::TaskContext::alloc_bytes`].
+    /// [`crate::buf::alloc_bytes`].
     pub fn acquire_slot(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
         self.tracker.take_exclusive(local);
@@ -78,7 +78,7 @@ impl FixedSlab {
 
     /// Pops a free slot and marks it shared (`+1`). This is the root of a
     /// shared view, e.g. the `Ref` handed to
-    /// [`crate::task::TaskContext::alloc`] for pooled op arguments.
+    /// [`crate::buf::alloc`] for pooled op arguments.
     pub fn acquire_slot_shared(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
         self.tracker.take_shared(local);

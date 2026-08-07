@@ -15,10 +15,6 @@ use std::num::NonZeroU64;
 
 use io_uring::squeue;
 
-use crate::buf::Bytes;
-use crate::buf::BytesMut;
-use crate::buf::Ref;
-use crate::buf::RefMut;
 use crate::runtime;
 use crate::runtime::Runtime;
 
@@ -383,92 +379,6 @@ impl TaskContext {
             panic!("invalid TaskContext: {e}");
         }
         runtime::with_runtime(f)
-    }
-
-    /// Allocates a slot of pooled op-argument memory for `T` from the
-    /// runtime's fixed buffer slab, or `None` when the size class is exhausted
-    /// or no size class fits `T`. Panics if `T` is zero-sized: a ZST needs no
-    /// pinned memory. The slot is uninitialized; initialize it through the
-    /// returned `Ref<MaybeUninit<T>>` before use. The slot is recycled when
-    /// the allocation is dropped.
-    ///
-    /// The view is shared ([`Ref`]): the slot counts one shared borrower, so
-    /// the allocation can be cloned (each clone adds a borrower) or upgraded
-    /// to an exclusive [`RefMut`] while it is the sole holder. This is the
-    /// root of the shared views the task's [`crate::io::Msg`] arguments use.
-    pub fn alloc<T>(&self) -> Option<Ref<MaybeUninit<T>>> {
-        assert!(
-            core::mem::size_of::<T>() > 0,
-            "alloc: zero-sized types cannot be pooled"
-        );
-        self.with_runtime(|r| {
-            let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
-            r.fixed_pool.acquire_ref::<MaybeUninit<T>>(class)
-        })
-    }
-
-    /// Allocates a slot of pooled op-argument memory for `T` as an exclusive
-    /// view, or `None` when the size class is exhausted or no size class fits
-    /// `T`. The mutable counterpart of [`TaskContext::alloc`]: the slot records
-    /// an exclusive borrow, so the returned [`RefMut`] cannot be cloned and
-    /// converts to a shared [`Ref`] with [`RefMut::into_ref`] while it is the
-    /// sole holder. This is the root of the exclusive views the
-    /// [`crate::io::Msg`]/[`crate::io::MsgMut`] arguments use. Panics if `T`
-    /// is zero-sized.
-    pub fn alloc_mut<T>(&self) -> Option<RefMut<MaybeUninit<T>>> {
-        assert!(
-            core::mem::size_of::<T>() > 0,
-            "alloc_mut: zero-sized types cannot be pooled"
-        );
-        self.with_runtime(|r| {
-            let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
-            r.fixed_pool.acquire_mut::<MaybeUninit<T>>(class)
-        })
-    }
-
-    /// Allocates a zero-copy buffer backed by a slot from the runtime's fixed
-    /// buffer slab. The buffer is drawn from the smallest size class whose
-    /// slot size is at least `size`; `size` larger than the largest class's
-    /// slot size fails with `EFBIG`. The buffer's [`BytesMut::capacity`] is
-    /// the chosen class's slot size; the caller fills it via
-    /// [`BytesMut::as_mut`] and records the length with
-    /// [`BytesMut::set_len`] before passing it to [`crate::io::write`]. The
-    /// slot is recycled when the buffer is dropped.
-    pub fn alloc_bytes(&self, size: usize) -> io::Result<BytesMut> {
-        self.with_runtime(|r| -> io::Result<BytesMut> {
-            let class = r
-                .fixed_pool
-                .class_for(size)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-            r.fixed_pool
-                .acquire_bytes_mut(class)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOMEM))
-        })
-    }
-
-    /// Adopts a provided buffer the kernel just selected for a completed
-    /// `IOSQE_BUFFER_SELECT` op into a shared [`Bytes`] view, so a task can
-    /// build its own buffer-selecting ops on top of [`crate::io::read`].
-    /// `class` is the provided size-class index, `local` the buffer id the
-    /// kernel reported via `cqueue::buffer_select`, and `len` the number of
-    /// bytes the op produced.
-    ///
-    /// The view borrows the slot from its slab: the buffer stays out of the
-    /// ring until the last view drops. A shared [`Bytes`] can be upgraded to
-    /// an exclusive [`BytesMut`] with [`Bytes::into_mut`] while it is the sole
-    /// holder, and dropped back to the ring either way.
-    ///
-    /// # Panics
-    ///
-    /// - `local` must be the buffer id of a *just-completed* `BUFFER_SELECT` op
-    ///   on class `class`'s buffer group, so the buffer has left the ring and
-    ///   no other view of it is alive (a double selection panics).
-    /// - `len` must not exceed the class's slot size.
-    ///
-    /// Everything else is checked: `class` out of range panics, and using the
-    /// returned view outside the runtime that owns it panics on access.
-    pub fn provided_bytes(&self, class: u8, local: u16, len: u32) -> Bytes {
-        self.with_runtime(|r| r.provided_pool.select(class, local, len))
     }
 
     pub fn wake(&self) {

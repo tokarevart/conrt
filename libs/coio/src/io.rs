@@ -14,6 +14,8 @@ use std::os::fd::RawFd;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
+use crate::buf::alloc_mut;
+use crate::buf::provided_bytes;
 use crate::task::TaskContext;
 
 /// Submits `entry` for the caller's task and awaits its CQE result, releasing
@@ -86,7 +88,7 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Byt
     // The kernel handed `local` to the just-completed BUFFER_SELECT read
     // above, and `result` is the number of bytes it produced, which fits in
     // the class's slot size.
-    Ok(ctx.provided_bytes(class, local, result as u32))
+    Ok(provided_bytes(class, local, result as u32))
 }
 
 /// Writes the contents of `buf` to `fd` via `IORING_OP_WRITE_FIXED`. The
@@ -177,16 +179,13 @@ impl Msg {
     /// pool cannot serve a requested allocation (a size class is exhausted).
     /// The lengths start at zero: data is declared by pushing with
     /// [`Msg::push_iov`], [`Msg::push_cmsg`] and [`Msg::push_scm_rights`].
-    pub fn new(ctx: TaskContext) -> Option<Self> {
-        let msg: RefMut<libc::msghdr> = unsafe { ctx.alloc_mut::<libc::msghdr>()?.cast() };
+    pub fn new() -> Option<Self> {
+        let msg: RefMut<libc::msghdr> = unsafe { alloc_mut::<libc::msghdr>()?.cast() };
         let iov = unsafe {
-            ctx.alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
+            alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
                 .cast::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()
         };
-        let ctrl = unsafe {
-            ctx.alloc_mut::<[u8; MAX_CTRL_CAP]>()?
-                .cast::<[u8; MAX_CTRL_CAP]>()
-        };
+        let ctrl = unsafe { alloc_mut::<[u8; MAX_CTRL_CAP]>()?.cast::<[u8; MAX_CTRL_CAP]>() };
 
         unsafe {
             let msg = msg.as_ptr().as_mut();
@@ -327,16 +326,13 @@ impl MsgMut {
     /// pool cannot serve a requested allocation (a size class is exhausted).
     /// The lengths start at zero: receive buffers are declared with
     /// [`MsgMut::push_iov`].
-    pub fn new(ctx: TaskContext) -> Option<Self> {
-        let msg: RefMut<libc::msghdr> = unsafe { ctx.alloc_mut::<libc::msghdr>()?.cast() };
+    pub fn new() -> Option<Self> {
+        let msg: RefMut<libc::msghdr> = unsafe { alloc_mut::<libc::msghdr>()?.cast() };
         let iov = unsafe {
-            ctx.alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
+            alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
                 .cast::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()
         };
-        let ctrl = unsafe {
-            ctx.alloc_mut::<[u8; MAX_CTRL_CAP]>()?
-                .cast::<[u8; MAX_CTRL_CAP]>()
-        };
+        let ctrl = unsafe { alloc_mut::<[u8; MAX_CTRL_CAP]>()?.cast::<[u8; MAX_CTRL_CAP]>() };
 
         unsafe {
             let msg = msg.as_ptr().as_mut();
