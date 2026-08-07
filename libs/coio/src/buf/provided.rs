@@ -1,20 +1,20 @@
-//! Provided buffer ring (`IORING_REGISTER_PBUF_RING`) support.
+//! Provided buffer ring slab (`IORING_REGISTER_PBUF_RING`) support.
 //!
-//! A [`ProvidedBufferPool`] describes one size class of buffers: a descriptor
-//! ring for `count` fixed-size slots that live inside the runtime's shared
-//! buffer slab. The pool does not own the slab. The caller must
-//! [`ProvidedBufferPool::register`] it with an `io_uring` instance before use
-//! and [`ProvidedBufferPool::unregister`] it before the ring is closed. Reads
-//! submitted with `IOSQE_BUFFER_SELECT` let the kernel pick a buffer from the
-//! pool and report which one via `cqueue::buffer_select`; the caller must then
-//! recycle the buffer back into the pool.
+//! A [`ProvidedSlab`] is one size class of buffers: a descriptor ring for
+//! `count` fixed-size slots that live inside the runtime's shared buffer slab.
+//! The slab does not own that backing memory. The caller must
+//! [`ProvidedSlab::register`] it with an `io_uring` instance before use and
+//! [`ProvidedSlab::unregister`] it before the ring is closed. Reads submitted
+//! with `IOSQE_BUFFER_SELECT` let the kernel pick a buffer from the slab and
+//! report which one via `cqueue::buffer_select`; the caller must then recycle
+//! the buffer back into the slab.
 //!
 //! Borrow tracking: the kernel consumes a buffer when it selects one, and the
-//! pool hands it out as a view (the `Bytes` returned by
-//! [`crate::io::read`]). The shared [`BorrowTracker`] records the hand-off
-//! (`0 → +1`); the count is positive while shared views hold the buffer and
-//! negative while exclusive views do. Each drop of a view releases one
-//! borrower, and the buffer returns to the ring when the count hits zero.
+//! slab hands it out as a view (the `Bytes` returned by [`crate::io::read`]).
+//! The shared [`BorrowTracker`] records the hand-off (`0 → +1`); the count is
+//! positive while shared views hold the buffer and negative while exclusive
+//! views do. Each drop of a view releases one borrower, and the buffer returns
+//! to the ring when the count hits zero.
 
 use std::alloc::Layout;
 use std::alloc::alloc_zeroed;
@@ -32,8 +32,8 @@ use crate::buf::Ref;
 use crate::buf::RefMut;
 use crate::buf::Slice;
 use crate::buf::SliceMut;
+use crate::buf::tracker::BorrowTracker;
 use crate::classes::pack_bid;
-use crate::pool::BorrowTracker;
 use crate::runtime::active_gen;
 
 const PAGE_SIZE: usize = 4096;
@@ -65,7 +65,7 @@ struct IoUringBufRingHeader {
     tail: AtomicU16,
 }
 
-pub struct ProvidedBufferPool {
+pub struct ProvidedSlab {
     buf_count: u16,
     size: u32,
     /// The start of this class's slot 0 within the shared slab, aligned to
@@ -76,16 +76,16 @@ pub struct ProvidedBufferPool {
     ring_ptr: NonNull<u8>,
     ring_size: usize,
     tail: u16,
-    /// Per-slot borrow counts shared with the fixed pools.
+    /// Per-slot borrow counts shared with the fixed slabs.
     pub(crate) tracker: BorrowTracker,
 }
 
-impl ProvidedBufferPool {
+impl ProvidedSlab {
     /// Creates a provided-buffer ring for `count` buffers of `size` bytes,
     /// backed by the `count * size` bytes of the caller-owned slab starting at
     /// `slab_base` (which must point at the class's slot 0 and be aligned to
     /// `min(size, BUFFER_MAX_ALIGN)`). Does not register the ring with any
-    /// `io_uring`; call [`ProvidedBufferPool::register`] to publish the
+    /// `io_uring`; call [`ProvidedSlab::register`] to publish the
     /// buffers under `bgid`. `count` must be a power of two.
     pub fn new(slab_base: NonNull<u8>, count: u16, size: u32, class: u8) -> Self {
         assert!(count.is_power_of_two());
@@ -127,9 +127,9 @@ impl ProvidedBufferPool {
         }
     }
 
-    /// Registers the pool with `ring`, publishing all buffers to the kernel
-    /// under the pool's fixed buffer group. Must be called before reads with
-    /// `IOSQE_BUFFER_SELECT` can use the pool.
+    /// Registers the slab with `ring`, publishing all buffers to the kernel
+    /// under the slab's fixed buffer group. Must be called before reads with
+    /// `IOSQE_BUFFER_SELECT` can use the slab.
     pub fn register(&self, ring: &IoUring) -> io::Result<()> {
         unsafe {
             ring.submitter().register_buf_ring_with_flags(
@@ -141,7 +141,7 @@ impl ProvidedBufferPool {
         }
     }
 
-    /// Unregisters the pool from `ring`. Must be called before the pool is
+    /// Unregisters the slab from `ring`. Must be called before the slab is
     /// dropped and the ring is closed.
     pub fn unregister(&self, ring: &IoUring) -> io::Result<()> {
         ring.submitter().unregister_buf_ring(self.class as _)
@@ -275,7 +275,7 @@ impl ProvidedBufferPool {
     }
 }
 
-impl Drop for ProvidedBufferPool {
+impl Drop for ProvidedSlab {
     fn drop(&mut self) {
         unsafe {
             dealloc(
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn pbuf_ring_select_and_recycle() {
+    fn provided_ring_select_and_recycle() {
         const BUF_SIZE: u32 = 16;
         const BUF_COUNT: u16 = 4;
         const BGID: u8 = 0;
@@ -315,10 +315,10 @@ mod tests {
         assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
 
         let mut ring = io_uring::IoUring::new(8).unwrap();
-        let mut slab = vec![0u8; BUF_COUNT as usize * BUF_SIZE as usize];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, BUF_COUNT, BUF_SIZE, BGID);
-        pool.register(&ring).unwrap();
+        let mut backing = vec![0u8; BUF_COUNT as usize * BUF_SIZE as usize];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, BUF_COUNT, BUF_SIZE, BGID);
+        slab.register(&ring).unwrap();
 
         let read_entry = || {
             io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), BUF_SIZE)
@@ -335,98 +335,98 @@ mod tests {
             let cqe = ring.completion().next().unwrap();
             assert_eq!(cqe.result(), 11);
             let bid = io_uring::cqueue::buffer_select(cqe.flags()).expect("no buffer selected");
-            assert_eq!(pool.get_slice(bid, 11), b"hello world");
-            pool.recycle_buffer(bid);
+            assert_eq!(slab.get_slice(bid, 11), b"hello world");
+            slab.recycle_buffer(bid);
         }
 
         unsafe { libc::close(fd) };
 
-        pool.unregister(&ring).unwrap();
+        slab.unregister(&ring).unwrap();
     }
 
     #[test]
-    fn pbuf_borrow_tracks_selection_and_release() {
-        let mut slab = vec![0u8; 4 * 16];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, 4, 16, 0);
+    fn provided_borrow_tracks_selection_and_release() {
+        let mut backing = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, 4, 16, 0);
 
-        assert_eq!(pool.tracker.borrows(1), 0);
-        pool.tracker.take_shared(1);
-        assert_eq!(pool.tracker.borrows(1), 1);
-        assert_eq!(pool.ring_tail(), 4);
+        assert_eq!(slab.tracker.borrows(1), 0);
+        slab.tracker.take_shared(1);
+        assert_eq!(slab.tracker.borrows(1), 1);
+        assert_eq!(slab.ring_tail(), 4);
         // A cloned view holds a second borrower; the buffer stays out of the
         // ring until both drop.
-        pool.tracker.clone_shared(1);
-        assert_eq!(pool.tracker.borrows(1), 2);
-        pool.drop_view(false, 1);
-        assert_eq!(pool.tracker.borrows(1), 1);
-        assert_eq!(pool.ring_tail(), 4);
-        pool.drop_view(false, 1);
-        assert_eq!(pool.tracker.borrows(1), 0);
-        assert_eq!(pool.ring_tail(), 5);
+        slab.tracker.clone_shared(1);
+        assert_eq!(slab.tracker.borrows(1), 2);
+        slab.drop_view(false, 1);
+        assert_eq!(slab.tracker.borrows(1), 1);
+        assert_eq!(slab.ring_tail(), 4);
+        slab.drop_view(false, 1);
+        assert_eq!(slab.tracker.borrows(1), 0);
+        assert_eq!(slab.ring_tail(), 5);
     }
 
     #[test]
-    fn pbuf_upgrade_downgrade_roundtrip() {
-        let mut slab = vec![0u8; 4 * 16];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, 4, 16, 0);
+    fn provided_upgrade_downgrade_roundtrip() {
+        let mut backing = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, 4, 16, 0);
 
-        pool.tracker.take_shared(1);
-        pool.tracker.upgrade(1);
-        assert_eq!(pool.tracker.borrows(1), -1);
+        slab.tracker.take_shared(1);
+        slab.tracker.upgrade(1);
+        assert_eq!(slab.tracker.borrows(1), -1);
         // The buffer stays out of the ring through the exclusive phase.
-        assert_eq!(pool.ring_tail(), 4);
-        pool.tracker.downgrade(1);
-        assert_eq!(pool.tracker.borrows(1), 1);
-        pool.drop_view(false, 1);
-        assert_eq!(pool.tracker.borrows(1), 0);
-        assert_eq!(pool.ring_tail(), 5);
+        assert_eq!(slab.ring_tail(), 4);
+        slab.tracker.downgrade(1);
+        assert_eq!(slab.tracker.borrows(1), 1);
+        slab.drop_view(false, 1);
+        assert_eq!(slab.tracker.borrows(1), 0);
+        assert_eq!(slab.ring_tail(), 5);
     }
 
     #[test]
-    fn pbuf_exclusive_split_and_release() {
-        let mut slab = vec![0u8; 4 * 16];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, 4, 16, 0);
+    fn provided_exclusive_split_and_release() {
+        let mut backing = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, 4, 16, 0);
 
-        pool.tracker.take_shared(1);
-        pool.tracker.upgrade(1);
-        pool.tracker.split_exclusive(1);
-        assert_eq!(pool.tracker.borrows(1), -2);
+        slab.tracker.take_shared(1);
+        slab.tracker.upgrade(1);
+        slab.tracker.split_exclusive(1);
+        assert_eq!(slab.tracker.borrows(1), -2);
         // An exclusive release of one split half still leaves a holder.
-        pool.drop_view(true, 1);
-        assert_eq!(pool.tracker.borrows(1), -1);
-        assert_eq!(pool.ring_tail(), 4);
-        pool.drop_view(true, 1);
-        assert_eq!(pool.tracker.borrows(1), 0);
-        assert_eq!(pool.ring_tail(), 5);
+        slab.drop_view(true, 1);
+        assert_eq!(slab.tracker.borrows(1), -1);
+        assert_eq!(slab.ring_tail(), 4);
+        slab.drop_view(true, 1);
+        assert_eq!(slab.tracker.borrows(1), 0);
+        assert_eq!(slab.ring_tail(), 5);
     }
 
     #[test]
-    fn pbuf_double_selection_panics() {
-        let mut slab = vec![0u8; 4 * 16];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, 4, 16, 0);
-        pool.tracker.take_shared(0);
+    fn provided_double_selection_panics() {
+        let mut backing = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, 4, 16, 0);
+        slab.tracker.take_shared(0);
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pool.tracker.take_shared(0);
+                slab.tracker.take_shared(0);
             }))
             .is_err()
         );
     }
 
     #[test]
-    fn pbuf_select_outside_runtime_panics() {
-        let mut slab = vec![0u8; 4 * 16];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        let mut pool = ProvidedBufferPool::new(base, 4, 16, 0);
+    fn provided_select_outside_runtime_panics() {
+        let mut backing = vec![0u8; 4 * 16];
+        let base = unsafe { NonNull::new_unchecked(backing.as_mut_ptr()) };
+        let mut slab = ProvidedSlab::new(base, 4, 16, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool.select(1, 5);
+            slab.select(1, 5);
         }));
         assert!(result.is_err());
         // The panic fired before any borrow was registered.
-        assert_eq!(pool.tracker.borrows(1), 0);
+        assert_eq!(slab.tracker.borrows(1), 0);
     }
 }

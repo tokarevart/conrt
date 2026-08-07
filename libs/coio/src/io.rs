@@ -55,7 +55,7 @@ fn release_io(ctx: TaskContext, slot: u32) {
 /// size class whose slot size is at least `max_len`; `max_len` larger than
 /// the largest class's slot size fails with `EFBIG`.
 ///
-/// The returned [`Bytes`] borrows the selected slot from the pool: the slot is
+/// The returned [`Bytes`] borrows the selected slot from its slab: the slot is
 /// recycled back to the ring when the last view is dropped, so the runtime
 /// must still be alive while the buffer is in use.
 pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Bytes> {

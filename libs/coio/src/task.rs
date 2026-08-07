@@ -387,11 +387,11 @@ impl TaskContext {
     }
 
     /// Allocates a slot of pooled op-argument memory for `T` from the
-    /// runtime's fixed buffer slab, or `None` when the pool is exhausted or no
-    /// size class fits `T`. Panics if `T` is zero-sized: a ZST needs no pinned
-    /// memory. The slot is uninitialized; initialize it through the returned
-    /// `Ref<MaybeUninit<T>>` before use. The slot is recycled when the
-    /// allocation is dropped.
+    /// runtime's fixed buffer slab, or `None` when the size class is exhausted
+    /// or no size class fits `T`. Panics if `T` is zero-sized: a ZST needs no
+    /// pinned memory. The slot is uninitialized; initialize it through the
+    /// returned `Ref<MaybeUninit<T>>` before use. The slot is recycled when
+    /// the allocation is dropped.
     ///
     /// The view is shared ([`Ref`]): the slot counts one shared borrower, so
     /// the allocation can be cloned (each clone adds a borrower) or upgraded
@@ -409,9 +409,9 @@ impl TaskContext {
     }
 
     /// Allocates a slot of pooled op-argument memory for `T` as an exclusive
-    /// view, or `None` when the pool is exhausted or no size class fits `T`.
-    /// The mutable counterpart of [`TaskContext::alloc`]: the slot records an
-    /// exclusive borrow, so the returned [`RefMut`] cannot be cloned and
+    /// view, or `None` when the size class is exhausted or no size class fits
+    /// `T`. The mutable counterpart of [`TaskContext::alloc`]: the slot records
+    /// an exclusive borrow, so the returned [`RefMut`] cannot be cloned and
     /// converts to a shared [`Ref`] with [`RefMut::into_ref`] while it is the
     /// sole holder. This is the root of the exclusive views the
     /// [`crate::io::Msg`]/[`crate::io::MsgMut`] arguments use. Panics if `T`
@@ -452,7 +452,7 @@ impl TaskContext {
     /// kernel reported via `cqueue::buffer_select`, and `len` the number of
     /// bytes the op produced.
     ///
-    /// The view borrows the slot from the pool: the buffer stays out of the
+    /// The view borrows the slot from its slab: the buffer stays out of the
     /// ring until the last view drops. A shared [`Bytes`] can be upgraded to
     /// an exclusive [`BytesMut`] with [`Bytes::into_mut`] while it is the sole
     /// holder, and dropped back to the ring either way.

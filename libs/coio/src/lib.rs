@@ -7,7 +7,7 @@
 //! while the read view is the sole holder; writes take a [`BytesMut`] — from
 //! [`crate::task::TaskContext::alloc_bytes`] or upgraded from a read — and are
 //! submitted with `IORING_OP_WRITE_FIXED`. All views are borrow-tracked: a
-//! slot returns to its pool only when the last view is dropped.
+//! slot returns to its slab only when the last view is dropped.
 //!
 //! # Example
 //!
@@ -31,8 +31,6 @@
 mod buf;
 pub mod classes;
 pub mod io;
-mod pbuf;
-mod pool;
 pub mod runtime;
 pub mod task;
 

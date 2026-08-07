@@ -1,16 +1,17 @@
-//! Per-slot borrow accounting shared by the fixed and provided buffer pools.
+//! Per-slot borrow accounting shared by the fixed and provided buffer slabs.
 //!
-//! Both [`crate::buf::BufferPool`] and [`crate::pbuf::ProvidedBufferPool`]
-//! hand out views over slots of a shared slab and must track how many views
-//! (shared or exclusive) currently hold each slot, recycling it only when the
-//! last view drops. The transition logic is identical in both pools, so it
-//! lives here once: a `BorrowTracker` owns the per-slot count and every state
-//! change, and the pools decide what "recycle" means (`None` here — that is
-//! the pool's `drop_view` wrapper, which pushes the slot back to its free
-//! stack or kernel ring when `drop_view` reports the last release).
+//! Both [`crate::buf::fixed::FixedSlab`] and
+//! [`crate::buf::provided::ProvidedSlab`] hand out views over slots of a
+//! shared slab and must track how many views (shared or exclusive) currently
+//! hold each slot, recycling it only when the last view drops. The transition
+//! logic is identical in both slabs, so it lives here once: a `BorrowTracker`
+//! owns the per-slot count and every state change, and the slabs decide what
+//! "recycle" means (`None` here — that is the slab's `drop_view` wrapper,
+//! which pushes the slot back to its free stack or kernel ring when
+//! `drop_view` reports the last release).
 //!
 //! Slots are addressed by `u32` ids — the same width the packed `bid` carries
-//! (only the low 24 bits are used) — so the tracker needs no per-pool
+//! (only the low 24 bits are used) — so the tracker needs no per-slab
 //! knowledge of their narrower kernel-facing ids.
 
 pub(crate) struct BorrowTracker {
@@ -93,7 +94,7 @@ impl BorrowTracker {
     }
 
     /// Releases one borrower of `local`, returning `true` when the slot is
-    /// fully free again so the owning pool can recycle it. Panics on a count
+    /// fully free again so the owning slab can recycle it. Panics on a count
     /// mismatch (an over-release, a double-drop, or releasing the wrong kind
     /// of borrow).
     pub(crate) fn drop_view(&mut self, exclusive: bool, local: u32) -> bool {

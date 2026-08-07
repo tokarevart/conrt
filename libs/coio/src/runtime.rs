@@ -11,7 +11,8 @@ use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
 use std::ptr::NonNull;
 
-use crate::buf::BufferPool;
+use crate::buf::FixedSlab;
+use crate::buf::ProvidedSlab;
 use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::DEFAULT_SIZE_CLASSES;
 use crate::classes::SizeClass;
@@ -19,7 +20,6 @@ use crate::classes::bid_class;
 use crate::classes::bid_local;
 use crate::classes::bid_provided;
 use crate::classes::layout_classes;
-use crate::pbuf::ProvidedBufferPool;
 use crate::task::IoSlot;
 use crate::task::IoUserData;
 use crate::task::IoVec;
@@ -232,9 +232,9 @@ pub(crate) struct Runtime {
     /// The layout of the slab allocation, used to free it on drop.
     slab_layout: Layout,
     pub provided_classes: Vec<SizeClass>,
-    pub provided_pools: Vec<ProvidedBufferPool>,
+    pub provided_pools: Vec<ProvidedSlab>,
     pub fixed_classes: Vec<SizeClass>,
-    pub fixed_pools: Vec<BufferPool>,
+    pub fixed_pools: Vec<FixedSlab>,
     pub ring: io_uring::IoUring,
     pub make_fut: *const (),
 }
@@ -244,8 +244,8 @@ impl Drop for Runtime {
         // Unregister every provided buffer ring and the fixed write buffer
         // slab while the io_uring fd is still open; the pools and slabs are
         // dropped afterwards along with the other fields.
-        for pool in &self.provided_pools {
-            let _ = pool.unregister(&self.ring);
+        for slab in &self.provided_pools {
+            let _ = slab.unregister(&self.ring);
         }
         let _ = self.ring.submitter().unregister_buffers();
         unsafe { dealloc(self.slab.as_ptr(), self.slab_layout) };
@@ -459,9 +459,9 @@ type BuiltPools = (
     NonNull<u8>,
     Layout,
     Vec<SizeClass>,
-    Vec<ProvidedBufferPool>,
+    Vec<ProvidedSlab>,
     Vec<SizeClass>,
-    Vec<BufferPool>,
+    Vec<FixedSlab>,
 );
 
 /// Builds both directions' pools over one shared slab: the provided classes
@@ -523,15 +523,15 @@ fn build_pools(
     let mut provided_pools = Vec::with_capacity(provided_layout.len());
     for (i, l) in provided_layout.iter().enumerate() {
         let class_base = unsafe { base.as_ptr().add(l.base_offset as usize) };
-        let pool = ProvidedBufferPool::new(
+        let slab = ProvidedSlab::new(
             unsafe { NonNull::new_unchecked(class_base) },
             l.count as u16,
             l.size,
             i as _,
         );
-        pool.register(ring)
+        slab.register(ring)
             .expect("failed to register the provided buffer ring");
-        provided_pools.push(pool);
+        provided_pools.push(slab);
     }
 
     let fixed_classes: Vec<SizeClass> = fixed_layout
@@ -549,7 +549,7 @@ fn build_pools(
                 base.as_ptr()
                     .add((fixed_start + u64::from(l.base_offset)) as usize)
             };
-            BufferPool::new(
+            FixedSlab::new(
                 unsafe { NonNull::new_unchecked(class_base) },
                 l.size,
                 l.count,
@@ -908,9 +908,9 @@ mod tests {
         // largest size, or the 128-byte class would land 64 bytes off.
         let base = slab.as_ptr() as usize;
         assert_eq!(base % 128, 0, "slab base is aligned to the largest class");
-        for (class, pool) in provided_classes.iter().zip(&provided_pools) {
+        for (class, slab) in provided_classes.iter().zip(&provided_pools) {
             for local in 0..class.count {
-                let addr = pool.slot_ptr(local as u16).as_ptr() as usize;
+                let addr = slab.slot_ptr(local as u16).as_ptr() as usize;
                 assert_eq!(
                     addr % class.size as usize,
                     0,
@@ -919,9 +919,9 @@ mod tests {
                 );
             }
         }
-        for (class, pool) in fixed_classes.iter().zip(&fixed_pools) {
+        for (class, slab) in fixed_classes.iter().zip(&fixed_pools) {
             for local in 0..class.count {
-                let addr = pool.slot_ptr(local).as_ptr() as usize;
+                let addr = slab.slot_ptr(local).as_ptr() as usize;
                 assert_eq!(
                     addr % class.size.min(BUFFER_MAX_ALIGN) as usize,
                     0,
@@ -1778,7 +1778,7 @@ mod tests {
         let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         // SAFETY: a deliberately fabricated view over a never-borrowed slot
         // with a stale generation: resolve panics before touching memory and
-        // drop would leak the slot rather than corrupt the pool.
+        // drop would leak the slot rather than corrupt the slab.
         let alloc: Ref<MaybeUninit<[u8; 16]>> =
             unsafe { Ref::new(pack_bid(false, 0, 0), stale, 0) };
         let _ = alloc.as_ptr();
