@@ -32,7 +32,9 @@
 mod buf;
 pub mod classes;
 pub mod io;
+mod notify;
 pub mod runtime;
+mod select;
 pub mod task;
 
 pub use crate::buf::Bytes;
@@ -53,9 +55,18 @@ pub use crate::io::MsgMut;
 pub use crate::io::Yield;
 pub use crate::io::accept;
 pub use crate::io::read;
+pub use crate::io::read_exact;
 pub use crate::io::recvmsg;
 pub use crate::io::sendmsg;
 pub use crate::io::write;
+pub use crate::io::write_all;
 pub use crate::io::yield_now;
+pub use crate::notify::Notify;
+pub use crate::select::Select2;
+pub use crate::select::Select2Out;
+pub use crate::select::Select3;
+pub use crate::select::Select3Out;
+pub use crate::select::select2;
+pub use crate::select::select3;
 pub use crate::task::JoinFuture;
 pub use crate::task::JoinHandle;

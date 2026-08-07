@@ -644,11 +644,23 @@ where
 
         ready_tasks.clear();
 
-        if !rt.has_io_in_flight() {
-            if rt.wakeups.is_empty() {
-                break;
+        if !rt.wakeups.is_empty() {
+            // Tasks were woken during the poll pass (e.g. Notify or spawn):
+            // re-poll them promptly instead of blocking on the ring. Flush
+            // any submissions issued this pass so they reach the kernel.
+            match rt.ring.submit() {
+                Ok(_) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(_) => {
+                    return main_output
+                        .expect("block_on: submit failed before the main future completed");
+                }
             }
             continue;
+        }
+
+        if !rt.has_io_in_flight() {
+            break;
         }
 
         match rt.ring.submit_and_wait(1) {

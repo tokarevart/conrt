@@ -866,6 +866,376 @@ fn block_on_read_oversized_errors() {
 }
 
 #[test]
+fn block_on_notify_awaits_value() {
+    use coio::Notify;
+    use coio::runtime::RuntimeContext;
+
+    let n = Notify::new();
+    let out = block_on(
+        rt(),
+        {
+            let n = n.clone();
+            move |ctx, rtc: RuntimeContext<u32, u32>, role: u32| {
+                let n = n.clone();
+                async move {
+                    if role == 0 {
+                        // Main: register the wait, then have the spawned task
+                        // deliver the value across tasks.
+                        rtc.spawn(1);
+                        n.wait(ctx).await
+                    } else {
+                        n.notify(42);
+                        0
+                    }
+                }
+            }
+        },
+        0,
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn block_on_notify_before_wait() {
+    use coio::Notify;
+
+    // Notify before any wait: the value is stored and handed to the next
+    // `wait` on its first poll.
+    let n = Notify::new();
+    n.notify(7);
+    let out = block_on(
+        rt(),
+        {
+            let n = n.clone();
+            move |ctx, _rt, _role: u32| {
+                let n = n.clone();
+                async move { n.wait(ctx).await }
+            }
+        },
+        0,
+    );
+    assert_eq!(out, 7);
+}
+
+#[test]
+fn block_on_notify_dropped_waiter_noop() {
+    use coio::Notify;
+    use coio::runtime::RuntimeContext;
+    use coio::yield_now;
+
+    // The spawned waiter registers and then gets cancelled, dropping its
+    // `Wait` without completing. A later notify must be a no-op (no panic) and
+    // the value must be stored for the next wait.
+    let n = Notify::new();
+    let out = block_on(
+        rt(),
+        {
+            let n = n.clone();
+            move |ctx, rtc: RuntimeContext<(u32, i32), u32>, data: (u32, i32)| {
+                let n = n.clone();
+                async move {
+                    if data.0 == 0 {
+                        let handle = rtc.spawn((1, 0)).unwrap();
+                        yield_now(ctx).await;
+                        assert!(handle.cancel());
+                        assert_eq!(handle.join().await, None);
+                        n.notify(99);
+                        n.wait(ctx).await
+                    } else {
+                        n.wait(ctx).await
+                    }
+                }
+            }
+        },
+        (0, 0),
+    );
+    assert_eq!(out, 99);
+}
+
+#[test]
+fn block_on_notify_second_waiter_panics() {
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+
+    use coio::Notify;
+    use coio::runtime::RuntimeContext;
+
+    // Main registers the sole waiter; the spawned task's concurrent `wait` must
+    // panic instead of stealing the pending notification.
+    let n: Notify<u32> = Notify::new();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        block_on(
+            rt(),
+            {
+                let n = n.clone();
+                move |ctx, rtc: RuntimeContext<u32, ()>, role: u32| {
+                    let n = n.clone();
+                    async move {
+                        if role == 0 {
+                            rtc.spawn(1);
+                            let _ = n.wait(ctx).await;
+                        } else {
+                            let _ = n.wait(ctx).await;
+                        }
+                    }
+                }
+            },
+            0,
+        );
+    }));
+    assert!(result.is_err());
+}
+
+// ── read_exact / write_all ──────────────────────────────────────────
+
+#[test]
+fn block_on_read_exact_accumulates_file() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use coio::io::read_exact;
+
+    // Larger than 4096: read_exact must chunk at 4096 and accumulate the
+    // whole payload across multiple reads, ending with an exactly-len Bytes.
+    let mut file = tmpfile();
+    let payload = vec![0xABu8; 10_000];
+    file.write_all(&payload).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 16,
+        provided_size_classes: &[SizeClass { size: 64, count: 4 }, SizeClass {
+            size: 4096,
+            count: 8,
+        }],
+        size_classes: &[
+            SizeClass { size: 64, count: 4 },
+            SizeClass {
+                size: 4096,
+                count: 8,
+            },
+            SizeClass {
+                size: 16384,
+                count: 4,
+            },
+        ],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| {
+            let payload = payload.clone();
+            async move {
+                let data = read_exact(ctx, fd, 10_000).await.unwrap();
+                assert_eq!(data.len(), 10_000);
+                assert_eq!(data.as_ref(), payload.as_slice());
+            }
+        },
+        fd,
+    );
+}
+
+#[test]
+fn block_on_read_exact_eof_errors() {
+    use coio::io::read_exact;
+
+    // A pipe whose write end is closed after 5 bytes: the first read returns
+    // those, the second hits EOF before read_exact's length is reached.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (r, w) = (fds[0], fds[1]);
+    assert_eq!(unsafe { libc::write(w, b"hello".as_ptr().cast(), 5) }, 5);
+    unsafe { libc::close(w) };
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 8,
+        provided_size_classes: &[SizeClass { size: 64, count: 4 }],
+        size_classes: &[SizeClass { size: 64, count: 4 }],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, r| async move {
+            let err = read_exact(ctx, r, 6).await.err().unwrap();
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        },
+        r,
+    );
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn block_on_read_exact_short_reads_pipe() {
+    use coio::io::read_exact;
+
+    // A pipe pre-loaded with 3 bytes: the first read returns only those, the
+    // second blocks until the spawned writer appends the rest. Exercises the
+    // short-read accumulation path and the runtime's prompt re-polling of a
+    // woken task while another task's io is in flight.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (r, w) = (fds[0], fds[1]);
+    assert_eq!(unsafe { libc::write(w, b"hel".as_ptr().cast(), 3) }, 3);
+
+    let rt = RuntimeParams {
+        tasks_capacity: 8,
+        ring_entries: 8,
+        provided_size_classes: &[SizeClass { size: 64, count: 4 }],
+        size_classes: &[SizeClass { size: 64, count: 4 }],
+    };
+    block_on(
+        rt,
+        |ctx, rtc: RuntimeContext<(i32, i32), ()>, data: (i32, i32)| async move {
+            if data.1 == 0 {
+                // Spawned writer: supply the remaining two bytes.
+                unsafe { libc::write(data.0, b"lo".as_ptr().cast(), 2) };
+                unsafe { libc::close(data.0) };
+            } else {
+                // Main reader task.
+                rtc.spawn((w, 0));
+                let got = read_exact(ctx, r, 5).await.unwrap();
+                assert_eq!(got.as_ref(), b"hello");
+            }
+        },
+        (r, w),
+    );
+    unsafe { libc::close(r) };
+}
+
+#[test]
+fn block_on_write_all_file() {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::fd::AsRawFd;
+
+    use coio::alloc_bytes;
+    use coio::io::write_all;
+
+    let mut file = tmpfile();
+    let fd = file.as_raw_fd();
+
+    let rt = RuntimeParams {
+        tasks_capacity: 4,
+        ring_entries: 16,
+        provided_size_classes: &[SizeClass { size: 64, count: 4 }, SizeClass {
+            size: 4096,
+            count: 8,
+        }],
+        size_classes: &[
+            SizeClass { size: 64, count: 4 },
+            SizeClass {
+                size: 4096,
+                count: 8,
+            },
+            SizeClass {
+                size: 16384,
+                count: 4,
+            },
+        ],
+    };
+    block_on(
+        rt,
+        |ctx, _rt, fd| async move {
+            let mut wb = alloc_bytes(10_000).unwrap();
+            wb.as_mut().fill(0x5A);
+            wb.set_len(10_000);
+            write_all(ctx, fd, wb.into_bytes()).await.unwrap();
+        },
+        fd,
+    );
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, [0x5A; 10_000]);
+}
+
+#[test]
+fn block_on_write_all_partial_socket() {
+    use coio::alloc_bytes;
+    use coio::io::read;
+    use coio::io::write_all;
+
+    // A tiny send buffer forces the first write to return short, so write_all
+    // must loop; the spawned reader drains the socket while the writer is
+    // blocked, and the writer closes its end so the reader sees EOF.
+    let (a, b) = socketpair(true);
+    let small: libc::c_int = 1024;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                a,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&small as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        },
+        0
+    );
+
+    let total: usize = 8192;
+    let rt = RuntimeParams {
+        tasks_capacity: 8,
+        ring_entries: 16,
+        provided_size_classes: &[SizeClass { size: 16, count: 4 }, SizeClass {
+            size: 2048,
+            count: 2,
+        }],
+        size_classes: &[
+            SizeClass { size: 16, count: 4 },
+            SizeClass {
+                size: 2048,
+                count: 2,
+            },
+            SizeClass {
+                size: 16384,
+                count: 2,
+            },
+        ],
+    };
+    let written = block_on(
+        rt,
+        |ctx,
+         rtc: RuntimeContext<(i32, i32, usize, bool), usize>,
+         data: (i32, i32, usize, bool)| async move {
+            if data.3 {
+                // Main writer task.
+                let (a, b, total, _) = data;
+                let reader = rtc.spawn((b, -1, total, false)).unwrap();
+                let mut wb = alloc_bytes(total).unwrap();
+                wb.as_mut().fill(0x5A);
+                wb.set_len(total as u32);
+                write_all(ctx, a, wb.into_bytes()).await.unwrap();
+                unsafe { libc::close(a) };
+                let got = reader.join().await;
+                assert_eq!(got, Some(total));
+                total
+            } else {
+                // Spawned reader: drain until EOF.
+                let (b, _, _, _) = data;
+                let mut got = 0usize;
+                loop {
+                    let data = read(ctx, b, 2048).await.unwrap();
+                    if data.is_empty() {
+                        break;
+                    }
+                    got += data.len();
+                }
+                got
+            }
+        },
+        (a, b, total, true),
+    );
+    assert_eq!(written, total);
+    unsafe { libc::close(b) };
+}
+
+#[test]
 fn block_on_alloc_bytes_oversized_errors() {
     use std::os::fd::AsRawFd;
 

@@ -14,6 +14,7 @@ use std::os::fd::RawFd;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
+use crate::buf::alloc_bytes;
 use crate::buf::alloc_mut;
 use crate::buf::provided_bytes;
 use crate::task::TaskContext;
@@ -91,6 +92,38 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Byt
     Ok(provided_bytes(class, local, result as u32))
 }
 
+/// Reads exactly `len` bytes from `fd` into a freshly allocated
+/// [`BytesMut`](crate::buf::BytesMut), looping over short [`read`]s and
+/// chunking at 4096 bytes so large reads use the smaller, more plentiful
+/// provided size classes instead of draining the few 64 KiB slots. The
+/// accumulated bytes are returned as a shared [`Bytes`] of exactly `len`
+/// bytes.
+///
+/// Returns [`io::ErrorKind::UnexpectedEof`] if `fd` reaches end of file before
+/// `len` bytes were read; the partially accumulated buffer is dropped and its
+/// slot recycled.
+pub async fn read_exact(ctx: TaskContext, fd: RawFd, len: usize) -> io::Result<Bytes> {
+    let mut buf = alloc_bytes(len)?;
+    buf.clear();
+
+    while buf.len() < len {
+        let start = buf.len();
+        let chunk = (len - start).min(4096);
+        let bytes = read(ctx, fd, chunk).await?;
+        if bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read_exact: unexpected end of file",
+            ));
+        }
+        let n = bytes.len();
+        buf.set_len((start + n) as u32);
+        buf.as_mut()[start..start + n].copy_from_slice(&bytes);
+    }
+
+    Ok(buf.into_bytes())
+}
+
 /// Writes the contents of `buf` to `fd` via `IORING_OP_WRITE_FIXED`. The
 /// buffer's slot is held (its borrow not released) until the kernel finishes
 /// with it; `buf` is consumed and its slot recycled when it drops.
@@ -109,6 +142,30 @@ pub async fn write(ctx: TaskContext, fd: RawFd, buf: Bytes) -> io::Result<usize>
     let (slot, result) = submit_and_await(ctx, entry).await?;
     release_io(ctx, slot);
     Ok(result as usize)
+}
+
+/// Writes all of `buf` to `fd`, looping over short [`write()`]s. Each iteration
+/// hands the kernel a `Bytes::sub` view over the unwritten tail, so a partial
+/// write only ever resubmits the bytes that remain. `buf` is consumed and its
+/// slot recycled once every byte is written.
+///
+/// Returns [`io::ErrorKind::WriteZero`] if a nonempty write reports zero bytes
+/// written, which would otherwise loop forever.
+pub async fn write_all(ctx: TaskContext, fd: RawFd, buf: Bytes) -> io::Result<()> {
+    let total = buf.len();
+    let mut off = 0;
+    while off < total {
+        let view = buf.sub(off, total).expect("write_all: sub-slice in bounds");
+        let n = write(ctx, fd, view).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_all: wrote zero bytes",
+            ));
+        }
+        off += n;
+    }
+    Ok(())
 }
 
 /// Accepts a connection on `listener_fd`, returning the new socket's fd.
@@ -484,7 +541,35 @@ pub(crate) async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
         if let Some(result) = result {
             return result;
         }
-        yield_now(ctx).await;
+        yield_now_nowake().await;
+    }
+}
+
+/// Yields the current task back to the runtime loop without waking it: the
+/// first poll returns `Pending` without re-enqueuing the task, the next poll
+/// returns `Ready`. Used internally by [`await_cqe`] so a task parked on an
+/// in-flight op is only re-polled by an actual completion (via
+/// [`crate::runtime::Runtime::drain_cqes`]) or an explicit wake, instead of
+/// keeping itself enqueued and starving the runtime loop's blocking wait.
+pub(crate) fn yield_now_nowake() -> YieldNoWake {
+    YieldNoWake { polled: false }
+}
+
+/// The future returned by [`yield_now_nowake`].
+pub(crate) struct YieldNoWake {
+    pub(crate) polled: bool,
+}
+
+impl Future for YieldNoWake {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.polled {
+            Poll::Ready(())
+        } else {
+            self.polled = true;
+            Poll::Pending
+        }
     }
 }
 
