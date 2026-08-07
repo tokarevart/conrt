@@ -15,6 +15,7 @@ use crate::buf::FixedPool;
 use crate::buf::FixedSlab;
 use crate::buf::ProvidedPool;
 use crate::buf::ProvidedSlab;
+use crate::buf::pool::Slab;
 use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::DEFAULT_SIZE_CLASSES;
 use crate::classes::SizeClass;
@@ -116,19 +117,13 @@ pub(crate) fn current_task_index() -> Option<u32> {
 /// Resolves a view's guarded slot to the start of its memory plus the view's
 /// sub-slot byte `offset`. Panics when called outside the runtime that owns
 /// the slot.
-pub(crate) fn resolve_ptr(bid: u32, generation: NonZeroU32, offset: u32) -> *mut u8 {
+pub(crate) fn resolve_ptr(bid: u32, generation: NonZeroU32, offset: u32) -> NonNull<u8> {
     assert!(
         active_gen_matches(generation),
         "resolve_ptr called outside the runtime that owns this buffer"
     );
     with_runtime(|r| {
-        let class = bid_class(bid);
-        let local = bid_local(bid);
-        let base = if bid_provided(bid) {
-            r.provided_pool.slot_ptr(class, local).as_ptr()
-        } else {
-            r.fixed_pool.slot_ptr(class, local).as_ptr()
-        };
+        let base = r.with_slab(bid, |slab, local| slab.slot_ptr(local));
         unsafe { base.add(offset as usize) }
     })
 }
@@ -139,15 +134,7 @@ pub(crate) fn clone_view(bid: u32, generation: NonZeroU32) {
     if !active_gen_matches(generation) {
         return;
     }
-    with_runtime(|r| {
-        let class = bid_class(bid);
-        let local = bid_local(bid);
-        if bid_provided(bid) {
-            r.provided_pool.tracker_mut(class).clone_shared(local);
-        } else {
-            r.fixed_pool.tracker_mut(class).clone_shared(local);
-        }
-    })
+    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().clone_shared(local)))
 }
 
 /// Releases one borrower of a view's slot, recycling the slot when the last
@@ -157,15 +144,7 @@ pub(crate) fn drop_view(bid: u32, generation: NonZeroU32, exclusive: bool) {
     if !active_gen_matches(generation) {
         return;
     }
-    with_runtime(|r| {
-        let class = bid_class(bid);
-        let local = bid_local(bid);
-        if bid_provided(bid) {
-            r.provided_pool.drop_view(class, exclusive, local);
-        } else {
-            r.fixed_pool.drop_view(class, exclusive, local);
-        }
-    })
+    with_runtime(|r| r.with_slab(bid, |slab, local| slab.drop_view(exclusive, local)))
 }
 
 /// Flips a sole shared `Ref` to an exclusive `RefMut`. Panics unless the slot
@@ -175,15 +154,7 @@ pub(crate) fn upgrade_view(bid: u32, generation: NonZeroU32) {
         active_gen_matches(generation),
         "upgrade_view called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| {
-        let class = bid_class(bid);
-        let local = bid_local(bid);
-        if bid_provided(bid) {
-            r.provided_pool.tracker_mut(class).upgrade(local);
-        } else {
-            r.fixed_pool.tracker_mut(class).upgrade(local);
-        }
-    })
+    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().upgrade(local)))
 }
 
 /// Flips a sole exclusive `RefMut` to a shared `Ref`. Panics unless the slot
@@ -193,15 +164,7 @@ pub(crate) fn downgrade_view(bid: u32, generation: NonZeroU32) {
         active_gen_matches(generation),
         "downgrade_view called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| {
-        let class = bid_class(bid);
-        let local = bid_local(bid);
-        if bid_provided(bid) {
-            r.provided_pool.tracker_mut(class).downgrade(local);
-        } else {
-            r.fixed_pool.tracker_mut(class).downgrade(local);
-        }
-    })
+    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().downgrade(local)))
 }
 
 /// Runs a closure exactly once when dropped, even on panic unwind.
@@ -251,6 +214,18 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    /// Hands the closure the slab of the `bid`'s direction and class, plus its
+    /// slot local id, decoding `bid` once for all borrow operations.
+    pub(crate) fn with_slab<R>(&mut self, bid: u32, f: impl FnOnce(&mut dyn Slab, u32) -> R) -> R {
+        let class = bid_class(bid);
+        let local = bid_local(bid);
+        if bid_provided(bid) {
+            f(self.provided_pool.slab_mut(class), local)
+        } else {
+            f(self.fixed_pool.slab_mut(class), local)
+        }
+    }
+
     /// Allocates an io slab slot and marks it submitted. The slot is reused
     /// from the free list when available, otherwise the slab grows; it only
     /// ever holds in-flight ops, so it stays bounded by peak concurrency.
@@ -755,7 +730,6 @@ mod tests {
     use crate::buf::RefMut;
     use crate::buf::Slice;
     use crate::buf::SliceMut;
-    use crate::buf::pool::Slab;
     use crate::classes::SizeClass;
     use crate::classes::pack_bid;
     use crate::io::MAX_CTRL_CAP;
@@ -866,13 +840,16 @@ mod tests {
         // The provided region is 4 x 16 = 64 bytes; the fixed class starts
         // right after it in the same slab.
         let base = slab.as_ptr() as usize;
-        assert_eq!(provided_pool.slot_ptr(0, 3).as_ptr() as usize - base, 48);
-        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize - base, 64);
-        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize - base, 96);
+        assert_eq!(
+            provided_pool.slab(0).slot_ptr(3).as_ptr() as usize - base,
+            48
+        );
+        assert_eq!(fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize - base, 64);
+        assert_eq!(fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize - base, 96);
         // Every slot address is aligned to its class's buffer size.
-        assert_eq!(provided_pool.slot_ptr(0, 3).as_ptr() as usize % 16, 0);
-        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize % 32, 0);
-        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize % 32, 0);
+        assert_eq!(provided_pool.slab(0).slot_ptr(3).as_ptr() as usize % 16, 0);
+        assert_eq!(fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize % 32, 0);
+        assert_eq!(fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize % 32, 0);
     }
 
     #[test]
@@ -928,15 +905,21 @@ mod tests {
         // to their full size, since alignment never exceeds one page.
         let base = slab.as_ptr() as usize;
         assert_eq!(base % 4096, 0, "slab base is aligned to at most one page");
-        assert_eq!(fixed_pool.slot_ptr(0, 0).as_ptr() as usize - base, 4096);
-        assert_eq!(fixed_pool.slot_ptr(0, 1).as_ptr() as usize - base, 12288);
+        assert_eq!(
+            fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize - base,
+            4096
+        );
+        assert_eq!(
+            fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize - base,
+            12288
+        );
         for local in 0..2 {
-            let addr = fixed_pool.slot_ptr(0, local).as_ptr() as usize;
+            let addr = fixed_pool.slab(0).slot_ptr(local).as_ptr() as usize;
             assert_eq!(addr % 4096, 0, "slot {local} is page-aligned");
         }
         // Small classes still get full alignment to their own size.
         for local in 0..4 {
-            let addr = provided_pool.slot_ptr(0, local).as_ptr() as usize;
+            let addr = provided_pool.slab(0).slot_ptr(local).as_ptr() as usize;
             assert_eq!(addr % 16, 0, "provided slot {local} is 16-byte aligned");
         }
     }
@@ -959,9 +942,21 @@ mod tests {
         let buf = data.provided_pool.select(0, local, 5);
 
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            1
+        );
         drop(buf);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            0
+        );
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
@@ -979,7 +974,10 @@ mod tests {
 
         let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
         let local = 1u16;
-        data.provided_pool.tracker_mut(0).take_shared(local as _);
+        data.provided_pool
+            .slab_mut(0)
+            .tracker_mut()
+            .take_shared(local as _);
         // SAFETY: take_shared above registered a shared borrow on the slot,
         // so 5 bytes stay within the class-0 slot size.
         let buf: Slice<u8> = unsafe {
@@ -1029,22 +1027,46 @@ mod tests {
 
         let local = 1u16;
         let buf = data.provided_pool.select(0, local, 5);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            1
+        );
 
         // Upgrade to an exclusive, writable view.
         let mut buf = buf.into_mut();
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            -1
+        );
         assert_eq!(buf.capacity(), 16);
         buf.as_mut()[..5].copy_from_slice(b"hello");
         buf.set_len(5);
 
         // Downgrade back to a shared read buffer and read the data back.
         let buf = buf.into_bytes();
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            1
+        );
         assert_eq!(buf.as_ref(), b"hello");
 
         drop(buf);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            0
+        );
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
@@ -1064,12 +1086,30 @@ mod tests {
         let buf = data.provided_pool.select(0, local, 5);
         let buf = buf.into_mut();
         let (head, tail) = buf.split_at(2).unwrap();
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -2);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            -2
+        );
         drop(head);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            -1
+        );
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
         drop(tail);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            0
+        );
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
@@ -1087,14 +1127,29 @@ mod tests {
 
         let local = 1u16;
         let buf = data.provided_pool.select(0, local, 5);
-        data.provided_pool.tracker_mut(0).clone_shared(local as _);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 2);
+        data.provided_pool
+            .slab_mut(0)
+            .tracker_mut()
+            .clone_shared(local as _);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            2
+        );
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.into_mut()));
         assert!(result.is_err());
         // The failed upgrade left the borrows intact; the unwind dropped
         // `buf`, releasing one of the two shared holders.
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            1
+        );
     }
 
     #[test]
@@ -1111,13 +1166,25 @@ mod tests {
 
         let local = 1u16;
         let mut buf = data.provided_pool.select_mut(0, local, 5);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), -1);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            -1
+        );
         assert_eq!(buf.capacity(), 16);
         assert_eq!(buf.len(), 5);
         buf.as_mut()[..5].copy_from_slice(b"hello");
 
         drop(buf);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(local as _), 0);
+        assert_eq!(
+            data.provided_pool
+                .slab_mut(0)
+                .tracker_mut()
+                .borrows(local as _),
+            0
+        );
         assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
     }
 
@@ -1139,7 +1206,7 @@ mod tests {
         }));
         assert!(result.is_err());
         drop(buf);
-        assert_eq!(data.provided_pool.tracker_mut(0).borrows(1), 0);
+        assert_eq!(data.provided_pool.slab_mut(0).tracker_mut().borrows(1), 0);
     }
 
     // ── BytesMut ─────────────────────────────────────────────────────
@@ -1203,9 +1270,9 @@ mod tests {
         let view: Ref<[u8; 16]> = data.fixed_pool.acquire_ref(0).unwrap();
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         let cloned = view.clone();
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 2);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 2);
         drop(cloned);
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         drop(view);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
@@ -1225,7 +1292,7 @@ mod tests {
         let before = data.fixed_pool.slab(0).free_count();
         let view: RefMut<[u8; 16]> = data.fixed_pool.acquire_mut(0).unwrap();
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), -1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), -1);
         drop(view);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
@@ -1781,16 +1848,16 @@ mod tests {
 
         let before = data.fixed_pool.slab(0).free_count();
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         let clone = alloc.clone();
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 2);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 2);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(alloc);
         // One borrower left: the slot is still held by the clone.
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
         drop(clone);
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 0);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 0);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }
 
@@ -1808,11 +1875,11 @@ mod tests {
 
         let before = data.fixed_pool.slab(0).free_count();
         let alloc = ctx.alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         let exclusive = alloc.into_mut();
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), -1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), -1);
         let shared: Ref<[u8; 8]> = unsafe { exclusive.into_ref().cast() };
-        assert_eq!(data.fixed_pool.tracker_mut(0).borrows(0), 1);
+        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
         drop(shared);
         assert_eq!(data.fixed_pool.slab(0).free_count(), before);
     }

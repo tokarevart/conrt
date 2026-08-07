@@ -35,11 +35,11 @@ use core::marker::PhantomData;
 use core::num::NonZeroU32;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::ptr::NonNull;
 
 pub(crate) use fixed::FixedSlab;
 pub(crate) use provided::ProvidedSlab;
 
-use crate::classes;
 use crate::runtime;
 use crate::runtime::clone_view;
 use crate::runtime::downgrade_view;
@@ -96,7 +96,7 @@ impl<T> Ref<T> {
     /// Resolves the guarded slot's memory to a raw pointer. The pointer is
     /// only valid while this value is alive and the runtime that owns it is
     /// still running. Panics if used outside the owning runtime.
-    pub fn as_ptr(&self) -> *mut T {
+    pub fn as_ptr(&self) -> NonNull<T> {
         resolve_ptr(self.bid, self.generation, self.offset).cast::<T>()
     }
 
@@ -204,7 +204,7 @@ impl<T> RefMut<T> {
     /// Resolves the guarded slot's memory to a raw pointer. The pointer is
     /// only valid while this value is alive and the runtime that owns it is
     /// still running. Panics if used outside the owning runtime.
-    pub fn as_ptr(&self) -> *mut T {
+    pub fn as_ptr(&self) -> NonNull<T> {
         resolve_ptr(self.bid, self.generation, self.offset).cast::<T>()
     }
 
@@ -286,7 +286,7 @@ impl<T> Slice<T> {
 
     /// The address of this view's first element. Only valid while this value
     /// is alive and the owning runtime is running.
-    pub fn as_ptr(&self) -> *const T {
+    pub fn as_ptr(&self) -> NonNull<T> {
         self.base.as_ptr()
     }
 
@@ -394,7 +394,7 @@ impl Deref for Bytes {
 
 impl AsRef<[u8]> for Bytes {
     fn as_ref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len as usize) }
+        unsafe { core::slice::from_raw_parts(self.as_ptr().as_ptr(), self.len as usize) }
     }
 }
 
@@ -433,7 +433,7 @@ impl<T> SliceMut<T> {
 
     /// The address of this view's first element. Only valid while this value
     /// is alive and the owning runtime is running.
-    pub fn as_ptr(&self) -> *mut T {
+    pub fn as_ptr(&self) -> NonNull<T> {
         self.base.as_ptr()
     }
 
@@ -571,13 +571,13 @@ impl DerefMut for BytesMut {
 
 impl AsRef<[u8]> for BytesMut {
     fn as_ref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len as usize) }
+        unsafe { core::slice::from_raw_parts(self.as_ptr().as_ptr(), self.len as usize) }
     }
 }
 
 impl AsMut<[u8]> for BytesMut {
     fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr(), self.len as usize) }
+        unsafe { core::slice::from_raw_parts_mut(self.base.as_ptr().as_ptr(), self.len as usize) }
     }
 }
 
@@ -588,14 +588,7 @@ fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
         active_gen_matches(generation),
         "capacity() called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| {
-        let class = classes::bid_class(bid);
-        if classes::bid_provided(bid) {
-            r.provided_pool.slot_size(class)
-        } else {
-            r.fixed_pool.slot_size(class)
-        }
-    })
+    with_runtime(|r| r.with_slab(bid, |slab, _| slab.slot_size()))
 }
 
 fn split_exclusive(bid: u32, generation: NonZeroU32) {
@@ -604,12 +597,6 @@ fn split_exclusive(bid: u32, generation: NonZeroU32) {
     }
 
     runtime::with_runtime(|r| {
-        let class = classes::bid_class(bid);
-        let local = classes::bid_local(bid);
-        if classes::bid_provided(bid) {
-            r.provided_pool.tracker_mut(class).split_exclusive(local);
-        } else {
-            r.fixed_pool.tracker_mut(class).split_exclusive(local);
-        }
+        r.with_slab(bid, |slab, local| slab.tracker_mut().split_exclusive(local))
     })
 }

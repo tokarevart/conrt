@@ -98,7 +98,7 @@ pub async fn write(ctx: TaskContext, fd: RawFd, buf: Bytes) -> io::Result<usize>
 
     let entry = io_uring::opcode::WriteFixed::new(
         io_uring::types::Fd(fd),
-        addr,
+        addr.as_ptr(),
         len as u32,
         0, // the whole slab is registered as fixed buffer index 0
     )
@@ -189,10 +189,10 @@ impl Msg {
         };
 
         unsafe {
-            let msg_ptr = msg.as_ptr();
-            msg_ptr.write(core::mem::zeroed());
-            (*msg_ptr).msg_iov = iov.as_ptr().cast();
-            (*msg_ptr).msg_control = ctrl.as_ptr().cast();
+            let msg = msg.as_ptr().as_mut();
+            *msg = core::mem::zeroed();
+            msg.msg_iov = iov.as_ptr().as_ptr().cast();
+            msg.msg_control = ctrl.as_ptr().as_ptr().cast();
         }
 
         Some(Self { msg, iov, ctrl })
@@ -232,7 +232,7 @@ impl Msg {
                 return false;
             }
             let base = self.ctrl.as_ptr().cast::<u8>();
-            let hdr = base.add(used) as *mut libc::cmsghdr;
+            let hdr = base.add(used).as_ptr() as *mut libc::cmsghdr;
             (*hdr).cmsg_len = size_of::<libc::cmsghdr>() + payload.len();
             (*hdr).cmsg_level = level;
             (*hdr).cmsg_type = kind;
@@ -258,7 +258,7 @@ impl Msg {
     /// so the slot can be refilled (and reused) for another op. The pooled
     /// buffers are untouched.
     pub fn clear(&mut self) {
-        let msg = unsafe { &mut *self.msg.as_ptr() };
+        let msg = unsafe { self.msg.as_ptr().as_mut() };
         msg.msg_iovlen = 0;
         msg.msg_controllen = 0;
     }
@@ -266,7 +266,7 @@ impl Msg {
     /// The wrapped `msghdr`, initialized and wired to the pooled iov/control
     /// memory by [`Msg::new`].
     pub fn msg(&mut self) -> &mut libc::msghdr {
-        unsafe { &mut *self.msg.as_ptr() }
+        unsafe { self.msg.as_ptr().as_mut() }
     }
 
     /// The pooled `iovec` at index `i`, for setting up a send. Bounded by the
@@ -278,7 +278,7 @@ impl Msg {
         }
         unsafe {
             let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
-            Some((&mut *base.add(i)).assume_init_mut())
+            Some(base.add(i).as_mut().assume_init_mut())
         }
     }
 
@@ -288,7 +288,7 @@ impl Msg {
         let len = self.msg().msg_controllen.min(MAX_CTRL_CAP);
         unsafe {
             Some(core::slice::from_raw_parts_mut(
-                self.ctrl.as_ptr().cast::<u8>(),
+                self.ctrl.as_ptr().as_ptr().cast::<u8>(),
                 len,
             ))
         }
@@ -296,7 +296,7 @@ impl Msg {
 
     /// The address of the wired `msghdr`, used to build the submission entry.
     pub(crate) fn msg_ptr(&self) -> *mut libc::msghdr {
-        self.msg.as_ptr()
+        self.msg.as_ptr().as_ptr()
     }
 }
 
@@ -339,10 +339,10 @@ impl MsgMut {
         };
 
         unsafe {
-            let msg_ptr = msg.as_ptr();
-            msg_ptr.write(core::mem::zeroed());
-            (*msg_ptr).msg_iov = iov.as_ptr().cast();
-            (*msg_ptr).msg_control = ctrl.as_ptr().cast();
+            let msg = msg.as_ptr().as_mut();
+            *msg = core::mem::zeroed();
+            msg.msg_iov = iov.as_ptr().as_ptr().cast();
+            msg.msg_control = ctrl.as_ptr().as_ptr().cast();
         }
 
         Some(Self { msg, iov, ctrl })
@@ -369,7 +369,7 @@ impl MsgMut {
     /// `msg_flags`, `msg_namelen` and `msg_controllen` are meaningful after
     /// the op resolves.
     pub fn msg(&mut self) -> &mut libc::msghdr {
-        unsafe { &mut *self.msg.as_ptr() }
+        unsafe { self.msg.as_ptr().as_mut() }
     }
 
     /// The pooled `iovec` at index `i`, for reading what a receive consumed.
@@ -381,7 +381,7 @@ impl MsgMut {
         }
         unsafe {
             let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
-            Some((&mut *base.add(i)).assume_init_mut())
+            Some(base.add(i).as_mut().assume_init_mut())
         }
     }
 
@@ -391,7 +391,7 @@ impl MsgMut {
         let len = self.msg().msg_controllen.min(MAX_CTRL_CAP);
         unsafe {
             Some(core::slice::from_raw_parts_mut(
-                self.ctrl.as_ptr().cast::<u8>(),
+                self.ctrl.as_ptr().as_ptr().cast::<u8>(),
                 len,
             ))
         }
@@ -402,21 +402,21 @@ impl MsgMut {
     /// while the caller keeps the list of data buffers the kernel filled.
     pub fn take_iov(&mut self) -> Vec<libc::iovec> {
         unsafe {
-            let msg_ptr = self.msg.as_ptr();
-            let len = (*msg_ptr).msg_iovlen;
+            let msg = self.msg.as_ptr().as_mut();
+            let len = msg.msg_iovlen;
             let mut out = Vec::with_capacity(len);
             let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             for i in 0..len {
                 out.push(base.add(i).read().assume_init());
             }
-            (*msg_ptr).msg_iovlen = 0;
+            msg.msg_iovlen = 0;
             out
         }
     }
 
     /// The address of the wired `msghdr`, used to build the submission entry.
     pub(crate) fn msg_ptr(&self) -> *mut libc::msghdr {
-        self.msg.as_ptr()
+        self.msg.as_ptr().as_ptr()
     }
 }
 

@@ -103,6 +103,7 @@ impl<S: Slab> Pool<S> {
     }
 
     /// The slab backing size class `class`.
+    #[cfg(test)]
     pub(crate) fn slab(&self, class: u8) -> &S {
         &self.slabs[class as usize]
     }
@@ -110,27 +111,6 @@ impl<S: Slab> Pool<S> {
     /// The mutable slab backing size class `class`.
     pub(crate) fn slab_mut(&mut self, class: u8) -> &mut S {
         &mut self.slabs[class as usize]
-    }
-
-    /// The slot size of size class `class`, in bytes.
-    pub(crate) fn slot_size(&self, class: u8) -> u32 {
-        self.slab(class).slot_size()
-    }
-
-    /// A raw pointer to the start of slot `local` of size class `class`.
-    pub(crate) fn slot_ptr(&self, class: u8, local: u32) -> NonNull<u8> {
-        self.slab(class).slot_ptr(local)
-    }
-
-    /// The mutable per-slot borrow tracker of size class `class`.
-    pub(crate) fn tracker_mut(&mut self, class: u8) -> &mut BorrowTracker {
-        self.slab_mut(class).tracker_mut()
-    }
-
-    /// Releases one borrower of slot `local` of size class `class`, recycling
-    /// the slot when the last view drops.
-    pub(crate) fn drop_view(&mut self, class: u8, exclusive: bool, local: u32) {
-        self.slab_mut(class).drop_view(exclusive, local);
     }
 }
 
