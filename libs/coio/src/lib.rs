@@ -32,6 +32,7 @@ mod buf;
 pub mod classes;
 pub mod io;
 mod pbuf;
+mod pool;
 pub mod runtime;
 pub mod task;
 

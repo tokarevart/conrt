@@ -2,10 +2,11 @@
 //!
 //! The runtime registers its whole shared buffer slab with the `io_uring` as
 //! fixed buffer index 0. A [`BufferPool`] describes one size class of that
-//! slab: a free stack of local slot ids plus a per-slot borrow count. Views
-//! into the slab — [`Ref`]/[`RefMut`] for typed slots and
-//! [`Slice`]/[`SliceMut`] for byte ranges — hold a slot's borrow; the slot
-//! returns to the pool only when the last view is dropped.
+//! slab: a free stack of local slot ids plus the per-slot borrow tracking that
+//! it shares with the provided pools via [`BorrowTracker`]. Views into the slab
+//! — [`Ref`]/[`RefMut`] for typed slots and [`Slice`]/[`SliceMut`] for byte
+//! ranges — hold a slot's borrow; the slot returns to the pool only when the
+//! last view is dropped.
 //!
 //! A slot is shared (count `+1`, `+2`, …) while [`Ref`]/[`Slice`] views borrow
 //! it and exclusive (count `−1`, `−2`, …) while [`RefMut`]/[`SliceMut`] views
@@ -23,6 +24,7 @@ use std::ops::DerefMut;
 use std::ptr::NonNull;
 
 use crate::classes::pack_bid;
+use crate::pool::BorrowTracker;
 use crate::runtime::active_gen;
 use crate::runtime::clone_view;
 use crate::runtime::downgrade_view;
@@ -35,53 +37,40 @@ pub struct BufferPool {
     /// This class's index in the runtime's fixed-pool table, packed into the
     /// high bits of every view this pool hands out.
     class: u8,
-    /// Byte offset of this class's first slot within the shared slab.
-    base_offset: u32,
-    /// Start of the shared slab this class's slots live in.
+    /// The start of this class's slot 0 within the shared slab, aligned to
+    /// `min(size, BUFFER_MAX_ALIGN)`; slot `local` lives `local * size` bytes
+    /// in.
     slab_base: NonNull<u8>,
     free: Vec<u32>,
-    /// Per-slot borrow count: `0` means free (on the stack), positive values
-    /// count shared views, negative values count exclusive views.
-    borrows: Vec<i32>,
+    /// Per-slot borrow counts shared with the provided pools.
+    pub(crate) tracker: BorrowTracker,
 }
 
 impl BufferPool {
     /// Creates a free stack of `count` slots of `size` bytes each, backed by
-    /// the slot range `[base_offset, base_offset + count*size)` of the
-    /// caller-owned slab at `slab_base`. The slab is registered with the ring
+    /// the `count * size` bytes of the caller-owned slab starting at
+    /// `slab_base` (which must point at the class's slot 0 and be aligned to
+    /// `min(size, BUFFER_MAX_ALIGN)`). The slab is registered with the ring
     /// once, by the runtime.
-    pub(crate) fn new(
-        slab_base: NonNull<u8>,
-        base_offset: usize,
-        size: u32,
-        count: u32,
-        class: u8,
-    ) -> Self {
+    pub(crate) fn new(slab_base: NonNull<u8>, size: u32, count: u32, class: u8) -> Self {
         assert!(size > 0);
         assert!(count > 0);
 
         // Seed the free stack so the first acquire returns slot 0.
         let mut free = Vec::with_capacity(count as usize);
         free.extend((0..count).rev());
-        let borrows = vec![0; count as usize];
 
         Self {
             size,
             class,
-            base_offset: base_offset as u32,
             slab_base,
             free,
-            borrows,
+            tracker: BorrowTracker::new(count as usize),
         }
     }
 
     pub fn slot_size(&self) -> u32 {
         self.size
-    }
-
-    /// The byte offset of slot `local` within the shared slab.
-    pub(crate) fn slot_offset(&self, local: u32) -> u32 {
-        self.base_offset + local * self.size
     }
 
     /// Returns a raw pointer to the start of slot `local`'s slab memory.
@@ -90,16 +79,15 @@ impl BufferPool {
             NonNull::new_unchecked(
                 self.slab_base
                     .as_ptr()
-                    .add(self.slot_offset(local) as usize),
+                    .add(local as usize * self.size as usize),
             )
         }
     }
 
     #[cfg(test)]
     pub fn get_slice_mut(&mut self, local: u32) -> &mut [u8] {
-        let start = self.slot_offset(local) as usize;
         unsafe {
-            core::slice::from_raw_parts_mut(self.slab_base.as_ptr().add(start), self.size as usize)
+            core::slice::from_raw_parts_mut(self.slot_ptr(local).as_ptr(), self.size as usize)
         }
     }
 
@@ -109,7 +97,7 @@ impl BufferPool {
     /// [`crate::task::TaskContext::alloc_bytes`].
     pub fn acquire_slot(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
-        self.borrows[local as usize] = -1;
+        self.tracker.take_exclusive(local);
         Some(local)
     }
 
@@ -118,7 +106,7 @@ impl BufferPool {
     /// [`crate::task::TaskContext::alloc`] for pooled op arguments.
     pub fn acquire_slot_shared(&mut self) -> Option<u32> {
         let local = self.free.pop()?;
-        self.borrows[local as usize] = 1;
+        self.tracker.take_shared(local);
         Some(local)
     }
 
@@ -209,82 +197,18 @@ impl BufferPool {
         self.acquire_slice_mut::<u8>()
     }
 
-    /// Registers one more shared borrower (a cloned [`Ref`]). Panics if the
-    /// slot is not currently shared.
-    pub fn clone_shared(&mut self, local: u32) {
-        let borrow = &mut self.borrows[local as usize];
-        assert!(*borrow > 0, "clone_shared: slot {local} is not shared");
-        *borrow += 1;
-    }
-
-    /// Registers one more exclusive borrower (a split of an exclusive view).
-    /// Panics if the slot is not currently exclusive.
-    pub fn split_exclusive(&mut self, local: u32) {
-        let borrow = &mut self.borrows[local as usize];
-        assert!(
-            *borrow < 0,
-            "split_exclusive: slot {local} is not exclusively borrowed"
-        );
-        *borrow -= 1;
-    }
-
     /// Releases one borrower of `local`, pushing the slot back onto the free
     /// stack when the last view is dropped. Panics on a count mismatch
     /// (over-release, a double-drop, or releasing the wrong kind of borrow).
     pub fn drop_view(&mut self, exclusive: bool, local: u32) {
-        let borrow = &mut self.borrows[local as usize];
-        assert!(*borrow != 0, "drop_view: slot {local} is not borrowed");
-        if exclusive {
-            assert!(
-                *borrow < 0,
-                "drop_view: exclusive release of a shared borrow on slot {local}"
-            );
-            *borrow += 1;
-            if *borrow == 0 {
-                self.free.push(local);
-            }
-        } else {
-            assert!(
-                *borrow > 0,
-                "drop_view: shared release of an exclusive borrow on slot {local}"
-            );
-            *borrow -= 1;
-            if *borrow == 0 {
-                self.free.push(local);
-            }
+        if self.tracker.drop_view(exclusive, local) {
+            self.free.push(local);
         }
-    }
-
-    /// Exclusive `−1` → shared `+1`. Panics unless this slot has exactly one
-    /// exclusive holder.
-    pub fn downgrade(&mut self, local: u32) {
-        let borrow = &mut self.borrows[local as usize];
-        assert_eq!(
-            *borrow, -1,
-            "downgrade: slot {local} must have exactly one exclusive holder"
-        );
-        *borrow = 1;
-    }
-
-    /// Shared `+1` → exclusive `−1`. Panics unless this slot has exactly one
-    /// shared holder.
-    pub fn upgrade(&mut self, local: u32) {
-        let borrow = &mut self.borrows[local as usize];
-        assert_eq!(
-            *borrow, 1,
-            "upgrade: slot {local} must have exactly one shared holder"
-        );
-        *borrow = -1;
     }
 
     #[cfg(test)]
     pub(crate) fn free_count(&self) -> usize {
         self.free.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn borrows(&self, local: u32) -> i32 {
-        self.borrows[local as usize]
     }
 }
 
@@ -853,9 +777,9 @@ fn split_exclusive(bid: u32, generation: NonZeroU32) {
         let class = usize::from(bid_class(bid));
         let local = bid_local(bid);
         if bid_provided(bid) {
-            r.provided_pools[class].split_exclusive(local as u16);
+            r.provided_pools[class].tracker.split_exclusive(local as _);
         } else {
-            r.fixed_pools[class].split_exclusive(local);
+            r.fixed_pools[class].tracker.split_exclusive(local);
         }
     })
 }
@@ -882,7 +806,7 @@ mod tests {
     fn make_pool(count: u32, size: u32) -> (BufferPool, Vec<u8>) {
         let mut slab = vec![0u8; count as usize * size as usize];
         let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        (BufferPool::new(base, 0, size, count, 0), slab)
+        (BufferPool::new(base, size, count, 0), slab)
     }
 
     #[test]
@@ -910,14 +834,14 @@ mod tests {
     fn shared_borrow_returns_to_free_at_zero() {
         let (mut pool, _slab) = make_pool(2, 16);
         let slot = pool.acquire_slot_shared().unwrap();
-        pool.clone_shared(slot);
-        assert_eq!(pool.borrows(slot), 2);
+        pool.tracker.clone_shared(slot);
+        assert_eq!(pool.tracker.borrows(slot), 2);
         assert_eq!(pool.free_count(), 1);
         pool.drop_view(false, slot);
-        assert_eq!(pool.borrows(slot), 1);
+        assert_eq!(pool.tracker.borrows(slot), 1);
         assert_eq!(pool.free_count(), 1);
         pool.drop_view(false, slot);
-        assert_eq!(pool.borrows(slot), 0);
+        assert_eq!(pool.tracker.borrows(slot), 0);
         assert_eq!(pool.free_count(), 2);
     }
 
@@ -925,14 +849,14 @@ mod tests {
     fn exclusive_split_requires_both_drops() {
         let (mut pool, _slab) = make_pool(2, 16);
         let slot = pool.acquire_slot().unwrap();
-        pool.split_exclusive(slot);
-        assert_eq!(pool.borrows(slot), -2);
+        pool.tracker.split_exclusive(slot);
+        assert_eq!(pool.tracker.borrows(slot), -2);
         assert_eq!(pool.free_count(), 1);
         pool.drop_view(true, slot);
-        assert_eq!(pool.borrows(slot), -1);
+        assert_eq!(pool.tracker.borrows(slot), -1);
         assert_eq!(pool.free_count(), 1);
         pool.drop_view(true, slot);
-        assert_eq!(pool.borrows(slot), 0);
+        assert_eq!(pool.tracker.borrows(slot), 0);
         assert_eq!(pool.free_count(), 2);
     }
 
@@ -940,10 +864,10 @@ mod tests {
     fn upgrade_downgrade_sole_holder() {
         let (mut pool, _slab) = make_pool(2, 16);
         let slot = pool.acquire_slot_shared().unwrap();
-        pool.upgrade(slot);
-        assert_eq!(pool.borrows(slot), -1);
-        pool.downgrade(slot);
-        assert_eq!(pool.borrows(slot), 1);
+        pool.tracker.upgrade(slot);
+        assert_eq!(pool.tracker.borrows(slot), -1);
+        pool.tracker.downgrade(slot);
+        assert_eq!(pool.tracker.borrows(slot), 1);
     }
 
     #[test]
@@ -952,7 +876,7 @@ mod tests {
         let slot = pool.acquire_slot().unwrap();
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pool.clone_shared(slot);
+                pool.tracker.clone_shared(slot);
             }))
             .is_err()
         );
