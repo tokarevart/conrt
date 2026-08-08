@@ -361,9 +361,10 @@ impl Runtime {
 
     fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
         for cqe in self.ring.completion() {
-            let raw = cqe.user_data();
-            let task_index = (raw >> 32) as u32;
-            let io_slot = raw as u32;
+            let IoUserData {
+                index: task_index,
+                io_slot,
+            } = cqe.user_data().into();
             let result = cqe.result();
 
             if io_slot as usize >= self.io_slab.len() {
@@ -432,9 +433,9 @@ type BuiltPools = (NonNull<u8>, Layout, ProvidedPool, FixedPool);
 /// Builds both directions' pools over one shared slab: the provided classes
 /// occupy the start of the slab, the fixed classes follow them. Each provided
 /// class gets a provided-buffer ring registered under `bgid = class index`;
-/// the fixed classes get free-stack slabs, and the whole slab is registered
-/// once as fixed buffer index 0 so writes can address any slot by its absolute
-/// offset. Returns the slab and both pools.
+/// the fixed classes get free-stack slabs, and the fixed region alone is
+/// registered as fixed buffer index 0 so writes can address any slot by its
+/// absolute offset. Returns the slab and both pools.
 ///
 /// The slab is allocated aligned to at most one page (4 KiB) and the classes
 /// are laid out on offsets aligned to their own sizes capped at that page
@@ -526,12 +527,19 @@ fn build_pools(
         .collect();
     let fixed_pool = FixedPool::new(fixed_classes, fixed_slabs);
 
+    // Only the fixed region is registered as fixed buffer index 0: writes
+    // address their slots by absolute offset within that region, while the
+    // provided region's slots are handed to the kernel one op at a time via
+    // `IORING_OP_PROVIDE_BUFFERS`. Registering the whole slab would pin the
+    // provided region's pages against the process's locked-memory limit for
+    // no benefit (each registered page counts toward `RLIMIT_MEMLOCK`), which
+    // caps how many daemons can run at once.
     let iovec = libc::iovec {
-        iov_base: base.as_ptr().cast::<libc::c_void>(),
-        iov_len: total as usize,
+        iov_base: unsafe { base.as_ptr().add(fixed_start as usize) }.cast(),
+        iov_len: (total - fixed_start) as usize,
     };
     unsafe { ring.submitter().register_buffers(&[iovec]) }
-        .expect("failed to register the buffer slab");
+        .expect("failed to register the fixed buffer region");
 
     (base, layout, provided_pool, fixed_pool)
 }
