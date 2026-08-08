@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -5,11 +6,26 @@ use std::os::fd::RawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::SystemTime;
 
+use coio::Bytes;
+use coio::BytesMut;
+use coio::Msg;
+use coio::MsgMut;
+use coio::Notify;
+use coio::accept;
+use coio::alloc_bytes;
+use coio::io::write_all;
+use coio::read;
+use coio::read_exact;
+use coio::recvmsg;
+use coio::runtime::RuntimeContext;
+use coio::runtime::block_on_default;
+use coio::sendmsg;
+use coio::task::TaskContext;
 use conrt_cstring::CString;
 use conrt_sys as sys;
-use io_uring::IoUring;
 use libc::pid_t;
 use serde::Deserialize;
 use serde::Serialize;
@@ -23,32 +39,23 @@ use crate::pty;
 use crate::setup_container_root;
 use crate::setup_overlay_rootfs;
 use crate::setup_userns_maps;
-use crate::uring;
 
 const CACHE_CAPACITY: usize = 65536;
 const LOG_CAPACITY: usize = CACHE_CAPACITY;
-const RING_SIZE: u32 = 1024;
 
-// user_data flags
-const BACKLOG_WRITE: u64 = 1 << 63;
-const PIPE_WRITE: u64 = 1 << 62;
-const FOLLOW_FD: u64 = 1 << 61;
-const ACCEPT: u64 = 1 << 60;
-const STREAM_READ: u64 = 1 << 59;
-const STREAM_WRITE: u64 = 1 << 58;
-const PTY_READ: u64 = 1 << 57;
-const PTY_WRITE: u64 = 1 << 56;
-const PTY_OUTPUT: u64 = 1 << 55;
-const SESSION_MASK: u64 = !(BACKLOG_WRITE
-    | PIPE_WRITE
-    | FOLLOW_FD
-    | ACCEPT
-    | STREAM_READ
-    | STREAM_WRITE
-    | PTY_READ
-    | PTY_WRITE
-    | PTY_OUTPUT);
-const PIPE_ID_MASK: u64 = !(BACKLOG_WRITE | PIPE_WRITE | FOLLOW_FD);
+/// The largest payload a single fixed-pool write buffer can carry: one byte
+/// short of the biggest size class, so a trailing `\n` always fits.
+const WRITE_CHUNK_PAYLOAD: usize = 65535;
+
+/// Allocates a fixed-pool buffer of `size` bytes, panicking on failure.
+///
+/// Pool allocation is expected to succeed unless the allocator itself fails:
+/// an exhausted size class indicates a sizing bug. The pools will grow on
+/// demand in coio in the future; until then, degrading gracefully on
+/// exhaustion (dropping log lines, closing sessions) is worse than aborting.
+fn pool_alloc(size: usize) -> BytesMut {
+    alloc_bytes(size).expect("fixed buffer pool exhausted or no size class fits")
+}
 
 // ── Protocol ──────────────────────────────────────────────────────────────
 
@@ -160,12 +167,34 @@ struct RunArgs {
     interactive: bool,
 }
 
-// ── Datagram receive phases ─────────────────────────────────────────────
+// ── TaskKinds: coio spawn user_data ───────────────────────────────────────
+//
+// One uniform `async move` dispatches on this; each variant maps to one
+// self-contained async task. Every persistent task keeps an io op in flight
+// (recvmsg / accept / sigchld read / output read) so the runtime loop never
+// sees `has_io_in_flight() == false` while the daemon should run.
 
-#[derive(PartialEq)]
-enum RecvPhase {
-    Peek,
-    Consume,
+enum TaskKind {
+    /// The bootstrap task: binds sockets, then spawns the persistent tasks.
+    Main,
+    /// Serves datagram requests (run/list/kill/logs/follow) over the control
+    /// socket.
+    Datagram,
+    /// Accepts Unix-stream attach clients.
+    Accept,
+    /// Reaps dead containers from the SIGCHLD signalfd.
+    SignalReaper,
+    /// Drains one container's stdout/stderr pipe into its log gateway.
+    ContainerOutput { pid: pid_t },
+    /// Drains a detached TTY container's pty master into its log gateway (the
+    /// pipe drain above captures stdout/stderr; this captures tty echo).
+    ContainerPtyOutput { pid: pid_t },
+    /// Reads client frames from an attach session's stream and forwards stdin
+    /// data/EOF/win-size to the container.
+    SessionRead { session_id: u64 },
+    /// Drains an attach session's output (PTY or follow pipe) into `0x10`
+    /// data frames, then sends the `0x02` exit frame and closes the session.
+    SessionOutput { session_id: u64 },
 }
 
 // ── LogCache: single-buffer ring of \n-delimited lines ─────────────────────
@@ -274,12 +303,17 @@ impl LogCache {
     }
 }
 
-// ── AsyncPipeWriter: io_uring-backed pipe writes ──────────────────────────
+// ── LogGateway: cache + follow pipes ───────────────────────────────────────
+//
+// The coio port keeps the cache and pipe bookkeeping synchronous; the actual
+// pipe writes happen in the async container-output task via `coio::io::write`.
+// `push` marks each idle pipe in-flight so at most one write is outstanding
+// per pipe at a time (matching the old AsyncPipeWriter contract), and returns
+// the ids the caller must write to.
 
 struct AsyncPipeWriter {
     id: u64,
     fd: RawFd,
-    send_buf: Vec<u8>,
     in_flight: bool,
 }
 
@@ -288,31 +322,14 @@ impl AsyncPipeWriter {
         Self {
             id,
             fd,
-            send_buf: Vec::with_capacity(4097),
             in_flight: false,
         }
     }
 
-    fn push_write(
-        &mut self,
-        sq: &mut io_uring::squeue::SubmissionQueue,
-        line: &[u8],
-        user_data: u64,
-    ) {
-        if self.in_flight {
-            return;
-        }
-        self.send_buf.clear();
-        self.send_buf.extend_from_slice(line);
-        self.send_buf.push(b'\n');
-        uring::push_write(sq, self.fd, &self.send_buf, user_data);
-        self.in_flight = true;
-    }
-
-    /// Returns `true` if the pipe is still alive.
-    fn complete(&mut self, ret: i32) -> bool {
+    /// Returns `true` if the pipe is still alive after this completion.
+    fn complete(&mut self, ok: bool) -> bool {
         self.in_flight = false;
-        if ret < 0 {
+        if !ok {
             let _ = unsafe { libc::close(self.fd) };
             self.fd = -1;
             false
@@ -322,96 +339,9 @@ impl AsyncPipeWriter {
     }
 }
 
-// ── FollowResponse: one-shot fd-pass buffer ────────────────────────────
-
-struct FollowResponse {
-    pid: pid_t,
-    pipe_writer: RawFd,
-    pipe_reader: RawFd,
-    backlog_buf: Vec<u8>,
-
-    // fd-pass state (set up lazily after backlog write completes)
-    cmsg_buf: Vec<u8>,
-    iov: libc::iovec,
-    msghdr: Box<libc::msghdr>,
-    datagram_fd: RawFd,
-    dest: libc::sockaddr_un,
-    dest_len: libc::socklen_t,
-}
-
-impl FollowResponse {
-    fn new(
-        pid: pid_t,
-        pipe_writer: RawFd,
-        pipe_reader: RawFd,
-        backlog_buf: Vec<u8>,
-        datagram_fd: RawFd,
-        dest: libc::sockaddr_un,
-        dest_len: libc::socklen_t,
-    ) -> Self {
-        Self {
-            pid,
-            pipe_writer,
-            pipe_reader,
-            backlog_buf,
-            cmsg_buf: Vec::new(),
-            iov: unsafe { std::mem::zeroed() },
-            msghdr: Box::new(unsafe { std::mem::zeroed() }),
-            datagram_fd,
-            dest,
-            dest_len,
-        }
-    }
-
-    /// Submit the backlog write SQE — caller calls this first.
-    fn push_backlog_write(&self, sq: &mut io_uring::squeue::SubmissionQueue, user_data: u64) {
-        if !self.backlog_buf.is_empty() {
-            uring::push_write(sq, self.pipe_writer, &self.backlog_buf, user_data);
-        }
-    }
-
-    /// After backlog CQE, set up and submit the fd-pass SCM_RIGHTS sendmsg.
-    fn push_fd_pass(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, user_data: u64) {
-        // Build cmsg: cmsghdr + SCM_RIGHTS with pipe_reader fd.
-        let cmsg_hdr_sz = std::mem::size_of::<libc::cmsghdr>();
-        let fd_size = std::mem::size_of::<RawFd>();
-        let cmsg_align = std::mem::align_of::<libc::cmsghdr>();
-        let cmsg_len_val = cmsg_hdr_sz + fd_size;
-        let cmsg_space = (cmsg_len_val + cmsg_align - 1) & !(cmsg_align - 1);
-        self.cmsg_buf = vec![0u8; cmsg_space];
-        let hdr = self.cmsg_buf.as_mut_ptr() as *mut libc::cmsghdr;
-        unsafe {
-            (*hdr).cmsg_len = cmsg_len_val;
-            (*hdr).cmsg_level = libc::SOL_SOCKET;
-            (*hdr).cmsg_type = libc::SCM_RIGHTS;
-            // Data starts right after the header (offset sizeof(cmsghdr)).
-            let data = self.cmsg_buf.as_mut_ptr().add(cmsg_hdr_sz) as *mut RawFd;
-            std::ptr::write(data, self.pipe_reader);
-        }
-
-        self.iov = libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        *self.msghdr = libc::msghdr {
-            msg_name: &self.dest as *const _ as *mut _,
-            msg_namelen: self.dest_len,
-            msg_iov: &self.iov as *const _ as *mut _,
-            msg_iovlen: 1,
-            msg_control: self.cmsg_buf.as_mut_ptr() as *mut _,
-            msg_controllen: cmsg_space,
-            msg_flags: 0,
-        };
-        uring::push_sendmsg(sq, self.datagram_fd, &*self.msghdr, user_data);
-    }
-}
-
-// ── LogGateway: cache + N async pipe writers ─────────────────────────────
-
 struct LogGateway {
     cache: LogCache,
     pipes: Vec<AsyncPipeWriter>,
-    lock_count: usize,
 }
 
 impl LogGateway {
@@ -419,29 +349,37 @@ impl LogGateway {
         Self {
             cache: LogCache::new(cap),
             pipes: Vec::new(),
-            lock_count: 0,
         }
     }
 
-    fn write(&mut self, sq: &mut io_uring::squeue::SubmissionQueue, line: &[u8]) {
+    /// Records `line` in the cache and marks every idle pipe in-flight for it.
+    /// Returns the ids of the pipes the caller must `write` to (no borrow of
+    /// the gateway may span the await, so the write happens outside).
+    fn push(&mut self, line: &[u8]) -> Vec<u64> {
         self.cache.push(line);
-        for p in &mut self.pipes {
-            if !p.in_flight {
-                p.push_write(sq, line, PIPE_WRITE | p.id);
+        self.pipes
+            .iter_mut()
+            .filter(|p| !p.in_flight)
+            .map(|p| {
+                p.in_flight = true;
+                p.id
+            })
+            .collect()
+    }
+
+    /// `ok == true` clears the in-flight flag; a failed write removes the pipe.
+    fn complete_write(&mut self, pipe_id: u64, ok: bool) {
+        if let Some(idx) = self.pipes.iter().position(|p| p.id == pipe_id) {
+            let alive = self.pipes[idx].complete(ok);
+            if !alive {
+                self.pipes.swap_remove(idx);
             }
         }
     }
 
-    /// Returns `true` if the pipe was removed (dead).
-    fn complete_write(&mut self, pipe_id: u64, ret: i32) -> bool {
-        let Some(idx) = self.pipes.iter().position(|p| p.id == pipe_id) else {
-            return false;
-        };
-        let alive = self.pipes[idx].complete(ret);
-        if !alive {
-            self.pipes.swap_remove(idx);
-        }
-        !alive
+    /// The current fd of `pipe_id`, or `None` if it was removed.
+    fn pipe_fd(&self, pipe_id: u64) -> Option<RawFd> {
+        self.pipes.iter().find(|p| p.id == pipe_id).map(|p| p.fd)
     }
 
     fn collect_lines(&self) -> Vec<String> {
@@ -470,1558 +408,333 @@ struct ContainerInfo {
     save: bool,
     start_time: SystemTime,
     gateway: LogGateway,
-    stdin_fd: RawFd,       // write end of stdin pipe (-1 if none)
-    ptm_fd: RawFd,         // PTY master fd (-1 if none)
-    pty_read_buf: Vec<u8>, // read buffer for PTY output (empty if no PTY)
-    pty_line_buf: Vec<u8>, // line buffer for PTY output assembly
+    stdin_fd: RawFd, // write end of stdin pipe (-1 if none)
+    ptm_fd: RawFd,   // PTY master fd (-1 if none)
+    /// Number of output-drain tasks still running for this container (the
+    /// stdout/stderr drain and, for `--tty`, the pty-echo drain). The container
+    /// is kept in `containers` until the count reaches zero, so the drains can
+    /// flush their remaining output to the follow pipes before cleanup closes
+    /// them. Attach-only containers have no drain tasks and are cleaned up by
+    /// the reaper directly.
+    drains_pending: u32,
 }
 
-// ── Attach Session (interactive/PTY run over Unix stream) ──────────────────
+/// One container's stdout/stderr pipe being drained asynchronously. The read
+/// buffer and line assembly live in the `ContainerOutput` task's locals; the
+/// pty echo for detached TTY containers lives in `ContainerPtyOutput`.
+struct Output {
+    fd: RawFd,
+}
+
+// ── Attach Session ────────────────────────────────────────────────────────
 
 struct AttachSession {
     stream_fd: RawFd,
-    ptm_fd: RawFd,
-    /// Read end of stdout/stderr pipe (used when no PTY).
-    log_read_fd: RawFd,
-    input_fd: RawFd, // fd to write stdin to (from ContainerInfo: ptm_fd or stdin_fd, -1 if none)
-    container_pid: pid_t, // PID of the container this session is attached to
-    child_pid: pid_t, // PID of child (0 until forked, set only for run_attach)
+    ptm_fd: RawFd,      // PTY master for a tty run_attach (-1 otherwise)
+    input_fd: RawFd,    // fd to write stdin to (ptm or stdin pipe, -1 if none)
+    log_read_fd: RawFd, // follow-pipe / log-pipe reader for output (-1 if none)
+    container_pid: pid_t,
     child_exited: bool,
-    reading_header: bool,
-    frame_buf: Vec<u8>,
-    frame_type: u8,
-    frame_len: u16,
-    output_rbuf: Vec<u8>,
-    stream_wbuf: Vec<u8>,
-    write_buf: Vec<u8>, // holds 0x10 write data alive until completion
-    pty_write_pending: bool,
-    stream_write_pending: bool,
+    exit_code: Option<i32>,
 }
 
-impl AttachSession {
-    fn new(stream_fd: RawFd) -> Self {
+/// Cross-task signal channels for one session.
+struct SessionNotify {
+    /// Fired by the reaper once the session's container is reaped. The value
+    /// is stored in the notify, so the output task observes the exit even if
+    /// it only waits after the reaper ran.
+    child_exit: Notify<()>,
+}
+
+// ── Follow (fd-pass) ───────────────────────────────────────────────────────
+//
+// A `Logs { follow: true }` request runs entirely inside the datagram task: it
+// snapshots the backlog into an owned `Vec`, writes it synchronously to a
+// fresh pipe (the backlog is at most the cache capacity, which fits the default
+// pipe capacity, and no await happens during the write so no line can slip in
+// between the snapshot and the pipe being attached), then passes the read end
+// to the client with SCM_RIGHTS via an async `sendmsg`. The gateway pipe is
+// registered only after the backlog write, so live output then flows to the
+// pipe through the normal container-output task.
+
+// ── DaemonState: shared, borrow-disciplined ────────────────────────────────
+
+struct DaemonState {
+    socket_path: PathBuf,
+    datagram_fd: RawFd,
+    attach_listener_fd: RawFd,
+    sigchld_fd: RawFd,
+    containers: HashMap<pid_t, ContainerInfo>,
+    outputs: HashMap<pid_t, Output>,
+    log_graveyard: HashMap<pid_t, LogCache>,
+    next_pipe_id: u64,
+    attach_sessions: HashMap<u64, AttachSession>,
+    session_notify: HashMap<u64, SessionNotify>,
+    next_session_id: u64,
+}
+
+impl DaemonState {
+    fn new(socket_path: PathBuf) -> Self {
         Self {
-            stream_fd,
-            ptm_fd: -1,
-            log_read_fd: -1,
-            input_fd: -1,
-            container_pid: 0,
-            child_pid: 0,
-            child_exited: false,
-            reading_header: true,
-            frame_buf: vec![0u8; 3],
-            frame_type: 0,
-            frame_len: 0,
-            output_rbuf: vec![0u8; 4096],
-            stream_wbuf: Vec::with_capacity(4096 + 3),
-            write_buf: Vec::new(),
-            pty_write_pending: false,
-            stream_write_pending: false,
+            socket_path,
+            datagram_fd: -1,
+            attach_listener_fd: -1,
+            sigchld_fd: -1,
+            containers: HashMap::new(),
+            outputs: HashMap::new(),
+            log_graveyard: HashMap::new(),
+            next_pipe_id: 0,
+            attach_sessions: HashMap::new(),
+            session_notify: HashMap::new(),
+            next_session_id: 0,
         }
     }
 }
 
+// ── Daemon entry point ────────────────────────────────────────────────────
+
 pub struct Daemon {
-    ring: IoUring,
-    sigchld_fd: RawFd,
-    sigchld_buf: Vec<u8>,
-    datagram_fd: RawFd,
-    attach_listener_fd: RawFd,
     socket_path: PathBuf,
-    containers: HashMap<pid_t, ContainerInfo>,
-    outputs: HashMap<u64, Output>,
-    next_output_id: u64,
-    log_graveyard: HashMap<pid_t, LogCache>,
-    follow_pend: HashMap<u64, Box<FollowResponse>>,
-    pipe_map: HashMap<u64, pid_t>,
-    next_follow_id: u64,
-    next_pipe_id: u64,
-    attach_sessions: HashMap<u64, AttachSession>,
-    next_session_id: u64,
-
-    // Datagram receive state
-    recv_buf: Vec<u8>,
-    recv_addr: libc::sockaddr_un,
-    recv_addr_len: libc::socklen_t,
-    recv_iov: libc::iovec,
-    recv_msghdr: libc::msghdr,
-    recv_phase: RecvPhase,
-}
-
-/// One container stdout/stderr pipe being drained asynchronously.
-struct Output {
-    fd: RawFd,
-    pid: pid_t,
-    read_buf: Vec<u8>,
-    line_buf: Vec<u8>,
 }
 
 impl Daemon {
     pub fn new(socket_path: PathBuf) -> Self {
-        let ring = IoUring::new(RING_SIZE).expect("failed to create io_uring");
-        Self {
-            ring,
-            sigchld_fd: -1,
-            sigchld_buf: Vec::new(),
-            datagram_fd: -1,
-            attach_listener_fd: -1,
-            socket_path,
-            containers: HashMap::new(),
-            outputs: HashMap::new(),
-            next_output_id: 2,
-            log_graveyard: HashMap::new(),
-            follow_pend: HashMap::new(),
-            pipe_map: HashMap::new(),
-            next_follow_id: 0,
-            next_pipe_id: 0,
-            attach_sessions: HashMap::new(),
-            next_session_id: 0,
-            recv_buf: vec![0u8; 65536],
-            recv_addr: unsafe { std::mem::zeroed() },
-            recv_addr_len: 0,
-            recv_iov: unsafe { std::mem::zeroed() },
-            recv_msghdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            recv_phase: RecvPhase::Peek,
-        }
+        Self { socket_path }
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        // Self-referential pointers: init AFTER self is at its final location. ??
-        self.recv_addr = unsafe { std::mem::zeroed() };
-        self.recv_iov = libc::iovec {
-            iov_base: self.recv_buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: self.recv_buf.len(),
-        };
-        self.recv_msghdr = libc::msghdr {
-            msg_name: &raw mut self.recv_addr as *mut _,
-            msg_namelen: size_of::<libc::sockaddr_un>() as _,
-            msg_iov: &raw mut self.recv_iov as *mut _,
-            msg_iovlen: 1,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
+        let state = Rc::new(RefCell::new(DaemonState::new(self.socket_path.clone())));
 
-        let dir = self.socket_path.parent().unwrap();
-        std::fs::create_dir_all(dir)?;
-
-        if self.socket_path.exists() {
-            std::fs::remove_file(&self.socket_path)?;
-        }
-
-        let datagram = UnixDatagram::bind(&self.socket_path)?;
-        self.datagram_fd = datagram.as_raw_fd();
-        tracing::info!(path = %self.socket_path.display(), "daemon listening (datagram)");
-
-        // Stream listener for attach/interactive sessions.
-        let mut stream_path = self.socket_path.clone().into_os_string();
-        stream_path.push(".stream");
-        let stream_path = PathBuf::from(stream_path);
-        if stream_path.exists() {
-            std::fs::remove_file(&stream_path)?;
-        }
-        let listener = std::os::unix::net::UnixListener::bind(&stream_path)?;
-        listener.set_nonblocking(true)?;
-        self.attach_listener_fd = listener.as_raw_fd();
-        tracing::info!(path = %stream_path.display(), "daemon listening (stream)");
-
-        let sigchld = setup_sigchld_fd()?;
-        self.sigchld_fd = sigchld;
-        self.sigchld_buf = vec![0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-
-        // Prevent listener from being dropped — socket stays bound for the
-        // daemon's lifetime.
-        std::mem::forget(listener);
-
-        {
-            let mut sq = self.ring.submission();
-            uring::push_recvmsg(
-                &mut sq,
-                self.datagram_fd,
-                &raw mut self.recv_msghdr,
-                (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
-                0,
-            );
-            uring::push_read(&mut sq, sigchld, &mut self.sigchld_buf, 1);
-            uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
-        }
-
-        loop {
-            self.ring.submit_and_wait(1)?;
-
-            while let Some(cqe) = {
-                let mut cq = self.ring.completion();
-                cq.next()
-            } {
-                let user_data = cqe.user_data();
-                let ret = cqe.result();
-                tracing::trace!(%ret, ?user_data, "cqe completion");
-                match user_data {
-                    0 => self.handle_datagram_cqe(ret),
-                    1 => self.handle_signal(ret),
-                    id if id & FOLLOW_FD != 0 => {
-                        self.complete_follow_fd_pass(id & PIPE_ID_MASK, ret)
-                    }
-                    id if id & BACKLOG_WRITE != 0 => {
-                        self.complete_backlog_write(id & PIPE_ID_MASK, ret)
-                    }
-                    id if id & PIPE_WRITE != 0 => self.complete_pipe_write(id & PIPE_ID_MASK, ret),
-                    id if id == (ACCEPT) => self.handle_accept(ret),
-                    id if id & STREAM_READ != 0 => self.handle_stream_read(id & SESSION_MASK, ret),
-                    id if id & STREAM_WRITE != 0 => {
-                        self.handle_stream_write(id & SESSION_MASK, ret)
-                    }
-                    id if id & PTY_READ != 0 => self.handle_pty_read(id & SESSION_MASK, ret),
-                    id if id & PTY_WRITE != 0 => self.handle_pty_write(id & SESSION_MASK, ret),
-                    id if id & PTY_OUTPUT != 0 => {
-                        self.handle_pty_output((id & !PTY_OUTPUT) as pid_t, ret)
-                    }
-                    id => self.handle_output(id, ret),
-                }
-            }
-        }
-    }
-
-    // ── Datagram handling (two-phase: peek → consume) ────────────────────
-
-    fn submit_datagram_peek(&mut self) {
-        self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
-        let mut sq = self.ring.submission();
-        uring::push_recvmsg(
-            &mut sq,
-            self.datagram_fd,
-            &mut self.recv_msghdr as *mut _,
-            (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
-            0,
+        // `make_fut` is the single spawn entry point: every task (main and
+        // spawned) is built by calling it, so the closure captures the shared
+        // state once and hands each task its own owned `Rc` clone. The returned
+        // future is `'static` because it owns the clone; the closure itself may
+        // borrow the stack `state` since `block_on` does not require `S` to be
+        // `'static`. `run()` returns only once the runtime drains, i.e. when
+        // every persistent task's io has completed (at process exit).
+        block_on_default(
+            |ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
+                let state = Rc::clone(&state);
+                async move { dispatcher(ctx, rt, kind, state).await }
+            },
+            TaskKind::Main,
         );
+        Ok(())
     }
+}
 
-    fn submit_datagram_consume(&mut self) {
-        self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
-        let mut sq = self.ring.submission();
-        uring::push_recvmsg(&mut sq, self.datagram_fd, &raw mut self.recv_msghdr, 0, 0);
-    }
-
-    fn handle_datagram_cqe(&mut self, ret: i32) {
-        match self.recv_phase {
-            RecvPhase::Peek => self.handle_datagram_peek(ret),
-            RecvPhase::Consume => self.handle_datagram_consume(ret),
+/// Dispatches one spawned task to its handler. `rt` is passed to every task
+/// (the runtime hands it to each spawned closure) so session tasks can spawn
+/// their output siblings.
+async fn dispatcher(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    kind: TaskKind,
+    state: Rc<RefCell<DaemonState>>,
+) {
+    match kind {
+        TaskKind::Main => main_task(ctx, rt, &state).await,
+        TaskKind::Datagram => datagram_task(ctx, rt, &state).await,
+        TaskKind::Accept => accept_task(ctx, rt, &state).await,
+        TaskKind::SignalReaper => reaper_task(ctx, &state).await,
+        TaskKind::ContainerOutput { pid } => container_output_task(ctx, &state, pid).await,
+        TaskKind::ContainerPtyOutput { pid } => container_pty_output_task(ctx, &state, pid).await,
+        TaskKind::SessionRead { session_id } => {
+            session_read_task(ctx, rt, &state, session_id).await
+        }
+        TaskKind::SessionOutput { session_id } => {
+            session_output_task(ctx, &state, session_id).await
         }
     }
+}
 
-    fn handle_datagram_peek(&mut self, ret: i32) {
-        tracing::trace!(%ret, "datagram peek");
-        let size = ret as usize;
-        if size > self.recv_buf.len() {
-            // Resize the receive buffer and update the iovec to match.
-            self.recv_buf.resize(size, 0);
-            self.recv_iov.iov_base = self.recv_buf.as_mut_ptr() as *mut libc::c_void;
-            self.recv_iov.iov_len = size;
-            self.recv_msghdr.msg_namelen = size_of::<libc::sockaddr_un>() as _;
-            // Re-link the updated iovec pointer to msghdr before giving it to the kernel
-            self.recv_msghdr.msg_iov = &raw mut self.recv_iov as *mut _;
-        }
-        self.recv_phase = RecvPhase::Consume;
-        self.submit_datagram_consume();
+/// The bootstrap task: bind the sockets, arm the SIGCHLD signalfd, store the
+/// fds in the shared state, then spawn the persistent tasks. Returns once the
+/// daemon's background io is all up; the runtime stays alive while any io is
+/// in flight, and `run()` only returns when everything drains.
+async fn main_task(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+) {
+    let socket_path = state.borrow().socket_path.clone();
+    let dir = socket_path.parent().expect("socket path has a parent");
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::error!(%e, path = %dir.display(), "cannot create socket dir");
+        return;
+    }
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
     }
 
-    fn handle_datagram_consume(&mut self, ret: i32) {
-        tracing::trace!(%ret, "datagram consume");
-        self.recv_phase = RecvPhase::Peek;
-        if ret >= 0 {
-            let sender = self.recv_addr;
-            self.recv_addr_len = self.recv_msghdr.msg_namelen;
-            let data = &self.recv_buf[..ret as usize];
-            let request: Request = match serde_json::from_slice(data) {
-                Ok(r) => r,
-                Err(e) => {
-                    let resp = serde_json::to_vec(&ErrorResponse {
-                        ok: false,
-                        error: format!("invalid request: {e}"),
-                    })
-                    .unwrap();
-                    let _ = self.send_datagram(&sender, &resp);
-                    self.submit_datagram_peek();
-                    return;
-                }
-            };
-
-            match request {
-                Request::Run {
-                    rootfs,
-                    net_pid,
-                    save,
-                    command,
-                    interactive,
-                    tty,
-                } => self.handle_run(sender, RunArgs {
-                    rootfs,
-                    net_pid,
-                    save,
-                    command: CStringSerde::into_inner_vec(command),
-                    tty: tty.unwrap_or(false),
-                    interactive: interactive.unwrap_or(false),
-                }),
-                Request::List => self.handle_list(sender),
-                Request::Kill { pid } => self.handle_kill(sender, pid),
-                Request::Logs { pid, follow } => {
-                    if follow {
-                        self.handle_follow(sender, pid);
-                    } else {
-                        self.handle_logs(sender, pid);
-                    }
-                }
-                Request::Attach { .. } => {
-                    self.reply(&sender, &ErrorResponse {
-                        ok: false,
-                        error: "attach must be sent over the stream socket".into(),
-                    });
-                }
-            }
-        }
-        self.submit_datagram_peek();
-    }
-
-    fn send_datagram(&self, addr: &libc::sockaddr_un, data: &[u8]) -> io::Result<usize> {
-        send_datagram_raw(self.datagram_fd, addr, self.recv_addr_len, data)
-    }
-
-    fn handle_signal(&mut self, ret: i32) {
-        if ret > 0 {
-            self.reap_children();
-        }
-        {
-            let mut sq = self.ring.submission();
-            uring::push_read(&mut sq, self.sigchld_fd, &mut self.sigchld_buf, 1);
-        }
-    }
-
-    // ── Container output (async read that stays in flight) ─────────────────
-
-    fn handle_output(&mut self, id: u64, result: i32) {
-        if result <= 0 {
-            self.cleanup_output(id);
+    let datagram = match UnixDatagram::bind(&socket_path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(%e, path = %socket_path.display(), "cannot bind datagram socket");
             return;
         }
-        let n = result as usize;
-        let pid = match self.outputs.get(&id) {
-            Some(o) => o.pid,
-            None => return,
-        };
+    };
+    let datagram_fd = datagram.as_raw_fd();
+    tracing::info!(path = %socket_path.display(), "daemon listening (datagram)");
 
-        {
-            let output = match self.outputs.get_mut(&id) {
-                Some(o) => o,
-                None => return,
-            };
-            output.line_buf.extend_from_slice(&output.read_buf[..n]);
+    let mut stream_path = socket_path.clone().into_os_string();
+    stream_path.push(".stream");
+    let stream_path = PathBuf::from(stream_path);
+    if stream_path.exists() {
+        let _ = std::fs::remove_file(&stream_path);
+    }
+    let listener = match std::os::unix::net::UnixListener::bind(&stream_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(%e, path = %stream_path.display(), "cannot bind stream listener");
+            return;
+        }
+    };
+    let attach_listener_fd = listener.as_raw_fd();
+    tracing::info!(path = %stream_path.display(), "daemon listening (stream)");
 
-            let mut start = 0usize;
-            let total = output.line_buf.len();
-            for i in 0..total {
-                if output.line_buf[i] == b'\n' {
-                    let line = &output.line_buf[start..i];
+    let sigchld_fd = match setup_sigchld_fd() {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::error!(%e, "cannot set up SIGCHLD signalfd");
+            return;
+        }
+    };
+
+    // Keep the sockets bound for the daemon's lifetime (same trick as the
+    // original run(): the owning objects are forgotten, the fds stay open).
+    std::mem::forget(datagram);
+    std::mem::forget(listener);
+
+    {
+        let mut s = state.borrow_mut();
+        s.datagram_fd = datagram_fd;
+        s.attach_listener_fd = attach_listener_fd;
+        s.sigchld_fd = sigchld_fd;
+    }
+
+    // Spawn the persistent tasks. Each keeps an io op in flight, so the
+    // runtime keeps running.
+    for kind in [TaskKind::Datagram, TaskKind::Accept, TaskKind::SignalReaper] {
+        match rt.spawn(kind) {
+            Some(_handle) => {}
+            None => tracing::error!("task slab full, failed to spawn task"),
+        }
+    }
+
+    let _ = ctx;
+}
+
+// ── Signal reaper ─────────────────────────────────────────────────────────
+
+async fn reaper_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>) {
+    let sigchld_fd = state.borrow().sigchld_fd;
+    loop {
+        // One 128-byte `signalfd_siginfo` record; the read future owns its own
+        // pooled buffer, so nothing must be borrowed across the await.
+        match coio::io::read(ctx, sigchld_fd, 128).await {
+            Ok(bytes) if !bytes.is_empty() => reap_children(state),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%e, "sigchld read failed, reaper exiting");
+                break;
+            }
+        }
+    }
+}
+
+fn reap_children(state: &Rc<RefCell<DaemonState>>) {
+    loop {
+        let mut status: i32 = 0;
+        match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
+            Ok(pid) if pid > 0 => {
+                tracing::info!(%pid, %status, "container exited");
+                let exit_code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else if libc::WIFSIGNALED(status) {
+                    128 + libc::WTERMSIG(status)
+                } else {
+                    1
+                };
+
+                let session_id = {
+                    let s = state.borrow();
+                    match s
+                        .attach_sessions
+                        .iter()
+                        .find_map(|(&id, sess)| (sess.container_pid == pid).then_some(id))
                     {
-                        let mut sq = self.ring.submission();
-                        if let Some(info) = self.containers.get_mut(&pid) {
-                            info.gateway.write(&mut sq, line);
-                        } else if let Some(cache) = self.log_graveyard.get_mut(&pid) {
-                            cache.push(line);
+                        Some(id) => Some(id),
+                        None => {
+                            if !s.containers.contains_key(&pid) {
+                                continue;
+                            }
+                            None
                         }
                     }
-                    start = i + 1;
-                }
-            }
+                };
 
-            if start < total {
-                output.line_buf.drain(..start);
-            } else {
-                output.line_buf.clear();
-            }
-        };
-
-        let fd = match self.outputs.get(&id) {
-            Some(o) => o.fd,
-            None => return,
-        };
-        if !self
-            .containers
-            .get(&pid)
-            .is_some_and(|c| c.gateway.lock_count > 0)
-        {
-            let mut sq = self.ring.submission();
-            let output = self.outputs.get_mut(&id).unwrap();
-            uring::push_read(&mut sq, fd, &mut output.read_buf, id);
-        }
-    }
-
-    fn cleanup_output(&mut self, id: u64) {
-        if let Some(output) = self.outputs.remove(&id) {
-            sys::close(output.fd);
-        }
-    }
-
-    fn handle_pty_output(&mut self, pid: pid_t, ret: i32) {
-        let Some(info) = self.containers.get_mut(&pid) else {
-            return;
-        };
-        if ret <= 0 {
-            if info.ptm_fd >= 0 {
-                sys::close(info.ptm_fd);
-                info.ptm_fd = -1;
-            }
-            return;
-        }
-        let n = ret as usize;
-        info.pty_line_buf.extend_from_slice(&info.pty_read_buf[..n]);
-
-        let mut start = 0usize;
-        let total = info.pty_line_buf.len();
-        for i in 0..total {
-            if info.pty_line_buf[i] == b'\n' {
-                let line = &info.pty_line_buf[start..i];
-                {
-                    let mut sq = self.ring.submission();
-                    info.gateway.write(&mut sq, line);
-                }
-                start = i + 1;
-            }
-        }
-        if start < total {
-            info.pty_line_buf.drain(..start);
-        } else {
-            info.pty_line_buf.clear();
-        }
-
-        if info.gateway.lock_count == 0 && info.ptm_fd >= 0 {
-            let mut sq = self.ring.submission();
-            uring::push_read(
-                &mut sq,
-                info.ptm_fd,
-                &mut info.pty_read_buf,
-                PTY_OUTPUT | (pid as u64),
-            );
-        }
-    }
-
-    // ── Request handlers ──────────────────────────────────────────────────
-
-    fn reply(&self, addr: &libc::sockaddr_un, data: impl serde::Serialize) {
-        let resp = serde_json::to_vec(&data).unwrap();
-        if let Err(e) = self.send_datagram(addr, &resp) {
-            tracing::error!(%e, "reply sendto failed");
-        }
-    }
-
-    /// Run a container in detached mode. All container lifecycle phases run
-    /// asynchronously via the daemon's io_uring event loop — stdout/stderr
-    /// are captured from a pipe, and the caller receives a `RunResponse`
-    /// datagram back. The container PID is returned to the caller for later
-    /// `logs`, `follow`, and `kill` operations.
-    fn handle_run(&mut self, sender: libc::sockaddr_un, args: RunArgs) {
-        let output_id = self.next_output_id;
-        self.next_output_id += 1;
-        let datagram_fd = self.datagram_fd;
-        let sender_len = self.recv_addr_len;
-
-        let err = |msg: &str| {
-            let resp = serde_json::to_vec(&ErrorResponse {
-                ok: false,
-                error: msg.to_string(),
-            })
-            .unwrap();
-            let _ = send_datagram_raw(datagram_fd, &sender, sender_len, &resp);
-        };
-
-        let save = args.save;
-        let use_pty = args.tty;
-        let interactive = args.interactive;
-        let prep = match prepare_run(args) {
-            Ok(p) => p,
-            Err(e) => {
-                err(&e);
-                return;
-            }
-        };
-
-        let use_stdin_pipe = interactive && !use_pty;
-
-        let mut stdin_pipe_fds = sys::FdPair {
-            read: -1,
-            write: -1,
-        };
-        if use_stdin_pipe && let Err(e) = sys::pipe2(&mut stdin_pipe_fds, libc::O_CLOEXEC) {
-            err(&format!("stdin pipe creation failed: {e}"));
-            return;
-        }
-
-        let (pty_master, pty_slave) = if use_pty {
-            match pty::open_pty() {
-                Ok((m, s)) => (Some(m), Some(s)),
-                Err(e) => {
-                    err(&format!("pty allocation failed: {e}"));
-                    return;
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        let mut pipe_fds = sys::FdPair {
-            read: -1,
-            write: -1,
-        };
-        if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            err(&format!("log pipe creation failed: {e}"));
-            return;
-        }
-
-        let clone_result = clone3_container(prep.clone_flags);
-        match clone_result {
-            Err(e) => {
-                sys::close(pipe_fds.read);
-                sys::close(pipe_fds.write);
-                if stdin_pipe_fds.read >= 0 {
-                    sys::close(stdin_pipe_fds.read);
-                }
-                if stdin_pipe_fds.write >= 0 {
-                    sys::close(stdin_pipe_fds.write);
-                }
-                drop(pty_master);
-                drop(pty_slave);
-                err(&format!("clone3 failed: {e}"));
-            }
-            Ok(None) => {
-                sys::close(pipe_fds.read);
-                let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
-                let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
-                if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
-                    sys::close(pipe_fds.write);
-                }
-
-                if use_pty {
-                    drop(pty_master);
-                    if let Some(slave) = pty_slave
-                        && let Err(e) = slave.make_controlling()
+                if let Some(sid) = session_id {
+                    // Notify the session's output task: the child exited and
+                    // the exit code is ready. The output task sends the 0x02
+                    // frame once its output drain hits EOF, so all 0x10 data
+                    // frames are flushed before the exit frame.
                     {
-                        tracing::error!(%e, "pty setup failed in child");
-                        std::process::exit(1);
-                    }
-                    // After make_controlling, dup2 pipe write to stdout/stderr too
-                    // so output goes to the log gateway.
-                    let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
-                    let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
-                    if pipe_fds.write != libc::STDOUT_FILENO
-                        && pipe_fds.write != libc::STDERR_FILENO
-                    {
-                        sys::close(pipe_fds.write);
-                    }
-                    if stdin_pipe_fds.read >= 0 {
-                        sys::close(stdin_pipe_fds.read);
-                    }
-                    if stdin_pipe_fds.write >= 0 {
-                        sys::close(stdin_pipe_fds.write);
-                    }
-                } else if use_stdin_pipe {
-                    sys::close(stdin_pipe_fds.write);
-                    let _ = sys::dup2(stdin_pipe_fds.read, libc::STDIN_FILENO);
-                    sys::close(stdin_pipe_fds.read);
-                } else {
-                    let devnull = CString::from("/dev/null");
-                    let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
-                    if fd < 0 {
-                        tracing::error!("cannot open /dev/null");
-                        std::process::exit(1);
-                    }
-                    let _ = sys::dup2(fd, libc::STDIN_FILENO);
-                    sys::close(fd);
-                }
-
-                if let Err(e) = prep.signal.wait() {
-                    tracing::error!(%e, "sync wait failed");
-                    std::process::exit(1);
-                }
-                child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
-            }
-            Ok(Some(pid)) => {
-                sys::close(pipe_fds.write);
-                drop(pty_slave);
-
-                let stdin_write_fd = if use_stdin_pipe {
-                    sys::close(stdin_pipe_fds.read);
-                    stdin_pipe_fds.write
-                } else {
-                    -1
-                };
-
-                let ptm_fd = pty_master.map_or(-1, |m| {
-                    let fd = m.raw_fd();
-                    std::mem::forget(m);
-                    fd
-                });
-
-                let output = Output {
-                    fd: pipe_fds.read,
-                    pid,
-                    read_buf: vec![0u8; 4096],
-                    line_buf: Vec::new(),
-                };
-                self.outputs.insert(output_id, output);
-
-                {
-                    let mut sq = self.ring.submission();
-                    let output = self.outputs.get_mut(&output_id).unwrap();
-                    uring::push_read(&mut sq, pipe_fds.read, &mut output.read_buf, output_id);
-                }
-
-                if let Err(e) =
-                    parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal)
-                {
-                    self.cleanup_output(output_id);
-                    if stdin_write_fd >= 0 {
-                        sys::close(stdin_write_fd);
-                    }
-                    if ptm_fd >= 0 {
-                        sys::close(ptm_fd);
-                    }
-                    err(&format!("container aborted: {e}"));
-                    return;
-                }
-
-                let cmd_str = prep
-                    .command
-                    .iter()
-                    .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                self.containers.insert(pid, ContainerInfo {
-                    pid,
-                    command: cmd_str,
-                    overlay_dir: prep.overlay_dir,
-                    save,
-                    start_time: SystemTime::now(),
-                    gateway: LogGateway::new(LOG_CAPACITY),
-                    stdin_fd: stdin_write_fd,
-                    ptm_fd,
-                    pty_read_buf: Vec::new(),
-                    pty_line_buf: Vec::new(),
-                });
-
-                if ptm_fd >= 0
-                    && let Some(info) = self.containers.get_mut(&pid)
-                {
-                    info.pty_read_buf = vec![0u8; 4096];
-                    let mut sq = self.ring.submission();
-                    uring::push_read(
-                        &mut sq,
-                        ptm_fd,
-                        &mut info.pty_read_buf,
-                        PTY_OUTPUT | (pid as u64),
-                    );
-                }
-
-                tracing::info!(%pid, "container started");
-
-                self.reply(&sender, &RunResponse {
-                    ok: true,
-                    pid: Some(pid),
-                    error: None,
-                });
-            }
-        }
-    }
-
-    fn handle_attach(&mut self, session_id: u64, pid: i32) {
-        let Some(info) = self.containers.get_mut(&(pid as pid_t)) else {
-            if let Some(session) = self.attach_sessions.get(&session_id) {
-                let payload = serde_json::to_vec(&ErrorResponse {
-                    ok: false,
-                    error: format!("container {pid} not found"),
-                })
-                .unwrap();
-                let mut frame = Vec::with_capacity(3 + payload.len());
-                frame.push(0x01);
-                frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-                frame.extend_from_slice(&payload);
-                let _ = sys::write(session.stream_fd, &frame);
-            }
-            self.close_attach_session(session_id);
-            return;
-        };
-
-        let mut pipe_fds = sys::FdPair {
-            read: -1,
-            write: -1,
-        };
-        if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            tracing::error!(%e, "attach follow pipe creation failed");
-            self.close_attach_session(session_id);
-            return;
-        }
-
-        let pipe_id = self.next_pipe_id;
-        self.next_pipe_id += 1;
-
-        // Register the follow pipe writer with the container's gateway (no backlog).
-        info.gateway
-            .pipes
-            .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
-        self.pipe_map.insert(pipe_id, pid as pid_t);
-
-        let input_fd = if info.ptm_fd >= 0 {
-            info.ptm_fd
-        } else if info.stdin_fd >= 0 {
-            info.stdin_fd
-        } else {
-            -1
-        };
-
-        if let Some(session) = self.attach_sessions.get_mut(&session_id) {
-            session.log_read_fd = pipe_fds.read;
-            session.input_fd = input_fd;
-            session.container_pid = pid as pid_t;
-        }
-
-        {
-            let mut sq = self.ring.submission();
-            if let Some(session) = self.attach_sessions.get_mut(&session_id) {
-                uring::push_read(
-                    &mut sq,
-                    pipe_fds.read,
-                    &mut session.output_rbuf,
-                    PTY_READ | session_id,
-                );
-            }
-        }
-
-        let payload = serde_json::to_vec(&RunResponse {
-            ok: true,
-            pid: Some(pid),
-            error: None,
-        })
-        .unwrap();
-        self.send_attach_frame(session_id, 0x01, &payload);
-        // Resume reading frames from the client (0x10 stdin, 0x11 EOF).
-        self.submit_stream_read_header(session_id);
-    }
-
-    fn handle_list(&mut self, sender: libc::sockaddr_un) {
-        let now = SystemTime::now();
-        let containers: Vec<ContainerSummary> = self
-            .containers
-            .values()
-            .map(|info| {
-                let age = now.duration_since(info.start_time).unwrap_or_default();
-                ContainerSummary {
-                    pid: info.pid,
-                    command: info.command.clone(),
-                    start_time: format!("{:.1}s", age.as_secs_f64()),
-                }
-            })
-            .collect();
-
-        self.reply(&sender, &ListResponse { containers });
-    }
-
-    fn handle_kill(&mut self, sender: libc::sockaddr_un, pid: i32) {
-        if !self.containers.contains_key(&(pid as pid_t)) {
-            self.reply(&sender, &KillResponse {
-                ok: false,
-                error: Some(format!("container {pid} not found")),
-            });
-            return;
-        }
-
-        let ret = unsafe { libc::kill(pid as pid_t, libc::SIGKILL) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            self.reply(&sender, &KillResponse {
-                ok: false,
-                error: Some(format!("kill failed: {err}")),
-            });
-            return;
-        }
-
-        tracing::info!(%pid, "sent SIGKILL");
-        self.reply(&sender, &KillResponse {
-            ok: true,
-            error: None,
-        });
-    }
-
-    fn handle_logs(&mut self, sender: libc::sockaddr_un, pid: i32) {
-        let pid = pid as pid_t;
-        let lines = if let Some(info) = self.containers.get_mut(&pid) {
-            info.gateway.collect_lines()
-        } else if let Some(cache) = self.log_graveyard.get_mut(&pid) {
-            cache.collect_lines()
-        } else {
-            self.reply(&sender, &ErrorResponse {
-                ok: false,
-                error: format!("container {pid} not found"),
-            });
-            return;
-        };
-
-        self.reply(&sender, &LogsResponse { lines });
-    }
-
-    fn handle_follow(&mut self, sender: libc::sockaddr_un, pid: i32) {
-        let pid = pid as pid_t;
-        tracing::debug!(%pid, "handle_follow");
-
-        // Lock cache and snapshot backlog (short-lived borrow on containers).
-        let backlog_buf = match self.containers.get_mut(&pid) {
-            Some(info) => {
-                info.gateway.lock_count += 1;
-                tracing::debug!(%pid, bytes = %info.gateway.cache.bytes, "follow: about to snapshot");
-                let buf = info.gateway.snapshot();
-                tracing::debug!(%pid, backlog_len = %buf.len(), "follow backlog snapshot");
-                buf
-            }
-            None => {
-                self.reply(&sender, &ErrorResponse {
-                    ok: false,
-                    error: format!("container {pid} not found"),
-                });
-                return;
-            }
-        };
-
-        let follow_id = self.next_follow_id;
-        self.next_follow_id += 1;
-
-        // Create pipe.
-        let mut pipe_fds = sys::FdPair {
-            read: -1,
-            write: -1,
-        };
-        if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            tracing::error!(%e, "follow pipe creation failed");
-            // Undo the lock
-            if let Some(info) = self.containers.get_mut(&pid) {
-                info.gateway.lock_count -= 1;
-            }
-            self.reply(&sender, &ErrorResponse {
-                ok: false,
-                error: format!("pipe creation failed: {e}"),
-            });
-            return;
-        }
-
-        let resp = Box::new(FollowResponse::new(
-            pid,
-            pipe_fds.write,
-            pipe_fds.read,
-            backlog_buf,
-            self.datagram_fd,
-            sender,
-            self.recv_addr_len,
-        ));
-
-        // Submit backlog write.
-        {
-            let mut sq = self.ring.submission();
-            resp.push_backlog_write(&mut sq, BACKLOG_WRITE | follow_id);
-        }
-
-        let is_backlog_empty = resp.backlog_buf.is_empty();
-        self.follow_pend.insert(follow_id, resp);
-
-        if is_backlog_empty {
-            self.complete_backlog_write(follow_id, 0);
-        }
-    }
-
-    fn complete_backlog_write(&mut self, follow_id: u64, ret: i32) {
-        tracing::debug!(%follow_id, %ret, "complete_backlog_write");
-        let mut resp = match self.follow_pend.remove(&follow_id) {
-            Some(r) => r,
-            None => return,
-        };
-        let pid = resp.pid;
-
-        if ret < 0 {
-            tracing::error!(%ret, "backlog write to pipe failed");
-            let _ = unsafe { libc::close(resp.pipe_writer) };
-            let _ = unsafe { libc::close(resp.pipe_reader) };
-            if let Some(info) = self.containers.get_mut(&pid) {
-                info.gateway.lock_count -= 1;
-            }
-            return;
-        }
-
-        let pipe_id = self.next_pipe_id;
-        self.next_pipe_id += 1;
-
-        // Backlog written. Attach pipe writer to the container's gateway.
-        if let Some(info) = self.containers.get_mut(&pid) {
-            info.gateway
-                .pipes
-                .push(AsyncPipeWriter::new(pipe_id, resp.pipe_writer));
-            self.pipe_map.insert(pipe_id, pid);
-            info.gateway.lock_count -= 1;
-        }
-        // Resubmit the output read for this pid (it was held during lock).
-        let output_id = self
-            .outputs
-            .iter()
-            .find_map(|(&id, o)| (o.pid == pid).then_some(id));
-        if let Some(id) = output_id {
-            let mut sq = self.ring.submission();
-            let output = self.outputs.get_mut(&id).unwrap();
-            uring::push_read(&mut sq, output.fd, &mut output.read_buf, id);
-        }
-
-        // Set up fd-pass buffer and submit SCM_RIGHTS.
-        {
-            let mut sq = self.ring.submission();
-            resp.push_fd_pass(&mut sq, FOLLOW_FD | follow_id);
-        }
-
-        // Keep resp alive — fd-pass is in-flight.
-        self.follow_pend.insert(follow_id, resp);
-    }
-
-    fn complete_follow_fd_pass(&mut self, follow_id: u64, ret: i32) {
-        tracing::debug!(%follow_id, %ret, "complete_follow_fd_pass");
-        if let Some(resp) = self.follow_pend.remove(&follow_id) {
-            tracing::debug!(pid = %resp.pid, "follow fd-pass done, closing reader");
-            let _ = unsafe { libc::close(resp.pipe_reader) };
-        }
-    }
-
-    fn complete_pipe_write(&mut self, pipe_id: u64, ret: i32) {
-        let Some(&pid) = self.pipe_map.get(&pipe_id) else {
-            return;
-        };
-        let Some(info) = self.containers.get_mut(&pid) else {
-            self.pipe_map.remove(&pipe_id);
-            return;
-        };
-        if info.gateway.complete_write(pipe_id, ret) {
-            self.pipe_map.remove(&pipe_id);
-        }
-    }
-
-    // ── Stream attach session handlers ────────────────────────────────────
-
-    fn handle_accept(&mut self, ret: i32) {
-        if ret < 0 {
-            // Accept failed (e.g. EAGAIN with non-blocking). Resubmit.
-            tracing::warn!(%ret, "accept failed");
-            let mut sq = self.ring.submission();
-            uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
-            return;
-        }
-        let stream_fd = ret;
-        let session_id = self.next_session_id;
-        self.next_session_id += 1;
-        tracing::debug!(%session_id, %stream_fd, "attach session accepted");
-        self.attach_sessions
-            .insert(session_id, AttachSession::new(stream_fd));
-        // Read first header.
-        self.submit_stream_read_header(session_id);
-        // Re-submit accept.
-        let mut sq = self.ring.submission();
-        uring::push_accept(&mut sq, self.attach_listener_fd, ACCEPT);
-    }
-
-    fn submit_stream_read_header(&mut self, session_id: u64) {
-        let session = self.attach_sessions.get_mut(&session_id).unwrap();
-        session.reading_header = true;
-        session.frame_buf.resize(3, 0);
-        let mut sq = self.ring.submission();
-        uring::push_read(
-            &mut sq,
-            session.stream_fd,
-            &mut session.frame_buf,
-            STREAM_READ | session_id,
-        );
-    }
-
-    fn handle_stream_read(&mut self, session_id: u64, ret: i32) {
-        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-            return;
-        };
-
-        if ret <= 0 {
-            if ret < 0 {
-                tracing::error!(%session_id, %ret, "stream read error, closing session");
-            } else {
-                tracing::info!(%session_id, "stream read EOF, closing session");
-            }
-            self.close_attach_session(session_id);
-            return;
-        }
-
-        if session.reading_header {
-            // Read 3-byte header.
-            session.frame_type = session.frame_buf[0];
-            session.frame_len = u16::from_le_bytes([session.frame_buf[1], session.frame_buf[2]]);
-            let len = session.frame_len as usize;
-            if len == 0 {
-                // No payload: dispatch immediately.
-                let frame_type = session.frame_type;
-                self.dispatch_frame(session_id, frame_type, &[]);
-            } else {
-                session.reading_header = false;
-                session.frame_buf.resize(len, 0);
-                let mut sq = self.ring.submission();
-                let s = self.attach_sessions.get_mut(&session_id).unwrap();
-                uring::push_read(
-                    &mut sq,
-                    s.stream_fd,
-                    &mut s.frame_buf,
-                    STREAM_READ | session_id,
-                );
-            }
-        } else {
-            // Payload complete.
-            let frame_type = session.frame_type;
-            let data = session.frame_buf[..session.frame_len as usize].to_vec();
-            self.dispatch_frame(session_id, frame_type, &data);
-        }
-    }
-
-    fn dispatch_frame(&mut self, session_id: u64, frame_type: u8, data: &[u8]) {
-        match frame_type {
-            0x00 => {
-                // RunRequest: parse JSON Request::Run
-                let request: Request = match serde_json::from_slice(data) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!(%session_id, %e, "invalid RunRequest JSON");
-                        self.close_attach_session(session_id);
-                        return;
-                    }
-                };
-                match request {
-                    Request::Run {
-                        rootfs,
-                        net_pid,
-                        save,
-                        command,
-                        interactive,
-                        tty,
-                    } => {
-                        self.handle_run_attach(session_id, RunArgs {
-                            rootfs,
-                            net_pid,
-                            save,
-                            command: CStringSerde::into_inner_vec(command),
-                            tty: tty.unwrap_or(false),
-                            interactive: interactive.unwrap_or(false),
-                        });
-                    }
-                    Request::Attach { pid } => {
-                        self.handle_attach(session_id, pid);
-                    }
-                    _ => {
-                        tracing::error!(%session_id, "expected Run or Attach inside frame");
-                        self.close_attach_session(session_id);
-                    }
-                }
-            }
-            0x10 => {
-                if !data.is_empty() {
-                    let mut sq = self.ring.submission();
-                    if let Some(session) = self.attach_sessions.get_mut(&session_id) {
-                        let fd = if session.ptm_fd >= 0 {
-                            session.ptm_fd
-                        } else {
-                            session.input_fd
-                        };
-                        if fd >= 0 {
-                            session.write_buf.clear();
-                            session.write_buf.extend_from_slice(data);
-                            session.pty_write_pending = true;
-                            uring::push_write(
-                                &mut sq,
-                                fd,
-                                &session.write_buf,
-                                PTY_WRITE | session_id,
-                            );
+                        let mut s = state.borrow_mut();
+                        if let Some(sess) = s.attach_sessions.get_mut(&sid) {
+                            sess.child_exited = true;
+                            sess.exit_code = Some(exit_code);
+                        }
+                        if let Some(notify) = s.session_notify.get(&sid) {
+                            notify.child_exit.notify(());
                         }
                     }
                 }
-                self.submit_stream_read_header(session_id);
-            }
-            0x11 => {
-                if let Some(session) = self.attach_sessions.get_mut(&session_id) {
-                    let fd = if session.ptm_fd >= 0 {
-                        let fd = session.ptm_fd;
-                        session.ptm_fd = -1;
-                        fd
-                    } else if session.input_fd >= 0 {
-                        let fd = session.input_fd;
-                        session.input_fd = -1;
-                        fd
-                    } else {
-                        -1
+
+                // Remove the container: move its log cache to the graveyard,
+                // close its fds and follow pipes, clean up the overlay. If the
+                // container still has output drains running (detached
+                // containers finish draining asynchronously after exit), defer
+                // the cleanup to `finish_drain` so the follow pipes stay open
+                // until the last of the buffered output has been delivered.
+                let removed = {
+                    let mut s = state.borrow_mut();
+                    let Some(info) = s.containers.get(&pid) else {
+                        continue;
                     };
-                    if fd >= 0 {
-                        sys::close(fd);
+                    if info.drains_pending > 0 {
+                        continue;
                     }
-                }
-                self.submit_stream_read_header(session_id);
-            }
-            0x20 => {
-                // WinSize: parse JSON { rows: u16, cols: u16 }
-                #[derive(serde::Deserialize)]
-                struct WinSize {
-                    rows: u16,
-                    cols: u16,
-                }
-                let ws: WinSize = match serde_json::from_slice(data) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!(%session_id, %e, "invalid WinSize JSON");
-                        self.submit_stream_read_header(session_id);
-                        return;
+                    let Some(mut info) = s.containers.remove(&pid) else {
+                        continue;
+                    };
+                    let cache =
+                        std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
+                    s.log_graveyard.insert(pid, cache);
+                    if info.ptm_fd >= 0 {
+                        sys::close(info.ptm_fd);
+                        info.ptm_fd = -1;
                     }
+                    if info.stdin_fd >= 0 {
+                        sys::close(info.stdin_fd);
+                        info.stdin_fd = -1;
+                    }
+                    info.gateway.close_all_pipes();
+                    info
                 };
-                if let Some(session) = self.attach_sessions.get_mut(&session_id)
-                    && session.ptm_fd >= 0
+                if let Some(ref overlay) = removed.overlay_dir
+                    && !removed.save
                 {
-                    let mut w: libc::winsize = unsafe { std::mem::zeroed() };
-                    w.ws_row = ws.rows;
-                    w.ws_col = ws.cols;
-                    let _ = unsafe { libc::ioctl(session.ptm_fd, libc::TIOCSWINSZ, &w) };
+                    cleanup_overlay(overlay);
                 }
-                self.submit_stream_read_header(session_id);
             }
-            _ => {
-                tracing::warn!(%session_id, %frame_type, "unknown frame type, closing");
-                self.close_attach_session(session_id);
-            }
-        }
-    }
-
-    /// Run a container with an interactive stream session. If `tty` or
-    /// `interactive` is set, a PTY is allocated and child I/O flows through
-    /// it; otherwise stdout/stderr go through a pipe (same as detached) and
-    /// stdin is wired to `/dev/null`. The result is sent as a framed
-    /// `RunResponse` on the Unix stream, and the session stays open for
-    /// bidirectional data/EOF/WinSize frames until the child exits.
-    fn handle_run_attach(&mut self, session_id: u64, args: RunArgs) {
-        let Some(session) = self.attach_sessions.get(&session_id) else {
-            return;
-        };
-        let stream_fd = session.stream_fd;
-
-        let mut err = |msg: &str| {
-            let payload = serde_json::to_vec(&ErrorResponse {
-                ok: false,
-                error: msg.to_string(),
-            })
-            .unwrap();
-            let mut frame = Vec::with_capacity(3 + payload.len());
-            frame.push(0x01);
-            frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-            frame.extend_from_slice(&payload);
-            let _ = sys::write(stream_fd, &frame);
-            self.close_attach_session(session_id);
-        };
-
-        let use_pty = args.tty || args.interactive;
-        let save = args.save;
-        let prep = match prepare_run(args) {
-            Ok(p) => p,
+            Ok(_) => break,
             Err(e) => {
-                err(&e);
-                return;
-            }
-        };
-
-        let (master, mut slave) = if use_pty {
-            match pty::open_pty() {
-                Ok((m, s)) => (Some(m), Some(s)),
-                Err(e) => {
-                    err(&format!("pty allocation failed: {e}"));
-                    return;
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        let mut pipe_fds = sys::FdPair {
-            read: -1,
-            write: -1,
-        };
-        if !use_pty && let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-            err(&format!("log pipe creation failed: {e}"));
-            return;
-        }
-
-        let clone_result = clone3_container(prep.clone_flags);
-        match clone_result {
-            Err(e) => {
-                if pipe_fds.read >= 0 {
-                    sys::close(pipe_fds.read);
-                }
-                if pipe_fds.write >= 0 {
-                    sys::close(pipe_fds.write);
-                }
-                err(&format!("clone3 failed: {e}"));
-            }
-            Ok(None) => {
-                drop(master);
-                if use_pty {
-                    if let Some(slave) = slave.take()
-                        && let Err(e) = slave.make_controlling()
-                    {
-                        tracing::error!(%e, "pty setup failed in child");
-                        std::process::exit(1);
-                    }
-                } else {
-                    sys::close(pipe_fds.read);
-                    let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
-                    let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
-                    if pipe_fds.write != libc::STDOUT_FILENO
-                        && pipe_fds.write != libc::STDERR_FILENO
-                    {
-                        sys::close(pipe_fds.write);
-                    }
-                    let devnull = CString::from("/dev/null");
-                    let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
-                    if fd < 0 {
-                        tracing::error!("cannot open /dev/null");
-                        std::process::exit(1);
-                    }
-                    let _ = sys::dup2(fd, libc::STDIN_FILENO);
-                    sys::close(fd);
-                }
-
-                if let Err(e) = prep.signal.wait() {
-                    tracing::error!(%e, "sync wait failed");
-                    std::process::exit(1);
-                }
-                child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
-            }
-            Ok(Some(pid)) => {
-                drop(slave);
-
-                if let Err(e) =
-                    parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal)
-                {
-                    err(&format!("container aborted: {e}"));
-                    return;
-                }
-
-                let ptm_fd = master.map_or(-1, |m| {
-                    let fd = m.raw_fd();
-                    std::mem::forget(m);
-                    fd
-                });
-
-                if pipe_fds.write >= 0 {
-                    sys::close(pipe_fds.write);
-                }
-
-                let cmd_str = prep
-                    .command
-                    .iter()
-                    .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                if let Some(session) = self.attach_sessions.get_mut(&session_id) {
-                    session.child_pid = pid;
-                    session.ptm_fd = ptm_fd;
-                    session.log_read_fd = pipe_fds.read;
-                }
-
-                self.containers.insert(pid, ContainerInfo {
-                    pid,
-                    command: cmd_str,
-                    overlay_dir: prep.overlay_dir,
-                    save,
-                    start_time: SystemTime::now(),
-                    gateway: LogGateway::new(LOG_CAPACITY),
-                    stdin_fd: -1,
-                    ptm_fd: -1,
-                    pty_read_buf: Vec::new(),
-                    pty_line_buf: Vec::new(),
-                });
-
-                tracing::info!(%pid, %session_id, "attach container started");
-
-                let payload = serde_json::to_vec(&RunResponse {
-                    ok: true,
-                    pid: Some(pid),
-                    error: None,
-                })
-                .unwrap();
-                self.send_attach_frame(session_id, 0x01, &payload);
-
-                self.submit_stream_read_header(session_id);
-            }
-        }
-    }
-
-    fn send_attach_frame(&mut self, session_id: u64, frame_type: u8, payload: &[u8]) {
-        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-            return;
-        };
-        let stream_fd = session.stream_fd;
-        session.stream_wbuf.clear();
-        session.stream_wbuf.push(frame_type);
-        session
-            .stream_wbuf
-            .extend_from_slice(&(payload.len() as u16).to_le_bytes());
-        session.stream_wbuf.extend_from_slice(payload);
-        session.stream_write_pending = true;
-        let mut sq = self.ring.submission();
-        uring::push_write(
-            &mut sq,
-            stream_fd,
-            &session.stream_wbuf,
-            STREAM_WRITE | session_id,
-        );
-    }
-
-    fn submit_output_read(&mut self, session_id: u64) {
-        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-            return;
-        };
-        let fd = if session.ptm_fd >= 0 {
-            session.ptm_fd
-        } else if session.log_read_fd >= 0 {
-            session.log_read_fd
-        } else {
-            return;
-        };
-        let mut sq = self.ring.submission();
-        uring::push_read(&mut sq, fd, &mut session.output_rbuf, PTY_READ | session_id);
-    }
-
-    fn handle_pty_read(&mut self, session_id: u64, ret: i32) {
-        // Fast path: successful read → send data frame (no close_attach_session
-        // needed).
-        if ret > 0 {
-            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-                return;
-            };
-            let n = ret as usize;
-            session.stream_wbuf.clear();
-            session.stream_wbuf.push(0x10); // Data frame type
-            session
-                .stream_wbuf
-                .extend_from_slice(&(n as u16).to_le_bytes());
-            session
-                .stream_wbuf
-                .extend_from_slice(&session.output_rbuf[..n]);
-            session.stream_write_pending = true;
-            let fd = session.stream_fd;
-            let mut sq = self.ring.submission();
-            uring::push_write(&mut sq, fd, &session.stream_wbuf, STREAM_WRITE | session_id);
-            // PTY_READ is NOT resubmitted here — it waits for STREAM_WRITE
-            // completion to provide backpressure.
-            return;
-        }
-        // EOF/error path: close output fds, then maybe close session.
-        let child_exited;
-        {
-            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-                return;
-            };
-            if ret < 0 {
-                tracing::error!(%session_id, %ret, "PTY/pipe read error");
-            } else {
-                tracing::info!(%session_id, "PTY/pipe read EOF");
-            }
-            if session.ptm_fd >= 0 {
-                sys::close(session.ptm_fd);
-                session.ptm_fd = -1;
-            }
-            if session.log_read_fd >= 0 {
-                sys::close(session.log_read_fd);
-                session.log_read_fd = -1;
-            }
-            child_exited = session.child_exited;
-        }
-        if child_exited {
-            self.close_attach_session(session_id);
-        }
-    }
-
-    fn handle_stream_write(&mut self, session_id: u64, ret: i32) {
-        let (child_exited, has_output, no_output_fds, no_pty_write) = {
-            let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-                return;
-            };
-            session.stream_write_pending = false;
-            if ret < 0 {
-                tracing::warn!(%session_id, %ret, "stream write error, closing");
-                let _ = session;
-                self.close_attach_session(session_id);
-                return;
-            }
-            // If there's a deferred exit-code frame, send it now.
-            if session.child_exited
-                && !session.stream_wbuf.is_empty()
-                && session.stream_wbuf[0] == 0x02
-            {
-                let fd = session.stream_fd;
-                let buf = session.stream_wbuf.clone();
-                session.stream_wbuf.clear();
-                session.stream_write_pending = true;
-                let _ = session;
-                let mut sq = self.ring.submission();
-                uring::push_write(&mut sq, fd, &buf, STREAM_WRITE | session_id);
-                return;
-            }
-            (
-                session.child_exited,
-                session.ptm_fd >= 0 || session.log_read_fd >= 0,
-                session.ptm_fd < 0 && session.log_read_fd < 0,
-                !session.pty_write_pending,
-            )
-        };
-        // Resubmit output read for more data (ping-pong flow control).
-        if has_output {
-            self.submit_output_read(session_id);
-        }
-        // If child exited and no more output reads pending, close.
-        if child_exited && no_output_fds && no_pty_write {
-            self.close_attach_session(session_id);
-        }
-    }
-
-    fn handle_pty_write(&mut self, session_id: u64, ret: i32) {
-        let Some(session) = self.attach_sessions.get_mut(&session_id) else {
-            return;
-        };
-        session.pty_write_pending = false;
-        if ret < 0 {
-            tracing::warn!(%session_id, %ret, "PTY write error, closing PTY");
-            if session.ptm_fd >= 0 {
-                sys::close(session.ptm_fd);
-                session.ptm_fd = -1;
-            }
-            if session.input_fd >= 0 {
-                sys::close(session.input_fd);
-                session.input_fd = -1;
-            }
-        }
-    }
-
-    fn close_attach_session(&mut self, session_id: u64) {
-        if let Some(session) = self.attach_sessions.remove(&session_id) {
-            tracing::info!(%session_id, "closing attach session");
-            if session.stream_fd >= 0 {
-                sys::close(session.stream_fd);
-            }
-            if session.ptm_fd >= 0 {
-                sys::close(session.ptm_fd);
-            }
-            if session.log_read_fd >= 0 {
-                sys::close(session.log_read_fd);
-            }
-            if session.input_fd >= 0 {
-                sys::close(session.input_fd);
-            }
-        }
-    }
-
-    fn reap_children(&mut self) {
-        loop {
-            let mut status: i32 = 0;
-            match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
-                Ok(pid) if pid > 0 => {
-                    tracing::info!(%pid, %status, "container exited");
-
-                    // Check if this pid belongs to an attach session.
-                    let session_id = self.attach_sessions.iter().find_map(|(&id, s)| {
-                        (s.child_pid == pid || s.container_pid == pid).then_some(id)
-                    });
-
-                    if let Some(sid) = session_id {
-                        // Attached container or late-attach.
-                        if let Some(session) = self.attach_sessions.get_mut(&sid) {
-                            session.child_exited = true;
-                            let exit_code = if libc::WIFEXITED(status) {
-                                libc::WEXITSTATUS(status)
-                            } else if libc::WIFSIGNALED(status) {
-                                128 + libc::WTERMSIG(status)
-                            } else {
-                                1
-                            };
-                            let payload =
-                                serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code }))
-                                    .unwrap();
-                            if !session.stream_write_pending {
-                                self.send_attach_frame(sid, 0x02, &payload);
-                            } else {
-                                session.stream_wbuf.clear();
-                                session.stream_wbuf.push(0x02);
-                                session
-                                    .stream_wbuf
-                                    .extend_from_slice(&(payload.len() as u16).to_le_bytes());
-                                session.stream_wbuf.extend_from_slice(&payload);
-                            }
-                        }
-                        if let Some(mut info) = self.containers.remove(&pid) {
-                            let cache = std::mem::replace(
-                                &mut info.gateway.cache,
-                                LogCache::new(LOG_CAPACITY),
-                            );
-                            self.log_graveyard.insert(pid, cache);
-                            if info.ptm_fd >= 0 {
-                                sys::close(info.ptm_fd);
-                            }
-                            if info.stdin_fd >= 0 {
-                                sys::close(info.stdin_fd);
-                            }
-                            info.gateway.close_all_pipes();
-                            if let Some(ref overlay) = info.overlay_dir
-                                && !info.save
-                            {
-                                cleanup_overlay(overlay);
-                            }
-                        }
-                    } else {
-                        // Detached container.
-                        if let Some(mut info) = self.containers.remove(&pid) {
-                            let cache = std::mem::replace(
-                                &mut info.gateway.cache,
-                                LogCache::new(LOG_CAPACITY),
-                            );
-                            self.log_graveyard.insert(pid, cache);
-                            self.pipe_map.retain(|_id, &mut p| p != pid);
-                            if info.ptm_fd >= 0 {
-                                sys::close(info.ptm_fd);
-                            }
-                            if info.stdin_fd >= 0 {
-                                sys::close(info.stdin_fd);
-                            }
-                            info.gateway.close_all_pipes();
-                            if let Some(ref overlay) = info.overlay_dir
-                                && !info.save
-                            {
-                                cleanup_overlay(overlay);
-                            }
-                        }
-                    }
-                }
-                Ok(_) => break,
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::ECHILD) {
-                        break;
-                    }
-                    tracing::warn!(%e, "waitpid error during reap");
+                if e.raw_os_error() == Some(libc::ECHILD) {
                     break;
                 }
+                tracing::warn!(%e, "waitpid error during reap");
+                break;
             }
         }
     }
@@ -2069,7 +782,7 @@ pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>
         let r = libc::bind(
             datagram.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
-            size_of::<libc::sa_family_t>() as _,
+            std::mem::size_of::<libc::sa_family_t>() as _,
         );
         if r < 0 {
             return Err(io::Error::last_os_error());
@@ -2171,10 +884,7 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
 }
 
 /// Write uid/gid maps into the child's user namespace (if needed), then
-/// signal the child to proceed. The child is stopped after `clone3` and
-/// blocked on `signal.wait()` — this function unblocks it only after maps
-/// are confirmed written, preventing the child from running with
-/// unconfigured namespaces.
+/// signal the child to proceed.
 fn parent_setup_maps_and_signal(
     pid: pid_t,
     needs_userns_maps: bool,
@@ -2187,10 +897,8 @@ fn parent_setup_maps_and_signal(
     Ok(())
 }
 
-/// Called in the child process after `clone3`. Brings up loopback, sets
-/// hostname, mounts overlay rootfs and pivot_root, then `execvp` into
-/// the workload. Never returns — either execs successfully or calls
-/// `process::exit(1)`.
+/// Called in the child process after `clone3`. Never returns — either execs
+/// successfully or calls `process::exit(1)`.
 fn child_init_environment(
     rootfs: &Option<PathBuf>,
     overlay_dir: &Option<PathBuf>,
@@ -2229,6 +937,1343 @@ fn child_init_environment(
     std::process::exit(1)
 }
 
+// ── Async request handlers ──────────────────────────────────────────────────
+
+async fn datagram_task(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+) {
+    let datagram_fd = state.borrow().datagram_fd;
+
+    let mut recv = MsgMut::new().expect("recvmsg slot");
+    let mut recv_buf = vec![0u8; 65536];
+    recv.push_iov(libc::iovec {
+        iov_base: recv_buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: recv_buf.len(),
+    });
+    let mut sender: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+
+    loop {
+        // Offer the sender-address buffer; the kernel fills it on recvmsg.
+        {
+            let msg = recv.msg();
+            msg.msg_name = (&mut sender as *mut libc::sockaddr_un).cast();
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        }
+        let n = match recvmsg(ctx, datagram_fd, &mut recv, 0).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(%e, "datagram recv failed");
+                continue;
+            }
+        };
+        if n == 0 {
+            continue;
+        }
+        let sender_len = recv.msg().msg_namelen;
+
+        let request: Request = match serde_json::from_slice(&recv_buf[..n]) {
+            Ok(r) => r,
+            Err(e) => {
+                reply_datagram(datagram_fd, &sender, sender_len, &ErrorResponse {
+                    ok: false,
+                    error: format!("invalid request: {e}"),
+                });
+                continue;
+            }
+        };
+
+        handle_datagram(ctx, rt, state, datagram_fd, &sender, sender_len, request).await;
+    }
+}
+
+async fn handle_datagram(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    datagram_fd: RawFd,
+    sender: &libc::sockaddr_un,
+    sender_len: libc::socklen_t,
+    request: Request,
+) {
+    match request {
+        Request::Run {
+            rootfs,
+            net_pid,
+            save,
+            command,
+            interactive,
+            tty,
+        } => handle_run(rt, state, datagram_fd, sender, sender_len, RunArgs {
+            rootfs,
+            net_pid,
+            save,
+            command: CStringSerde::into_inner_vec(command),
+            tty: tty.unwrap_or(false),
+            interactive: interactive.unwrap_or(false),
+        }),
+        Request::List => {
+            let now = SystemTime::now();
+            let containers: Vec<ContainerSummary> = state
+                .borrow()
+                .containers
+                .values()
+                .map(|info| {
+                    let age = now.duration_since(info.start_time).unwrap_or_default();
+                    ContainerSummary {
+                        pid: info.pid,
+                        command: info.command.clone(),
+                        start_time: format!("{:.1}s", age.as_secs_f64()),
+                    }
+                })
+                .collect();
+            reply_datagram(datagram_fd, sender, sender_len, &ListResponse {
+                containers,
+            });
+        }
+        Request::Kill { pid } => {
+            let pid = pid as pid_t;
+            if !state.borrow().containers.contains_key(&pid) {
+                reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+                    ok: false,
+                    error: Some(format!("container {pid} not found")),
+                });
+                return;
+            }
+            let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+                    ok: false,
+                    error: Some(format!("kill failed: {e}")),
+                });
+                return;
+            }
+            tracing::info!(%pid, "sent SIGKILL");
+            reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+                ok: true,
+                error: None,
+            });
+        }
+        Request::Logs { pid, follow } => {
+            let pid = pid as pid_t;
+            if follow {
+                handle_follow(ctx, state, datagram_fd, sender, sender_len, pid).await;
+            } else {
+                let lines = {
+                    let mut s = state.borrow_mut();
+                    if let Some(info) = s.containers.get_mut(&pid) {
+                        info.gateway.collect_lines()
+                    } else if let Some(cache) = s.log_graveyard.get_mut(&pid) {
+                        cache.collect_lines()
+                    } else {
+                        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+                            ok: false,
+                            error: format!("container {pid} not found"),
+                        });
+                        return;
+                    }
+                };
+                reply_datagram(datagram_fd, sender, sender_len, &LogsResponse { lines });
+            }
+        }
+        Request::Attach { .. } => {
+            reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+                ok: false,
+                error: "attach must be sent over the stream socket".into(),
+            });
+        }
+    }
+}
+
+fn reply_datagram(
+    datagram_fd: RawFd,
+    sender: &libc::sockaddr_un,
+    sender_len: libc::socklen_t,
+    resp: &impl Serialize,
+) {
+    let data = serde_json::to_vec(resp).unwrap();
+    if let Err(e) = send_datagram_raw(datagram_fd, sender, sender_len, &data) {
+        tracing::error!(%e, "reply sendto failed");
+    }
+}
+
+/// The `Logs { follow: true }` path. Runs entirely in the datagram task: the
+/// backlog is snapshotted and written to a fresh pipe synchronously (the
+/// snapshot is at most the cache capacity, which fits the default pipe
+/// capacity, and no await happens between the snapshot and the write, so no
+/// other task can push a line into the gap) — no lock is needed. The read end
+/// is then passed to the client with an async SCM_RIGHTS `sendmsg`, and the
+/// pipe writer is attached to the container's gateway so live output flows to
+/// it through the normal container-output task.
+async fn handle_follow(
+    ctx: TaskContext,
+    state: &Rc<RefCell<DaemonState>>,
+    datagram_fd: RawFd,
+    sender: &libc::sockaddr_un,
+    sender_len: libc::socklen_t,
+    pid: pid_t,
+) {
+    tracing::debug!(%pid, "handle_follow");
+
+    let backlog = match state.borrow_mut().containers.get_mut(&pid) {
+        Some(info) => info.gateway.snapshot(),
+        None => {
+            reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+                ok: false,
+                error: format!("container {pid} not found"),
+            });
+            return;
+        }
+    };
+
+    let mut pipe_fds = sys::FdPair {
+        read: -1,
+        write: -1,
+    };
+    if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+        tracing::error!(%e, "follow pipe creation failed");
+        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+            ok: false,
+            error: format!("pipe creation failed: {e}"),
+        });
+        return;
+    }
+
+    if !backlog.is_empty() {
+        let mut written = 0usize;
+        while written < backlog.len() {
+            let n = unsafe {
+                libc::write(
+                    pipe_fds.write,
+                    backlog[written..].as_ptr() as *const _,
+                    backlog.len() - written,
+                )
+            };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                tracing::error!(%e, "backlog write to pipe failed");
+                let _ = unsafe { libc::close(pipe_fds.write) };
+                let _ = unsafe { libc::close(pipe_fds.read) };
+                return;
+            }
+            if n == 0 {
+                break;
+            }
+            written += n as usize;
+        }
+    }
+
+    {
+        let mut s = state.borrow_mut();
+        let pipe_id = s.next_pipe_id;
+        s.next_pipe_id += 1;
+        let Some(info) = s.containers.get_mut(&pid) else {
+            let _ = unsafe { libc::close(pipe_fds.write) };
+            let _ = unsafe { libc::close(pipe_fds.read) };
+            return;
+        };
+        info.gateway
+            .pipes
+            .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
+    }
+
+    // Pass the read end to the client with SCM_RIGHTS.
+    let mut slot = Msg::new().expect("sendmsg slot");
+    slot.push_scm_rights(&[pipe_fds.read]);
+    {
+        let msg = slot.msg();
+        msg.msg_name = (sender as *const libc::sockaddr_un as *mut libc::c_void).cast();
+        msg.msg_namelen = sender_len;
+    }
+    match sendmsg(ctx, datagram_fd, &mut slot).await {
+        Ok(_) => {}
+        Err(e) => tracing::error!(%e, "fd-pass sendmsg failed"),
+    }
+    let _ = unsafe { libc::close(pipe_fds.read) };
+}
+
+/// Run a container in detached mode. Fully synchronous except for the spawns:
+/// stdout/stderr are captured from a pipe and drained by the
+/// `ContainerOutput` task (and, for `--tty`, the pty echo by
+/// `ContainerPtyOutput`). The caller receives a `RunResponse` datagram.
+fn handle_run(
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    datagram_fd: RawFd,
+    sender: &libc::sockaddr_un,
+    sender_len: libc::socklen_t,
+    args: RunArgs,
+) {
+    let err = |msg: &str| {
+        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+            ok: false,
+            error: msg.to_string(),
+        });
+    };
+
+    let save = args.save;
+    let use_pty = args.tty;
+    let interactive = args.interactive;
+    let use_stdin_pipe = interactive && !use_pty;
+    let prep = match prepare_run(args) {
+        Ok(p) => p,
+        Err(e) => {
+            err(&e);
+            return;
+        }
+    };
+
+    let mut stdin_pipe_fds = sys::FdPair {
+        read: -1,
+        write: -1,
+    };
+    if use_stdin_pipe && let Err(e) = sys::pipe2(&mut stdin_pipe_fds, libc::O_CLOEXEC) {
+        err(&format!("stdin pipe creation failed: {e}"));
+        return;
+    }
+
+    let (pty_master, pty_slave) = if use_pty {
+        match pty::open_pty() {
+            Ok((m, s)) => (Some(m), Some(s)),
+            Err(e) => {
+                err(&format!("pty allocation failed: {e}"));
+                return;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let mut pipe_fds = sys::FdPair {
+        read: -1,
+        write: -1,
+    };
+    if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+        err(&format!("log pipe creation failed: {e}"));
+        return;
+    }
+
+    let clone_result = clone3_container(prep.clone_flags);
+    match clone_result {
+        Err(e) => {
+            sys::close(pipe_fds.read);
+            sys::close(pipe_fds.write);
+            if stdin_pipe_fds.read >= 0 {
+                sys::close(stdin_pipe_fds.read);
+            }
+            if stdin_pipe_fds.write >= 0 {
+                sys::close(stdin_pipe_fds.write);
+            }
+            drop(pty_master);
+            drop(pty_slave);
+            err(&format!("clone3 failed: {e}"));
+        }
+        Ok(None) => {
+            // Child.
+            sys::close(pipe_fds.read);
+            let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
+            let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
+            if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
+                sys::close(pipe_fds.write);
+            }
+
+            if use_pty {
+                drop(pty_master);
+                if let Some(slave) = pty_slave
+                    && let Err(e) = slave.make_controlling()
+                {
+                    tracing::error!(%e, "pty setup failed in child");
+                    std::process::exit(1);
+                }
+                // After make_controlling, dup2 the pipe write to stdout/stderr
+                // too so output goes to the log gateway.
+                let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
+                let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
+                if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
+                    sys::close(pipe_fds.write);
+                }
+                if stdin_pipe_fds.read >= 0 {
+                    sys::close(stdin_pipe_fds.read);
+                }
+                if stdin_pipe_fds.write >= 0 {
+                    sys::close(stdin_pipe_fds.write);
+                }
+            } else if use_stdin_pipe {
+                sys::close(stdin_pipe_fds.write);
+                let _ = sys::dup2(stdin_pipe_fds.read, libc::STDIN_FILENO);
+                sys::close(stdin_pipe_fds.read);
+            } else {
+                let devnull = CString::from("/dev/null");
+                let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
+                if fd < 0 {
+                    tracing::error!("cannot open /dev/null");
+                    std::process::exit(1);
+                }
+                let _ = sys::dup2(fd, libc::STDIN_FILENO);
+                sys::close(fd);
+            }
+
+            if let Err(e) = prep.signal.wait() {
+                tracing::error!(%e, "sync wait failed");
+                std::process::exit(1);
+            }
+            child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
+        }
+        Ok(Some(pid)) => {
+            // Parent.
+            sys::close(pipe_fds.write);
+            drop(pty_slave);
+
+            let stdin_write_fd = if use_stdin_pipe {
+                sys::close(stdin_pipe_fds.read);
+                stdin_pipe_fds.write
+            } else {
+                -1
+            };
+            let ptm_fd = pty_master.map_or(-1, |m| {
+                let fd = m.raw_fd();
+                std::mem::forget(m);
+                fd
+            });
+
+            if let Err(e) = parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal) {
+                sys::close(pipe_fds.read);
+                if stdin_write_fd >= 0 {
+                    sys::close(stdin_write_fd);
+                }
+                if ptm_fd >= 0 {
+                    sys::close(ptm_fd);
+                }
+                err(&format!("container aborted: {e}"));
+                return;
+            }
+
+            let cmd_str = prep
+                .command
+                .iter()
+                .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let has_pty = ptm_fd >= 0;
+
+            {
+                let mut s = state.borrow_mut();
+                s.outputs.insert(pid, Output { fd: pipe_fds.read });
+                s.containers.insert(pid, ContainerInfo {
+                    pid,
+                    command: cmd_str,
+                    overlay_dir: prep.overlay_dir,
+                    save,
+                    start_time: SystemTime::now(),
+                    gateway: LogGateway::new(LOG_CAPACITY),
+                    stdin_fd: stdin_write_fd,
+                    ptm_fd,
+                    drains_pending: 0,
+                });
+            }
+
+            match rt.spawn(TaskKind::ContainerOutput { pid }) {
+                Some(_) => {
+                    let mut s = state.borrow_mut();
+                    if let Some(info) = s.containers.get_mut(&pid) {
+                        info.drains_pending += 1;
+                    }
+                }
+                None => tracing::error!("task slab full, failed to spawn container output task"),
+            }
+            if has_pty {
+                match rt.spawn(TaskKind::ContainerPtyOutput { pid }) {
+                    Some(_) => {
+                        let mut s = state.borrow_mut();
+                        if let Some(info) = s.containers.get_mut(&pid) {
+                            info.drains_pending += 1;
+                        }
+                    }
+                    None => tracing::error!("task slab full, failed to spawn pty output task"),
+                }
+            }
+
+            tracing::info!(%pid, "container started");
+            reply_datagram(datagram_fd, sender, sender_len, &RunResponse {
+                ok: true,
+                pid: Some(pid),
+                error: None,
+            });
+        }
+    }
+}
+
+// ── Container output drains ───────────────────────────────────────────────
+
+/// Accumulate `bytes` into `line_buf`, extracting complete `\n`-terminated
+/// lines into `lines`. A trailing partial line stays in `line_buf`.
+fn drain_lines(line_buf: &mut Vec<u8>, bytes: &[u8], lines: &mut Vec<Vec<u8>>) {
+    line_buf.extend_from_slice(bytes);
+    let mut start = 0usize;
+    let total = line_buf.len();
+    for i in 0..total {
+        if line_buf[i] == b'\n' {
+            lines.push(line_buf[start..i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < total {
+        line_buf.drain(..start);
+    } else {
+        line_buf.clear();
+    }
+}
+
+/// Split `line` plus its trailing `\n` into fixed-pool-sized write buffers.
+/// Each non-final buffer carries exactly [`WRITE_CHUNK_PAYLOAD`] bytes; the
+/// final buffer carries the remainder and the `\n`. Pipes are byte streams, so
+/// writing the chunks in order delivers exactly `line` + `\n`.
+fn split_line(line: &[u8]) -> Vec<Bytes> {
+    let mut chunks = Vec::new();
+    let mut rest = line;
+    loop {
+        let take = rest.len().min(WRITE_CHUNK_PAYLOAD);
+        let last = take == rest.len();
+        let mut buf = pool_alloc(take + 1);
+        buf.set_len((take + 1) as u32);
+        buf[..take].copy_from_slice(&rest[..take]);
+        if last {
+            buf[take] = b'\n';
+        }
+        chunks.push(buf.into_bytes());
+        if last {
+            return chunks;
+        }
+        rest = &rest[take..];
+    }
+}
+
+/// Push `lines` into the container's gateway (or the graveyard cache if the
+/// container was already reaped), writing each to its idle follow pipes. All
+/// awaits happen without holding a borrow on the shared state. A line's
+/// in-flight mark is held across all of its chunks, so the next line can never
+/// interleave with it on the same pipe.
+async fn write_lines(
+    ctx: TaskContext,
+    state: &Rc<RefCell<DaemonState>>,
+    pid: pid_t,
+    lines: Vec<Vec<u8>>,
+) {
+    for line in lines {
+        let pending = {
+            let mut s = state.borrow_mut();
+            match s.containers.get_mut(&pid) {
+                Some(info) => {
+                    let mut pend = Vec::new();
+                    for id in info.gateway.push(&line) {
+                        if let Some(fd) = info.gateway.pipe_fd(id) {
+                            pend.push((id, fd));
+                        }
+                    }
+                    pend
+                }
+                None => {
+                    if let Some(cache) = s.log_graveyard.get_mut(&pid) {
+                        cache.push(&line);
+                    }
+                    Vec::new()
+                }
+            }
+        };
+        if pending.is_empty() {
+            continue;
+        }
+        let chunks = split_line(&line);
+        for (id, fd) in pending {
+            let mut ok = true;
+            for chunk in &chunks {
+                let view = chunk.sub(0, chunk.len()).expect("line chunk in bounds");
+                if let Err(e) = write_all(ctx, fd, view).await {
+                    tracing::warn!(%e, "follow pipe write failed");
+                    ok = false;
+                    break;
+                }
+            }
+            {
+                let mut s = state.borrow_mut();
+                if let Some(info) = s.containers.get_mut(&pid) {
+                    info.gateway.complete_write(id, ok);
+                }
+            }
+        }
+    }
+}
+
+/// Decrements a container's drain counter. When the last output/pty drain task
+/// finishes, removes the container, moves its log cache to the graveyard,
+/// closes its fds and follow pipes, and cleans up its overlay. No-op when the
+/// container is already gone (reaper cleaned it up, or it had no drain tasks).
+fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
+    let removed = {
+        let mut s = state.borrow_mut();
+        let Some(info) = s.containers.get_mut(&pid) else {
+            return;
+        };
+        info.drains_pending = info.drains_pending.saturating_sub(1);
+        if info.drains_pending > 0 {
+            return;
+        }
+        let Some(mut info) = s.containers.remove(&pid) else {
+            return;
+        };
+        let cache = std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
+        s.log_graveyard.insert(pid, cache);
+        if info.ptm_fd >= 0 {
+            sys::close(info.ptm_fd);
+            info.ptm_fd = -1;
+        }
+        if info.stdin_fd >= 0 {
+            sys::close(info.stdin_fd);
+            info.stdin_fd = -1;
+        }
+        info.gateway.close_all_pipes();
+        info
+    };
+    if let Some(ref overlay) = removed.overlay_dir
+        && !removed.save
+    {
+        cleanup_overlay(overlay);
+    }
+}
+
+/// Drains one container's stdout/stderr pipe into its log gateway. The read
+/// buffer and line assembly live in this task's locals; the gateway and pipe
+/// bookkeeping are touched only inside short synchronous borrows.
+async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
+    let fd = match state.borrow().outputs.get(&pid) {
+        Some(o) => o.fd,
+        None => {
+            tracing::warn!(%pid, "container output task: no output entry");
+            finish_drain(state, pid);
+            return;
+        }
+    };
+    let mut line_buf: Vec<u8> = Vec::new();
+    loop {
+        let bytes = match read(ctx, fd, 4096).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(%pid, %e, "output read failed, closing output");
+                break;
+            }
+        };
+        if bytes.is_empty() {
+            break;
+        }
+        let mut lines = Vec::new();
+        drain_lines(&mut line_buf, &bytes, &mut lines);
+        if !lines.is_empty() {
+            write_lines(ctx, state, pid, lines).await;
+        }
+    }
+    // EOF: drop the output entry, close the pipe, and finish this drain.
+    {
+        let mut s = state.borrow_mut();
+        if let Some(o) = s.outputs.remove(&pid)
+            && o.fd >= 0
+        {
+            sys::close(o.fd);
+        }
+    }
+    finish_drain(state, pid);
+}
+
+/// Drains a detached TTY container's pty master echo into its log gateway.
+/// The pipe drain captures stdout/stderr; this captures the terminal echo.
+async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
+    let ptm_fd = match state.borrow().containers.get(&pid) {
+        Some(info) => info.ptm_fd,
+        None => {
+            finish_drain(state, pid);
+            return;
+        }
+    };
+    if ptm_fd < 0 {
+        finish_drain(state, pid);
+        return;
+    }
+    let mut line_buf: Vec<u8> = Vec::new();
+    loop {
+        let bytes = match read(ctx, ptm_fd, 4096).await {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => break,
+            Err(e) => {
+                tracing::warn!(%pid, %e, "pty output read failed");
+                break;
+            }
+        };
+        let mut lines = Vec::new();
+        drain_lines(&mut line_buf, &bytes, &mut lines);
+        if !lines.is_empty() {
+            write_lines(ctx, state, pid, lines).await;
+        }
+    }
+    // EOF/error: close the pty master, clear it on the container, and finish
+    // this drain.
+    {
+        let mut s = state.borrow_mut();
+        if let Some(info) = s.containers.get_mut(&pid)
+            && info.ptm_fd >= 0
+        {
+            sys::close(info.ptm_fd);
+            info.ptm_fd = -1;
+        }
+    }
+    finish_drain(state, pid);
+}
+
+// ── Accept + attach sessions ────────────────────────────────────────────────
+
+async fn accept_task(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+) {
+    let listener_fd = state.borrow().attach_listener_fd;
+    loop {
+        let stream_fd = match accept(ctx, listener_fd).await {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::warn!(%e, "accept failed, retrying");
+                continue;
+            }
+        };
+        let session_id = {
+            let mut s = state.borrow_mut();
+            let id = s.next_session_id;
+            s.next_session_id += 1;
+            s.attach_sessions.insert(id, AttachSession {
+                stream_fd,
+                ptm_fd: -1,
+                input_fd: -1,
+                log_read_fd: -1,
+                container_pid: 0,
+                child_exited: false,
+                exit_code: None,
+            });
+            s.session_notify.insert(id, SessionNotify {
+                child_exit: Notify::new(),
+            });
+            id
+        };
+        match rt.spawn(TaskKind::SessionRead { session_id }) {
+            Some(_) => {}
+            None => {
+                tracing::error!("task slab full, closing attach session");
+                let mut s = state.borrow_mut();
+                s.attach_sessions.remove(&session_id);
+                s.session_notify.remove(&session_id);
+                sys::close(stream_fd);
+            }
+        }
+    }
+}
+
+fn close_session(state: &Rc<RefCell<DaemonState>>, session_id: u64) {
+    let mut s = state.borrow_mut();
+    if let Some(sess) = s.attach_sessions.remove(&session_id) {
+        tracing::info!(%session_id, "closing attach session");
+        // Wake the session's output task if it is waiting on the child exit,
+        // so it can stop even when the client disconnects before the reaper.
+        if let Some(notify) = s.session_notify.get(&session_id) {
+            notify.child_exit.notify(());
+        }
+        s.session_notify.remove(&session_id);
+        if sess.stream_fd >= 0 {
+            sys::close(sess.stream_fd);
+        }
+        if sess.ptm_fd >= 0 {
+            sys::close(sess.ptm_fd);
+        }
+        if sess.log_read_fd >= 0 {
+            sys::close(sess.log_read_fd);
+        }
+        if sess.input_fd >= 0 {
+            sys::close(sess.input_fd);
+        }
+    }
+}
+
+/// Reads client frames from the session's stream and dispatches them. Keeps
+/// reading until the client disconnects (or a fatal frame error closes the
+/// session).
+async fn session_read_task(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+) {
+    let stream_fd = match state.borrow().attach_sessions.get(&session_id) {
+        Some(s) => s.stream_fd,
+        None => return,
+    };
+    loop {
+        // 3-byte header: frame type + u16 payload length (LE).
+        let header = match read_exact(ctx, stream_fd, 3).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(%session_id, %e, "stream read error/EOF, closing session");
+                close_session(state, session_id);
+                return;
+            }
+        };
+        let frame_type = header[0];
+        let frame_len = u16::from_le_bytes([header[1], header[2]]) as usize;
+        if frame_len == 0 {
+            let empty = pool_alloc(1);
+            let mut empty = empty;
+            empty.set_len(0);
+            if !dispatch_frame(ctx, rt, state, session_id, frame_type, empty.into_bytes()).await {
+                close_session(state, session_id);
+                return;
+            }
+            continue;
+        }
+        let payload = match read_exact(ctx, stream_fd, frame_len).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(%session_id, %e, "frame payload read error/EOF");
+                close_session(state, session_id);
+                return;
+            }
+        };
+        if !dispatch_frame(ctx, rt, state, session_id, frame_type, payload).await {
+            close_session(state, session_id);
+            return;
+        }
+    }
+}
+
+/// Dispatch one stream frame. Returns `false` when the session must close.
+async fn dispatch_frame(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+    frame_type: u8,
+    payload: Bytes,
+) -> bool {
+    match frame_type {
+        0x00 => {
+            let request: Request = match serde_json::from_slice(&payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(%session_id, %e, "invalid RunRequest JSON");
+                    return false;
+                }
+            };
+            match request {
+                Request::Run { .. } => handle_run_attach(ctx, rt, state, session_id, request).await,
+                Request::Attach { pid } => handle_attach(ctx, rt, state, session_id, pid).await,
+                _ => {
+                    tracing::error!(%session_id, "expected Run or Attach inside frame");
+                    false
+                }
+            }
+        }
+        0x10 => {
+            if !payload.is_empty() {
+                let fd = {
+                    let s = state.borrow();
+                    match s.attach_sessions.get(&session_id) {
+                        Some(sess) => {
+                            if sess.ptm_fd >= 0 {
+                                sess.ptm_fd
+                            } else {
+                                sess.input_fd
+                            }
+                        }
+                        None => -1,
+                    }
+                };
+                if fd >= 0
+                    && let Err(e) = write_all(ctx, fd, payload).await
+                {
+                    tracing::warn!(%session_id, %e, "stdin write failed");
+                }
+            }
+            true
+        }
+        0x11 => {
+            {
+                let mut s = state.borrow_mut();
+                if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                    let fd = if sess.ptm_fd >= 0 {
+                        let fd = sess.ptm_fd;
+                        sess.ptm_fd = -1;
+                        fd
+                    } else if sess.input_fd >= 0 {
+                        let fd = sess.input_fd;
+                        sess.input_fd = -1;
+                        fd
+                    } else {
+                        -1
+                    };
+                    if fd >= 0 {
+                        sys::close(fd);
+                    }
+                }
+            }
+            true
+        }
+        0x20 => {
+            #[derive(serde::Deserialize)]
+            struct WinSize {
+                rows: u16,
+                cols: u16,
+            }
+            match serde_json::from_slice::<WinSize>(&payload) {
+                Ok(ws) => {
+                    let ptm_fd = state
+                        .borrow()
+                        .attach_sessions
+                        .get(&session_id)
+                        .map(|s| s.ptm_fd)
+                        .unwrap_or(-1);
+                    if ptm_fd >= 0 {
+                        let mut w: libc::winsize = unsafe { std::mem::zeroed() };
+                        w.ws_row = ws.rows;
+                        w.ws_col = ws.cols;
+                        let _ = unsafe { libc::ioctl(ptm_fd, libc::TIOCSWINSZ, &w) };
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(%session_id, %e, "invalid WinSize JSON");
+                    true
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(%session_id, %frame_type, "unknown frame type, closing");
+            false
+        }
+    }
+}
+
+/// Send one framed message (type + u16 length + payload) on the session's
+/// stream. Resolves the stream fd first so no borrow spans the await.
+async fn send_attach_frame(
+    ctx: TaskContext,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+    frame_type: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let stream_fd = state
+        .borrow()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd)
+        .unwrap_or(-1);
+    if stream_fd < 0 {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
+    }
+    let len = 3 + payload.len();
+    let mut buf = pool_alloc(len);
+    buf.set_len(len as u32);
+    buf[0] = frame_type;
+    buf[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    buf[3..].copy_from_slice(payload);
+    write_all(ctx, stream_fd, buf.into_bytes()).await
+}
+
+/// Send a `0x10` data frame carrying one read buffer.
+async fn send_data_frame(
+    ctx: TaskContext,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+    data: &Bytes,
+) -> io::Result<()> {
+    let stream_fd = state
+        .borrow()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd)
+        .unwrap_or(-1);
+    if stream_fd < 0 {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
+    }
+    let len = 3 + data.len();
+    let mut buf = pool_alloc(len);
+    buf.set_len(len as u32);
+    buf[0] = 0x10;
+    buf[1..3].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    buf[3..].copy_from_slice(data);
+    write_all(ctx, stream_fd, buf.into_bytes()).await
+}
+
+/// Run a container inside an attach session (0x00 run frame). The pty (for
+/// `--tty`/`--interactive`) or log pipe lives in the session; the child is
+/// inserted into the container map so the reaper can report its exit code.
+/// Sends a `0x01` response frame and spawns the `SessionOutput` task.
+async fn handle_run_attach(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+    request: Request,
+) -> bool {
+    let args = match request {
+        Request::Run {
+            rootfs,
+            net_pid,
+            save,
+            command,
+            interactive,
+            tty,
+        } => RunArgs {
+            rootfs,
+            net_pid,
+            save,
+            command: CStringSerde::into_inner_vec(command),
+            tty: tty.unwrap_or(false),
+            interactive: interactive.unwrap_or(false),
+        },
+        _ => return false,
+    };
+    let Some(stream_fd) = state
+        .borrow()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd)
+    else {
+        return false;
+    };
+
+    let err = |msg: &str| {
+        let payload = serde_json::to_vec(&ErrorResponse {
+            ok: false,
+            error: msg.to_string(),
+        })
+        .unwrap();
+        let mut frame = Vec::with_capacity(3 + payload.len());
+        frame.push(0x01);
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let _ = sys::write(stream_fd, &frame);
+        close_session(state, session_id);
+    };
+
+    let use_pty = args.tty || args.interactive;
+    let save = args.save;
+    let prep = match prepare_run(args) {
+        Ok(p) => p,
+        Err(e) => {
+            err(&e);
+            return false;
+        }
+    };
+
+    let (master, mut slave) = if use_pty {
+        match pty::open_pty() {
+            Ok((m, s)) => (Some(m), Some(s)),
+            Err(e) => {
+                err(&format!("pty allocation failed: {e}"));
+                return false;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let mut pipe_fds = sys::FdPair {
+        read: -1,
+        write: -1,
+    };
+    if !use_pty && let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+        err(&format!("log pipe creation failed: {e}"));
+        return false;
+    }
+
+    let clone_result = clone3_container(prep.clone_flags);
+    match clone_result {
+        Err(e) => {
+            if pipe_fds.read >= 0 {
+                sys::close(pipe_fds.read);
+            }
+            if pipe_fds.write >= 0 {
+                sys::close(pipe_fds.write);
+            }
+            err(&format!("clone3 failed: {e}"));
+            false
+        }
+        Ok(None) => {
+            drop(master);
+            if use_pty {
+                if let Some(slave) = slave.take()
+                    && let Err(e) = slave.make_controlling()
+                {
+                    tracing::error!(%e, "pty setup failed in child");
+                    std::process::exit(1);
+                }
+            } else {
+                sys::close(pipe_fds.read);
+                let _ = sys::dup2(pipe_fds.write, libc::STDOUT_FILENO);
+                let _ = sys::dup2(pipe_fds.write, libc::STDERR_FILENO);
+                if pipe_fds.write != libc::STDOUT_FILENO && pipe_fds.write != libc::STDERR_FILENO {
+                    sys::close(pipe_fds.write);
+                }
+                let devnull = CString::from("/dev/null");
+                let fd = unsafe { libc::open(devnull.as_raw(), libc::O_RDONLY) };
+                if fd < 0 {
+                    tracing::error!("cannot open /dev/null");
+                    std::process::exit(1);
+                }
+                let _ = sys::dup2(fd, libc::STDIN_FILENO);
+                sys::close(fd);
+            }
+            if let Err(e) = prep.signal.wait() {
+                tracing::error!(%e, "sync wait failed");
+                std::process::exit(1);
+            }
+            child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
+        }
+        Ok(Some(pid)) => {
+            drop(slave);
+
+            if let Err(e) = parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal) {
+                err(&format!("container aborted: {e}"));
+                return false;
+            }
+
+            let ptm_fd = master.map_or(-1, |m| {
+                let fd = m.raw_fd();
+                std::mem::forget(m);
+                fd
+            });
+            if pipe_fds.write >= 0 {
+                sys::close(pipe_fds.write);
+            }
+
+            let cmd_str = prep
+                .command
+                .iter()
+                .map(|c| unsafe { std::str::from_utf8_unchecked(c.to_bytes()) })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            {
+                let mut s = state.borrow_mut();
+                s.containers.insert(pid, ContainerInfo {
+                    pid,
+                    command: cmd_str,
+                    overlay_dir: prep.overlay_dir,
+                    save,
+                    start_time: SystemTime::now(),
+                    gateway: LogGateway::new(LOG_CAPACITY),
+                    stdin_fd: -1,
+                    ptm_fd: -1, // run_attach holds the ptm in the session
+                    drains_pending: 0,
+                });
+                if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                    sess.ptm_fd = ptm_fd;
+                    sess.log_read_fd = pipe_fds.read;
+                    sess.container_pid = pid;
+                }
+            }
+
+            tracing::info!(%pid, %session_id, "attach container started");
+
+            let payload = serde_json::to_vec(&RunResponse {
+                ok: true,
+                pid: Some(pid),
+                error: None,
+            })
+            .unwrap();
+            let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
+
+            match rt.spawn(TaskKind::SessionOutput { session_id }) {
+                Some(_) => {}
+                None => tracing::error!("task slab full, failed to spawn session output task"),
+            }
+
+            true
+        }
+    }
+}
+
+/// Late-attach to an already-running container (0x00 attach frame): creates a
+/// fresh follow pipe, registers its writer with the container's gateway (no
+/// backlog, matching the old daemon), wires the session to it, sends a `0x01`
+/// response frame, and spawns the `SessionOutput` task.
+async fn handle_attach(
+    ctx: TaskContext,
+    rt: RuntimeContext<TaskKind, ()>,
+    state: &Rc<RefCell<DaemonState>>,
+    session_id: u64,
+    pid: i32,
+) -> bool {
+    let pid = pid as pid_t;
+    let (found, input_fd) = {
+        let s = state.borrow();
+        match s.containers.get(&pid) {
+            Some(info) => (
+                true,
+                if info.ptm_fd >= 0 {
+                    info.ptm_fd
+                } else {
+                    info.stdin_fd
+                },
+            ),
+            None => (false, -1),
+        }
+    };
+    if !found {
+        let payload = serde_json::to_vec(&ErrorResponse {
+            ok: false,
+            error: format!("container {pid} not found"),
+        })
+        .unwrap();
+        let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
+        close_session(state, session_id);
+        return false;
+    }
+
+    let mut pipe_fds = sys::FdPair {
+        read: -1,
+        write: -1,
+    };
+    if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+        tracing::error!(%e, "attach follow pipe creation failed");
+        close_session(state, session_id);
+        return false;
+    }
+
+    {
+        let mut s = state.borrow_mut();
+        let pipe_id = s.next_pipe_id;
+        s.next_pipe_id += 1;
+        let Some(info) = s.containers.get_mut(&pid) else {
+            sys::close(pipe_fds.read);
+            sys::close(pipe_fds.write);
+            close_session(state, session_id);
+            return false;
+        };
+        info.gateway
+            .pipes
+            .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
+    }
+    {
+        let mut s = state.borrow_mut();
+        if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+            sess.log_read_fd = pipe_fds.read;
+            sess.input_fd = input_fd;
+            sess.container_pid = pid;
+        }
+    }
+
+    let payload = serde_json::to_vec(&RunResponse {
+        ok: true,
+        pid: Some(pid),
+        error: None,
+    })
+    .unwrap();
+    let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
+
+    match rt.spawn(TaskKind::SessionOutput { session_id }) {
+        Some(_) => {}
+        None => tracing::error!("task slab full, failed to spawn session output task"),
+    }
+
+    true
+}
+
+/// Drains the session's output (PTY or follow pipe) into `0x10` data frames,
+/// then — once the drain hits EOF and the child has been reaped — sends the
+/// deferred `0x02` exit frame and closes the session.
+async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, session_id: u64) {
+    let fd = {
+        let s = state.borrow();
+        match s.attach_sessions.get(&session_id) {
+            Some(sess) => {
+                if sess.ptm_fd >= 0 {
+                    sess.ptm_fd
+                } else {
+                    sess.log_read_fd
+                }
+            }
+            None => return,
+        }
+    };
+    if fd < 0 {
+        return;
+    }
+    let child_notify = match state.borrow().session_notify.get(&session_id) {
+        Some(n) => n.child_exit.clone(),
+        None => return,
+    };
+
+    // Drain output into 0x10 frames until EOF/error.
+    loop {
+        let bytes = match read(ctx, fd, 4096).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(%session_id, %e, "session output read failed");
+                break;
+            }
+        };
+        if bytes.is_empty() {
+            break;
+        }
+        let stream_fd = {
+            let s = state.borrow();
+            s.attach_sessions
+                .get(&session_id)
+                .map(|se| se.stream_fd)
+                .unwrap_or(-1)
+        };
+        if stream_fd < 0 {
+            break;
+        }
+        if let Err(e) = send_data_frame(ctx, state, session_id, &bytes).await {
+            tracing::warn!(%session_id, %e, "session stream write failed");
+            break;
+        }
+    }
+
+    // Wait for the child to exit (fired by the reaper, or by close_session
+    // when the client disconnected first), then send the deferred 0x02 frame.
+    let exit_code = {
+        let s = state.borrow();
+        match s.attach_sessions.get(&session_id) {
+            Some(sess) if sess.child_exited => sess.exit_code,
+            Some(_) => None,
+            None => return,
+        }
+    };
+    if exit_code.is_none() {
+        child_notify.wait(ctx).await;
+    }
+    let stream_fd = {
+        let s = state.borrow();
+        s.attach_sessions
+            .get(&session_id)
+            .map(|se| se.stream_fd)
+            .unwrap_or(-1)
+    };
+    if stream_fd < 0 {
+        return;
+    }
+    let exit_code = {
+        let s = state.borrow();
+        s.attach_sessions
+            .get(&session_id)
+            .and_then(|se| se.exit_code)
+    };
+    let payload =
+        serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code.unwrap_or(0) })).unwrap();
+    let _ = send_attach_frame(ctx, state, session_id, 0x02, &payload).await;
+    close_session(state, session_id);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2257,7 +2302,6 @@ mod tests {
         c.push(b"bar");
         let lines = c.collect_lines();
         assert_eq!(lines, &["foo", "bar"]);
-        // Snapshot after collect_lines should still have everything.
         let snap = c.snapshot();
         assert_eq!(snap, b"foo\nbar\n");
     }
@@ -2272,11 +2316,10 @@ mod tests {
     #[test]
     fn log_cache_evicts_oldest_when_full() {
         let mut c = LogCache::new(16);
-        // 4 pushes of 5 bytes each = 20 bytes total → 1st evicted.
         c.push(b"aaaa"); // 5 bytes
         c.push(b"bbbb"); // 5 bytes, total 10
         c.push(b"cccc"); // 5 bytes, total 15 (1 byte free)
-        c.push(b"dddd"); // 5 bytes, need 5, avail 1 → evict "aaaa\n" → write "dddd\n"
+        c.push(b"dddd"); // need 5, avail 1 → evict "aaaa\n" → write "dddd\n"
         let raw = c.snapshot();
         let snap = String::from_utf8_lossy(&raw);
         assert!(
@@ -2291,22 +2334,20 @@ mod tests {
     #[test]
     fn log_cache_wraparound() {
         let mut c = LogCache::new(16);
-        // Fill buffer with wraparound: evict older lines to make room.
         c.push(b"aaaa"); // bytes=5, end=5
         c.push(b"bbbb"); // bytes=10, end=10
         c.push(b"cccc"); // bytes=15, end=15, avail=1
-        // This push evicts "aaaa\n" → bytes=10, start=5, then writes "dddd\n" wrapping
-        // end to 4.
+        // evicts "aaaa\n" → bytes=10, start=5, then writes "dddd\n" wrapping
         c.push(b"dddd");
         let lines = c.collect_lines();
         assert_eq!(lines, &["bbbb", "cccc", "dddd"], "got {lines:?}");
-        // One more push evicts "bbbb\n"
         c.push(b"eeee");
         let lines = c.collect_lines();
         assert_eq!(lines, &["cccc", "dddd", "eeee"], "got {lines:?}");
     }
 
-    // ── LogGateway unit tests ─────────────────────────────────────────────
+    // ── LogGateway unit tests (sync bookkeeping; the async writes are
+    //    exercised by the integration tests) ─────────────────────────────
 
     fn make_pipe_pair() -> (RawFd, RawFd) {
         let mut fds = sys::FdPair {
@@ -2321,7 +2362,6 @@ mod tests {
     fn log_gateway_starts_empty() {
         let g = LogGateway::new(64);
         assert!(g.pipes.is_empty());
-        assert_eq!(g.lock_count, 0);
     }
 
     #[test]
@@ -2337,28 +2377,35 @@ mod tests {
     }
 
     #[test]
-    fn log_gateway_complete_write_alive_pipe() {
-        let (r, w) = make_pipe_pair();
-        let mut g = LogGateway::new(64);
-        g.pipes.push(AsyncPipeWriter::new(1, w));
-        assert!(!g.complete_write(1, 5)); // 5 bytes written = success
-        assert_eq!(g.pipes.len(), 1); // still alive
-        assert!(!g.pipes[0].in_flight);
-        let _ = unsafe { libc::close(r) };
+    fn log_gateway_push_marks_idle_pipes_in_flight() {
+        let mut g = LogGateway::new(4096);
+        let (r1, w1) = make_pipe_pair();
+        let (r2, w2) = make_pipe_pair();
+        g.pipes.push(AsyncPipeWriter::new(1, w1));
+        g.pipes.push(AsyncPipeWriter::new(2, w2));
+        let ids = g.push(b"hello");
+        assert_eq!(ids, &[1, 2]);
+        assert!(g.pipes[0].in_flight);
+        assert!(g.pipes[1].in_flight);
+        assert_eq!(g.cache.snapshot(), b"hello\n");
+        // A second push skips both in-flight pipes.
+        let ids = g.push(b"world");
+        assert!(ids.is_empty());
+        let _ = unsafe { libc::close(r1) };
+        let _ = unsafe { libc::close(r2) };
     }
 
     #[test]
     fn log_gateway_complete_write_removes_dead_pipe() {
         let (r, w) = make_pipe_pair();
-        // Close the read end so writing will fail, but for this test
-        // we simulate error by passing ret < 0.
         let _ = unsafe { libc::close(r) };
         let mut g = LogGateway::new(64);
         g.pipes.push(AsyncPipeWriter::new(1, w));
-        // Simulate write error
-        assert!(g.complete_write(1, -1)); // true = removed
+        let ids = g.push(b"hello");
+        assert_eq!(ids, &[1]);
+        g.complete_write(1, false); // write failed → pipe removed, fd closed
         assert!(g.pipes.is_empty());
-        // w fd was closed by complete()
+        assert!(g.pipe_fd(1).is_none());
     }
 
     #[test]
@@ -2366,7 +2413,7 @@ mod tests {
         let mut g = LogGateway::new(64);
         let (r, w) = make_pipe_pair();
         g.pipes.push(AsyncPipeWriter::new(1, w));
-        assert!(!g.complete_write(999, 0)); // not found
+        g.complete_write(999, true);
         assert_eq!(g.pipes.len(), 1);
         let _ = unsafe { libc::close(r) };
     }
@@ -2380,61 +2427,6 @@ mod tests {
         g.pipes.push(AsyncPipeWriter::new(2, w2));
         g.close_all_pipes();
         assert!(g.pipes.is_empty());
-        let _ = unsafe { libc::close(r1) };
-        let _ = unsafe { libc::close(r2) };
-    }
-
-    #[test]
-    fn log_gateway_lock_count_blocks_check() {
-        let mut g = LogGateway::new(64);
-        assert_eq!(g.lock_count, 0);
-        g.lock_count += 1;
-        assert!(g.lock_count > 0);
-        g.lock_count -= 1;
-        assert_eq!(g.lock_count, 0);
-    }
-
-    #[test]
-    fn log_gateway_write_goes_to_all_pipes() {
-        use io_uring::IoUring;
-        let (r1, w1) = make_pipe_pair();
-        let (r2, w2) = make_pipe_pair();
-        let mut g = LogGateway::new(4096);
-
-        let mut ring = IoUring::new(8).unwrap();
-        let mut sq = ring.submission();
-
-        g.pipes.push(AsyncPipeWriter::new(1, w1));
-        g.pipes.push(AsyncPipeWriter::new(2, w2));
-        g.write(&mut sq, b"hello");
-        assert_eq!(g.cache.snapshot(), b"hello\n");
-        // Both pipes should have an SQE in-flight
-        assert!(g.pipes[0].in_flight);
-        assert!(g.pipes[1].in_flight);
-        let _ = unsafe { libc::close(r1) };
-        let _ = unsafe { libc::close(r2) };
-    }
-
-    #[test]
-    fn log_gateway_write_skips_in_flight_pipe() {
-        use io_uring::IoUring;
-        let (r1, w1) = make_pipe_pair();
-        let (r2, w2) = make_pipe_pair();
-        let mut g = LogGateway::new(4096);
-
-        let mut ring = IoUring::new(8).unwrap();
-        let mut sq = ring.submission();
-
-        g.pipes.push(AsyncPipeWriter::new(1, w1));
-        g.pipes.push(AsyncPipeWriter::new(2, w2));
-        // Mark pipe 1 as in_flight
-        g.pipes[0].in_flight = true;
-        g.write(&mut sq, b"world");
-        assert_eq!(g.cache.snapshot(), b"world\n");
-        // Pipe 1 stays in_flight and didn't get a new SQE (its state unchanged)
-        assert!(g.pipes[0].in_flight);
-        // Pipe 2 got the write
-        assert!(g.pipes[1].in_flight);
         let _ = unsafe { libc::close(r1) };
         let _ = unsafe { libc::close(r2) };
     }

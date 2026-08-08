@@ -1,7 +1,6 @@
 pub mod daemon;
 pub mod interprocess;
 pub mod pty;
-pub mod uring;
 
 use std::ffi::c_int;
 use std::io;

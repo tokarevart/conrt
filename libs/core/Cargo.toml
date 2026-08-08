@@ -7,7 +7,6 @@ edition = "2024"
 conrt-cstring = { path = "../cstring" }
 conrt-sys = { path = "../sys" }
 coio = { path = "../coio" }
-io-uring = "0.7"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

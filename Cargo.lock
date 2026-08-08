@@ -149,7 +149,6 @@ dependencies = [
  "coio",
  "conrt-cstring",
  "conrt-sys",
- "io-uring",
  "libc",
  "serde",
  "serde_json",

@@ -59,7 +59,7 @@ container process ──write()──► PTY slave
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `io-uring` — raw io_uring bindings for the daemon event loop
+- `coio` — single-threaded `io_uring`-based async runtime that powers the daemon event loop
 
 ## Usage
 
