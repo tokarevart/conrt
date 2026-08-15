@@ -2198,9 +2198,38 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
         }
         None => -1,
     });
-    if fd < 0 {
-        return;
+    if fd >= 0 {
+        // Drain output into 0x10 frames until EOF/error. When `fd` is -1 (e.g.
+        // the client sent a 0x11 EOF frame that closed the pty master before
+        // this task sampled the session) there is nothing to drain; skip
+        // straight to the exit handshake below.
+        loop {
+            let bytes = match read(ctx, fd, 4096).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(%session_id, %e, "session output read failed");
+                    break;
+                }
+            };
+            if bytes.is_empty() {
+                break;
+            }
+            let stream_fd = with_state(state, |s| {
+                s.attach_sessions
+                    .get(&session_id)
+                    .map(|se| se.stream_fd)
+                    .unwrap_or(-1)
+            });
+            if stream_fd < 0 {
+                break;
+            }
+            if let Err(e) = send_data_frame(ctx, state, session_id, &bytes).await {
+                tracing::warn!(%session_id, %e, "session stream write failed");
+                break;
+            }
+        }
     }
+
     let Some(child_notify) = with_state(state, |s| {
         s.session_notify
             .get(&session_id)
@@ -2208,33 +2237,6 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
     }) else {
         return;
     };
-
-    // Drain output into 0x10 frames until EOF/error.
-    loop {
-        let bytes = match read(ctx, fd, 4096).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(%session_id, %e, "session output read failed");
-                break;
-            }
-        };
-        if bytes.is_empty() {
-            break;
-        }
-        let stream_fd = with_state(state, |s| {
-            s.attach_sessions
-                .get(&session_id)
-                .map(|se| se.stream_fd)
-                .unwrap_or(-1)
-        });
-        if stream_fd < 0 {
-            break;
-        }
-        if let Err(e) = send_data_frame(ctx, state, session_id, &bytes).await {
-            tracing::warn!(%session_id, %e, "session stream write failed");
-            break;
-        }
-    }
 
     // Wait for the child to exit (fired by the reaper, or by close_session
     // when the client disconnected first), then send the deferred 0x02 frame.
@@ -2265,6 +2267,8 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     #[test]
@@ -2416,5 +2420,90 @@ mod tests {
         assert!(g.pipes.is_empty());
         let _ = unsafe { libc::close(r1) };
         let _ = unsafe { libc::close(r2) };
+    }
+
+    // ── Session output task ────────────────────────────────────────────
+
+    fn read_available(mut client: &std::os::unix::net::UnixStream) -> Vec<u8> {
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut tmp = [0u8; 256];
+        loop {
+            match client.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    // Regression test: when a 0x11 EOF frame closes the pty master before the
+    // output task samples the session, the task has no fd to drain (ptm_fd and
+    // log_read_fd are both -1). It must still send the deferred 0x02 exit frame
+    // and close the session, instead of returning early and leaking it.
+    #[test]
+    fn session_output_task_sends_exit_frame_when_no_output_fd() {
+        let state = Rc::new(RefCell::new(DaemonState::new(PathBuf::from("/tmp/x.sock"))));
+
+        let (daemon_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stream_fd = daemon_end.as_raw_fd();
+        std::mem::forget(daemon_end); // keep the fd open; close_session closes it
+
+        const SESSION_ID: u64 = 7;
+        {
+            let mut s = state.borrow_mut();
+            s.attach_sessions.insert(SESSION_ID, AttachSession {
+                stream_fd,
+                ptm_fd: -1, // closed by a 0x11 EOF frame before the task sampled it
+                input_fd: -1,
+                log_read_fd: -1, // no follow/log pipe (pty run_attach)
+                container_pid: 12345,
+                child_exited: true,
+                exit_code: Some(0),
+            });
+            s.session_notify.insert(SESSION_ID, SessionNotify {
+                child_exit: Notify::new(),
+            });
+        }
+
+        let state2 = Rc::clone(&state);
+        block_on_default(
+            |ctx: TaskContext, _rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
+                let state = Rc::clone(&state2);
+                async move {
+                    match kind {
+                        TaskKind::SessionOutput { session_id } => {
+                            session_output_task(ctx, &state, session_id).await
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            },
+            TaskKind::SessionOutput {
+                session_id: SESSION_ID,
+            },
+        );
+
+        let frames = read_available(&client_end);
+        assert!(!frames.is_empty(), "expected a 0x02 exit frame, got none");
+        assert_eq!(frames[0], 0x02);
+        let payload_len = u16::from_le_bytes([frames[1], frames[2]]) as usize;
+        assert_eq!(
+            &frames[3..3 + payload_len],
+            br#"{"exit_code":0}"#,
+            "unexpected exit frame payload"
+        );
+
+        assert!(
+            !state.borrow().attach_sessions.contains_key(&SESSION_ID),
+            "session should be closed"
+        );
+        assert!(
+            !state.borrow().session_notify.contains_key(&SESSION_ID),
+            "session notify should be removed"
+        );
     }
 }
