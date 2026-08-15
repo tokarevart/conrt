@@ -457,7 +457,7 @@ struct SessionNotify {
 // registered only after the backlog write, so live output then flows to the
 // pipe through the normal container-output task.
 
-// ── DaemonState: shared, borrow-disciplined ────────────────────────────────
+// ── DaemonState / DaemonStateShared: shared, borrow-disciplined ────────────
 
 struct DaemonState {
     socket_path: PathBuf,
@@ -491,22 +491,41 @@ impl DaemonState {
     }
 }
 
-/// Run `f` against a synchronous immutable borrow of the shared state.
-///
-/// The `Ref` is dropped when the closure returns, so a borrow can never be
-/// held across an await point: an async task that needs the state extracts
-/// whatever it needs inside the closure and lets the borrow go before awaiting.
-fn with_state<T>(state: &Rc<RefCell<DaemonState>>, f: impl FnOnce(&DaemonState) -> T) -> T {
-    f(&state.borrow())
+/// Shared handle to the daemon state: an `Rc<RefCell<DaemonState>>` behind a
+/// borrow-disciplined facade. All access goes through [`Self::with`] /
+/// [`Self::with_mut`], which hand out a short, synchronous borrow so a
+/// borrow is never held across an await point. Tasks receive a clone of this
+/// handle (a cheap `Rc` bump) and pass `&DaemonStateShared` around.
+#[derive(Clone)]
+struct DaemonStateShared {
+    inner: Rc<RefCell<DaemonState>>,
 }
 
-/// Run `f` against a synchronous mutable borrow of the shared state.
-///
-/// Like [`with_state`], the `RefMut` is dropped when the closure returns, so
-/// mutations always happen in a short, synchronous span and never across an
-/// await point.
-fn with_state_mut<T>(state: &Rc<RefCell<DaemonState>>, f: impl FnOnce(&mut DaemonState) -> T) -> T {
-    f(&mut state.borrow_mut())
+impl DaemonStateShared {
+    fn new(socket_path: PathBuf) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(DaemonState::new(socket_path))),
+        }
+    }
+
+    /// Run `f` against a synchronous immutable borrow of the shared state.
+    ///
+    /// The `Ref` is dropped when the closure returns, so a borrow can never be
+    /// held across an await point: an async task that needs the state extracts
+    /// whatever it needs inside the closure and lets the borrow go before
+    /// awaiting.
+    fn with<T>(&self, f: impl FnOnce(&DaemonState) -> T) -> T {
+        f(&self.inner.borrow())
+    }
+
+    /// Run `f` against a synchronous mutable borrow of the shared state.
+    ///
+    /// Like [`Self::with`], the `RefMut` is dropped when the closure
+    /// returns, so mutations always happen in a short, synchronous span and
+    /// never across an await point.
+    fn with_mut<T>(&self, f: impl FnOnce(&mut DaemonState) -> T) -> T {
+        f(&mut self.inner.borrow_mut())
+    }
 }
 
 // ── Daemon entry point ────────────────────────────────────────────────────
@@ -521,18 +540,19 @@ impl Daemon {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        let state = Rc::new(RefCell::new(DaemonState::new(self.socket_path.clone())));
+        let state = DaemonStateShared::new(self.socket_path.clone());
 
         // `make_fut` is the single spawn entry point: every task (main and
         // spawned) is built by calling it, so the closure captures the shared
-        // state once and hands each task its own owned `Rc` clone. The returned
-        // future is `'static` because it owns the clone; the closure itself may
-        // borrow the stack `state` since `block_on` does not require `S` to be
-        // `'static`. `run()` returns only once the runtime drains, i.e. when
-        // every persistent task's io has completed (at process exit).
+        // state once and hands each task its own owned `DaemonStateShared`
+        // clone. The returned future is `'static` because it owns the clone;
+        // the closure itself may borrow the stack `state` since `block_on`
+        // does not require `S` to be `'static`. `run()` returns only once the
+        // runtime drains, i.e. when every persistent task's io has completed
+        // (at process exit).
         block_on_default(
             |ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
-                let state = Rc::clone(&state);
+                let state = state.clone();
                 async move { dispatcher(ctx, rt, kind, state).await }
             },
             TaskKind::Main,
@@ -548,7 +568,7 @@ async fn dispatcher(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
     kind: TaskKind,
-    state: Rc<RefCell<DaemonState>>,
+    state: DaemonStateShared,
 ) {
     match kind {
         TaskKind::Main => main_task(ctx, rt, &state).await,
@@ -570,12 +590,8 @@ async fn dispatcher(
 /// fds in the shared state, then spawn the persistent tasks. Returns once the
 /// daemon's background io is all up; the runtime stays alive while any io is
 /// in flight, and `run()` only returns when everything drains.
-async fn main_task(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
-) {
-    let socket_path = with_state(state, |s| s.socket_path.clone());
+async fn main_task(ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, state: &DaemonStateShared) {
+    let socket_path = state.with(|s| s.socket_path.clone());
     let dir = socket_path.parent().expect("socket path has a parent");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::error!(%e, path = %dir.display(), "cannot create socket dir");
@@ -624,7 +640,7 @@ async fn main_task(
     std::mem::forget(datagram);
     std::mem::forget(listener);
 
-    with_state_mut(state, |s| {
+    state.with_mut(|s| {
         s.datagram_fd = datagram_fd;
         s.attach_listener_fd = attach_listener_fd;
         s.sigchld_fd = sigchld_fd;
@@ -644,8 +660,8 @@ async fn main_task(
 
 // ── Signal reaper ─────────────────────────────────────────────────────────
 
-async fn reaper_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>) {
-    let sigchld_fd = with_state(state, |s| s.sigchld_fd);
+async fn reaper_task(ctx: TaskContext, state: &DaemonStateShared) {
+    let sigchld_fd = state.with(|s| s.sigchld_fd);
     loop {
         // One 128-byte `signalfd_siginfo` record; the read future owns its own
         // pooled buffer, so nothing must be borrowed across the await.
@@ -660,7 +676,7 @@ async fn reaper_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>) {
     }
 }
 
-fn reap_children(state: &Rc<RefCell<DaemonState>>) {
+fn reap_children(state: &DaemonStateShared) {
     loop {
         let mut status: i32 = 0;
         match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
@@ -674,7 +690,7 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                     1
                 };
 
-                let Some(session_id) = with_state(state, |s| {
+                let Some(session_id) = state.with(|s| {
                     let found = s
                         .attach_sessions
                         .iter()
@@ -695,7 +711,7 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                     // the exit code is ready. The output task sends the 0x02
                     // frame once its output drain hits EOF, so all 0x10 data
                     // frames are flushed before the exit frame.
-                    with_state_mut(state, |s| {
+                    state.with_mut(|s| {
                         if let Some(sess) = s.attach_sessions.get_mut(&sid) {
                             sess.child_exited = true;
                             sess.exit_code = Some(exit_code);
@@ -712,7 +728,7 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                 // containers finish draining asynchronously after exit), defer
                 // the cleanup to `finish_drain` so the follow pipes stay open
                 // until the last of the buffered output has been delivered.
-                let Some(removed) = with_state_mut(state, |s| {
+                let Some(removed) = state.with_mut(|s| {
                     let info = s.containers.get(&pid)?;
                     if info.drains_pending > 0 {
                         return None;
@@ -954,9 +970,9 @@ fn child_init_environment(
 async fn datagram_task(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
 ) {
-    let datagram_fd = with_state(state, |s| s.datagram_fd);
+    let datagram_fd = state.with(|s| s.datagram_fd);
 
     let mut recv = MsgMut::new().expect("recvmsg slot");
     let mut recv_buf = vec![0u8; 65536];
@@ -1003,7 +1019,7 @@ async fn datagram_task(
 async fn handle_datagram(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     datagram_fd: RawFd,
     sender: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
@@ -1027,7 +1043,7 @@ async fn handle_datagram(
         }),
         Request::List => {
             let now = SystemTime::now();
-            let containers: Vec<ContainerSummary> = with_state(state, |s| {
+            let containers: Vec<ContainerSummary> = state.with(|s| {
                 s.containers
                     .values()
                     .map(|info| {
@@ -1046,7 +1062,7 @@ async fn handle_datagram(
         }
         Request::Kill { pid } => {
             let pid = pid as pid_t;
-            if !with_state(state, |s| s.containers.contains_key(&pid)) {
+            if !state.with(|s| s.containers.contains_key(&pid)) {
                 reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
                     ok: false,
                     error: Some(format!("container {pid} not found")),
@@ -1073,7 +1089,7 @@ async fn handle_datagram(
             if follow {
                 handle_follow(ctx, state, datagram_fd, sender, sender_len, pid).await;
             } else {
-                let lines = with_state_mut(state, |s| {
+                let lines = state.with_mut(|s| {
                     if let Some(info) = s.containers.get_mut(&pid) {
                         Some(info.gateway.collect_lines())
                     } else {
@@ -1123,7 +1139,7 @@ fn reply_datagram(
 /// it through the normal container-output task.
 async fn handle_follow(
     ctx: TaskContext,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     datagram_fd: RawFd,
     sender: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
@@ -1131,7 +1147,7 @@ async fn handle_follow(
 ) {
     tracing::debug!(%pid, "handle_follow");
 
-    let backlog = with_state_mut(state, |s| match s.containers.get_mut(&pid) {
+    let backlog = state.with_mut(|s| match s.containers.get_mut(&pid) {
         Some(info) => Some(info.gateway.snapshot()),
         None => None,
     });
@@ -1180,7 +1196,7 @@ async fn handle_follow(
         }
     }
 
-    let attached = with_state_mut(state, |s| {
+    let attached = state.with_mut(|s| {
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
         let Some(info) = s.containers.get_mut(&pid) else {
@@ -1218,7 +1234,7 @@ async fn handle_follow(
 /// `ContainerPtyOutput`). The caller receives a `RunResponse` datagram.
 fn handle_run(
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     datagram_fd: RawFd,
     sender: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
@@ -1376,7 +1392,7 @@ fn handle_run(
                 .join(" ");
             let has_pty = ptm_fd >= 0;
 
-            with_state_mut(state, |s| {
+            state.with_mut(|s| {
                 s.outputs.insert(pid, Output { fd: pipe_fds.read });
                 s.containers.insert(pid, ContainerInfo {
                     pid,
@@ -1392,7 +1408,7 @@ fn handle_run(
             });
 
             match rt.spawn(TaskKind::ContainerOutput { pid }) {
-                Some(_) => with_state_mut(state, |s| {
+                Some(_) => state.with_mut(|s| {
                     if let Some(info) = s.containers.get_mut(&pid) {
                         info.drains_pending += 1;
                     }
@@ -1401,7 +1417,7 @@ fn handle_run(
             }
             if has_pty {
                 match rt.spawn(TaskKind::ContainerPtyOutput { pid }) {
-                    Some(_) => with_state_mut(state, |s| {
+                    Some(_) => state.with_mut(|s| {
                         if let Some(info) = s.containers.get_mut(&pid) {
                             info.drains_pending += 1;
                         }
@@ -1470,14 +1486,9 @@ fn split_line(line: &[u8]) -> Vec<Bytes> {
 /// awaits happen without holding a borrow on the shared state. A line's
 /// in-flight mark is held across all of its chunks, so the next line can never
 /// interleave with it on the same pipe.
-async fn write_lines(
-    ctx: TaskContext,
-    state: &Rc<RefCell<DaemonState>>,
-    pid: pid_t,
-    lines: Vec<Vec<u8>>,
-) {
+async fn write_lines(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t, lines: Vec<Vec<u8>>) {
     for line in lines {
-        let pending = with_state_mut(state, |s| match s.containers.get_mut(&pid) {
+        let pending = state.with_mut(|s| match s.containers.get_mut(&pid) {
             Some(info) => {
                 let mut pend = Vec::new();
                 for id in info.gateway.push(&line) {
@@ -1508,7 +1519,7 @@ async fn write_lines(
                     break;
                 }
             }
-            with_state_mut(state, |s| {
+            state.with_mut(|s| {
                 if let Some(info) = s.containers.get_mut(&pid) {
                     info.gateway.complete_write(id, ok);
                 }
@@ -1521,8 +1532,8 @@ async fn write_lines(
 /// finishes, removes the container, moves its log cache to the graveyard,
 /// closes its fds and follow pipes, and cleans up its overlay. No-op when the
 /// container is already gone (reaper cleaned it up, or it had no drain tasks).
-fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let removed = with_state_mut(state, |s| {
+fn finish_drain(state: &DaemonStateShared, pid: pid_t) {
+    let removed = state.with_mut(|s| {
         let info = s.containers.get_mut(&pid)?;
         info.drains_pending = info.drains_pending.saturating_sub(1);
         if info.drains_pending > 0 {
@@ -1555,8 +1566,8 @@ fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
 /// Drains one container's stdout/stderr pipe into its log gateway. The read
 /// buffer and line assembly live in this task's locals; the gateway and pipe
 /// bookkeeping are touched only inside short synchronous borrows.
-async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let fd = with_state(state, |s| s.outputs.get(&pid).map(|o| o.fd));
+async fn container_output_task(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t) {
+    let fd = state.with(|s| s.outputs.get(&pid).map(|o| o.fd));
     let Some(fd) = fd else {
         tracing::warn!(%pid, "container output task: no output entry");
         finish_drain(state, pid);
@@ -1581,7 +1592,7 @@ async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>
         }
     }
     // EOF: drop the output entry, close the pipe, and finish this drain.
-    with_state_mut(state, |s| {
+    state.with_mut(|s| {
         if let Some(o) = s.outputs.remove(&pid)
             && o.fd >= 0
         {
@@ -1593,8 +1604,8 @@ async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>
 
 /// Drains a detached TTY container's pty master echo into its log gateway.
 /// The pipe drain captures stdout/stderr; this captures the terminal echo.
-async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let ptm_fd = with_state(state, |s| s.containers.get(&pid).map(|info| info.ptm_fd));
+async fn container_pty_output_task(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t) {
+    let ptm_fd = state.with(|s| s.containers.get(&pid).map(|info| info.ptm_fd));
     let Some(ptm_fd) = ptm_fd else {
         finish_drain(state, pid);
         return;
@@ -1621,7 +1632,7 @@ async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonSt
     }
     // EOF/error: close the pty master, clear it on the container, and finish
     // this drain.
-    with_state_mut(state, |s| {
+    state.with_mut(|s| {
         if let Some(info) = s.containers.get_mut(&pid)
             && info.ptm_fd >= 0
         {
@@ -1637,9 +1648,9 @@ async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonSt
 async fn accept_task(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
 ) {
-    let listener_fd = with_state(state, |s| s.attach_listener_fd);
+    let listener_fd = state.with(|s| s.attach_listener_fd);
     loop {
         let stream_fd = match accept(ctx, listener_fd).await {
             Ok(fd) => fd,
@@ -1648,7 +1659,7 @@ async fn accept_task(
                 continue;
             }
         };
-        with_state_mut(state, |s| {
+        state.with_mut(|s| {
             let session_id = s.next_session_id;
             s.next_session_id += 1;
             s.attach_sessions.insert(session_id, AttachSession {
@@ -1668,7 +1679,7 @@ async fn accept_task(
                 Some(_) => {}
                 None => {
                     tracing::error!("task slab full, closing attach session");
-                    with_state_mut(state, |s| {
+                    state.with_mut(|s| {
                         s.attach_sessions.remove(&session_id);
                         s.session_notify.remove(&session_id);
                     });
@@ -1679,8 +1690,8 @@ async fn accept_task(
     }
 }
 
-fn close_session(state: &Rc<RefCell<DaemonState>>, session_id: u64) {
-    with_state_mut(state, |s| {
+fn close_session(state: &DaemonStateShared, session_id: u64) {
+    state.with_mut(|s| {
         let Some(sess) = s.attach_sessions.remove(&session_id) else {
             return;
         };
@@ -1712,12 +1723,10 @@ fn close_session(state: &Rc<RefCell<DaemonState>>, session_id: u64) {
 async fn session_read_task(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
 ) {
-    let stream_fd = with_state(state, |s| {
-        s.attach_sessions.get(&session_id).map(|s| s.stream_fd)
-    });
+    let stream_fd = state.with(|s| s.attach_sessions.get(&session_id).map(|s| s.stream_fd));
     let Some(stream_fd) = stream_fd else {
         return;
     };
@@ -1762,7 +1771,7 @@ async fn session_read_task(
 async fn dispatch_frame(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
     frame_type: u8,
     payload: Bytes,
@@ -1787,7 +1796,7 @@ async fn dispatch_frame(
         }
         0x10 => {
             if !payload.is_empty() {
-                let fd = with_state(state, |s| match s.attach_sessions.get(&session_id) {
+                let fd = state.with(|s| match s.attach_sessions.get(&session_id) {
                     Some(sess) => {
                         if sess.ptm_fd >= 0 {
                             sess.ptm_fd
@@ -1806,7 +1815,7 @@ async fn dispatch_frame(
             true
         }
         0x11 => {
-            with_state_mut(state, |s| {
+            state.with_mut(|s| {
                 if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
                     let fd = if sess.ptm_fd >= 0 {
                         let fd = sess.ptm_fd;
@@ -1834,7 +1843,7 @@ async fn dispatch_frame(
             }
             match serde_json::from_slice::<WinSize>(&payload) {
                 Ok(ws) => {
-                    let ptm_fd = with_state(state, |s| {
+                    let ptm_fd = state.with(|s| {
                         s.attach_sessions
                             .get(&session_id)
                             .map(|s| s.ptm_fd)
@@ -1865,12 +1874,12 @@ async fn dispatch_frame(
 /// stream. Resolves the stream fd first so no borrow spans the await.
 async fn send_attach_frame(
     ctx: TaskContext,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
     frame_type: u8,
     payload: &[u8],
 ) -> io::Result<()> {
-    let stream_fd = with_state(state, |s| {
+    let stream_fd = state.with(|s| {
         s.attach_sessions
             .get(&session_id)
             .map(|s| s.stream_fd)
@@ -1891,11 +1900,11 @@ async fn send_attach_frame(
 /// Send a `0x10` data frame carrying one read buffer.
 async fn send_data_frame(
     ctx: TaskContext,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
     data: &Bytes,
 ) -> io::Result<()> {
-    let stream_fd = with_state(state, |s| {
+    let stream_fd = state.with(|s| {
         s.attach_sessions
             .get(&session_id)
             .map(|s| s.stream_fd)
@@ -1920,7 +1929,7 @@ async fn send_data_frame(
 async fn handle_run_attach(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
     request: Request,
 ) -> bool {
@@ -1942,9 +1951,8 @@ async fn handle_run_attach(
         },
         _ => return false,
     };
-    let Some(stream_fd) = with_state(state, |s| {
-        s.attach_sessions.get(&session_id).map(|s| s.stream_fd)
-    }) else {
+    let Some(stream_fd) = state.with(|s| s.attach_sessions.get(&session_id).map(|s| s.stream_fd))
+    else {
         return false;
     };
 
@@ -2060,7 +2068,7 @@ async fn handle_run_attach(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            with_state_mut(state, |s| {
+            state.with_mut(|s| {
                 s.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
@@ -2106,12 +2114,12 @@ async fn handle_run_attach(
 async fn handle_attach(
     ctx: TaskContext,
     rt: RuntimeContext<TaskKind, ()>,
-    state: &Rc<RefCell<DaemonState>>,
+    state: &DaemonStateShared,
     session_id: u64,
     pid: i32,
 ) -> bool {
     let pid = pid as pid_t;
-    let (found, input_fd) = with_state(state, |s| match s.containers.get(&pid) {
+    let (found, input_fd) = state.with(|s| match s.containers.get(&pid) {
         Some(info) => (
             true,
             if info.ptm_fd >= 0 {
@@ -2143,7 +2151,7 @@ async fn handle_attach(
         return false;
     }
 
-    let attached = with_state_mut(state, |s| {
+    let attached = state.with_mut(|s| {
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
         let Some(info) = s.containers.get_mut(&pid) else {
@@ -2187,8 +2195,8 @@ async fn handle_attach(
 /// Drains the session's output (PTY or follow pipe) into `0x10` data frames,
 /// then — once the drain hits EOF and the child has been reaped — sends the
 /// deferred `0x02` exit frame and closes the session.
-async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, session_id: u64) {
-    let fd = with_state(state, |s| match s.attach_sessions.get(&session_id) {
+async fn session_output_task(ctx: TaskContext, state: &DaemonStateShared, session_id: u64) {
+    let fd = state.with(|s| match s.attach_sessions.get(&session_id) {
         Some(sess) => {
             if sess.ptm_fd >= 0 {
                 sess.ptm_fd
@@ -2214,7 +2222,7 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
             if bytes.is_empty() {
                 break;
             }
-            let stream_fd = with_state(state, |s| {
+            let stream_fd = state.with(|s| {
                 s.attach_sessions
                     .get(&session_id)
                     .map(|se| se.stream_fd)
@@ -2230,7 +2238,7 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
         }
     }
 
-    let Some(child_notify) = with_state(state, |s| {
+    let Some(child_notify) = state.with(|s| {
         s.session_notify
             .get(&session_id)
             .map(|n| n.child_exit.clone())
@@ -2240,15 +2248,15 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
 
     // Wait for the child to exit (fired by the reaper, or by close_session
     // when the client disconnected first), then send the deferred 0x02 frame.
-    let Some(child_exited) = with_state(state, |s| {
-        s.attach_sessions.get(&session_id).map(|se| se.child_exited)
-    }) else {
+    let Some(child_exited) =
+        state.with(|s| s.attach_sessions.get(&session_id).map(|se| se.child_exited))
+    else {
         return;
     };
     if !child_exited {
         child_notify.wait(ctx).await;
     }
-    let (stream_fd, exit_code) = with_state(state, |s| {
+    let (stream_fd, exit_code) = state.with(|s| {
         s.attach_sessions
             .get(&session_id)
             .map(|se| (se.stream_fd, se.exit_code))
@@ -2446,15 +2454,14 @@ mod tests {
     // and close the session, instead of returning early and leaking it.
     #[test]
     fn session_output_task_sends_exit_frame_when_no_output_fd() {
-        let state = Rc::new(RefCell::new(DaemonState::new(PathBuf::from("/tmp/x.sock"))));
+        let state = DaemonStateShared::new(PathBuf::from("/tmp/x.sock"));
 
         let (daemon_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let stream_fd = daemon_end.as_raw_fd();
         std::mem::forget(daemon_end); // keep the fd open; close_session closes it
 
         const SESSION_ID: u64 = 7;
-        {
-            let mut s = state.borrow_mut();
+        state.with_mut(|s| {
             s.attach_sessions.insert(SESSION_ID, AttachSession {
                 stream_fd,
                 ptm_fd: -1, // closed by a 0x11 EOF frame before the task sampled it
@@ -2467,12 +2474,12 @@ mod tests {
             s.session_notify.insert(SESSION_ID, SessionNotify {
                 child_exit: Notify::new(),
             });
-        }
+        });
 
-        let state2 = Rc::clone(&state);
+        let state2 = state.clone();
         block_on_default(
             |ctx: TaskContext, _rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
-                let state = Rc::clone(&state2);
+                let state = state2.clone();
                 async move {
                     match kind {
                         TaskKind::SessionOutput { session_id } => {
@@ -2498,11 +2505,11 @@ mod tests {
         );
 
         assert!(
-            !state.borrow().attach_sessions.contains_key(&SESSION_ID),
+            !state.with(|s| s.attach_sessions.contains_key(&SESSION_ID)),
             "session should be closed"
         );
         assert!(
-            !state.borrow().session_notify.contains_key(&SESSION_ID),
+            !state.with(|s| s.session_notify.contains_key(&SESSION_ID)),
             "session notify should be removed"
         );
     }
