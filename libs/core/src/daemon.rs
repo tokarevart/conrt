@@ -491,6 +491,24 @@ impl DaemonState {
     }
 }
 
+/// Run `f` against a synchronous immutable borrow of the shared state.
+///
+/// The `Ref` is dropped when the closure returns, so a borrow can never be
+/// held across an await point: an async task that needs the state extracts
+/// whatever it needs inside the closure and lets the borrow go before awaiting.
+fn with_state<T>(state: &Rc<RefCell<DaemonState>>, f: impl FnOnce(&DaemonState) -> T) -> T {
+    f(&state.borrow())
+}
+
+/// Run `f` against a synchronous mutable borrow of the shared state.
+///
+/// Like [`with_state`], the `RefMut` is dropped when the closure returns, so
+/// mutations always happen in a short, synchronous span and never across an
+/// await point.
+fn with_state_mut<T>(state: &Rc<RefCell<DaemonState>>, f: impl FnOnce(&mut DaemonState) -> T) -> T {
+    f(&mut state.borrow_mut())
+}
+
 // ── Daemon entry point ────────────────────────────────────────────────────
 
 pub struct Daemon {
@@ -557,7 +575,7 @@ async fn main_task(
     rt: RuntimeContext<TaskKind, ()>,
     state: &Rc<RefCell<DaemonState>>,
 ) {
-    let socket_path = state.borrow().socket_path.clone();
+    let socket_path = with_state(state, |s| s.socket_path.clone());
     let dir = socket_path.parent().expect("socket path has a parent");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::error!(%e, path = %dir.display(), "cannot create socket dir");
@@ -606,12 +624,11 @@ async fn main_task(
     std::mem::forget(datagram);
     std::mem::forget(listener);
 
-    {
-        let mut s = state.borrow_mut();
+    with_state_mut(state, |s| {
         s.datagram_fd = datagram_fd;
         s.attach_listener_fd = attach_listener_fd;
         s.sigchld_fd = sigchld_fd;
-    }
+    });
 
     // Spawn the persistent tasks. Each keeps an io op in flight, so the
     // runtime keeps running.
@@ -628,7 +645,7 @@ async fn main_task(
 // ── Signal reaper ─────────────────────────────────────────────────────────
 
 async fn reaper_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>) {
-    let sigchld_fd = state.borrow().sigchld_fd;
+    let sigchld_fd = with_state(state, |s| s.sigchld_fd);
     loop {
         // One 128-byte `signalfd_siginfo` record; the read future owns its own
         // pooled buffer, so nothing must be borrowed across the await.
@@ -657,21 +674,20 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                     1
                 };
 
-                let session_id = {
-                    let s = state.borrow();
-                    match s
+                let Some(session_id) = with_state(state, |s| {
+                    let found = s
                         .attach_sessions
                         .iter()
-                        .find_map(|(&id, sess)| (sess.container_pid == pid).then_some(id))
-                    {
-                        Some(id) => Some(id),
-                        None => {
-                            if !s.containers.contains_key(&pid) {
-                                continue;
-                            }
-                            None
-                        }
+                        .find_map(|(&id, sess)| (sess.container_pid == pid).then_some(id));
+                    // A pid we neither manage nor attach to is not ours; the
+                    // caller skips it.
+                    if found.is_some() || s.containers.contains_key(&pid) {
+                        Some(found)
+                    } else {
+                        None
                     }
+                }) else {
+                    continue;
                 };
 
                 if let Some(sid) = session_id {
@@ -679,8 +695,7 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                     // the exit code is ready. The output task sends the 0x02
                     // frame once its output drain hits EOF, so all 0x10 data
                     // frames are flushed before the exit frame.
-                    {
-                        let mut s = state.borrow_mut();
+                    with_state_mut(state, |s| {
                         if let Some(sess) = s.attach_sessions.get_mut(&sid) {
                             sess.child_exited = true;
                             sess.exit_code = Some(exit_code);
@@ -688,7 +703,7 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                         if let Some(notify) = s.session_notify.get(&sid) {
                             notify.child_exit.notify(());
                         }
-                    }
+                    });
                 }
 
                 // Remove the container: move its log cache to the graveyard,
@@ -697,17 +712,12 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                 // containers finish draining asynchronously after exit), defer
                 // the cleanup to `finish_drain` so the follow pipes stay open
                 // until the last of the buffered output has been delivered.
-                let removed = {
-                    let mut s = state.borrow_mut();
-                    let Some(info) = s.containers.get(&pid) else {
-                        continue;
-                    };
+                let Some(removed) = with_state_mut(state, |s| {
+                    let info = s.containers.get(&pid)?;
                     if info.drains_pending > 0 {
-                        continue;
+                        return None;
                     }
-                    let Some(mut info) = s.containers.remove(&pid) else {
-                        continue;
-                    };
+                    let mut info = s.containers.remove(&pid)?;
                     let cache =
                         std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
                     s.log_graveyard.insert(pid, cache);
@@ -720,7 +730,9 @@ fn reap_children(state: &Rc<RefCell<DaemonState>>) {
                         info.stdin_fd = -1;
                     }
                     info.gateway.close_all_pipes();
-                    info
+                    Some(info)
+                }) else {
+                    continue;
                 };
                 if let Some(ref overlay) = removed.overlay_dir
                     && !removed.save
@@ -944,7 +956,7 @@ async fn datagram_task(
     rt: RuntimeContext<TaskKind, ()>,
     state: &Rc<RefCell<DaemonState>>,
 ) {
-    let datagram_fd = state.borrow().datagram_fd;
+    let datagram_fd = with_state(state, |s| s.datagram_fd);
 
     let mut recv = MsgMut::new().expect("recvmsg slot");
     let mut recv_buf = vec![0u8; 65536];
@@ -1015,26 +1027,26 @@ async fn handle_datagram(
         }),
         Request::List => {
             let now = SystemTime::now();
-            let containers: Vec<ContainerSummary> = state
-                .borrow()
-                .containers
-                .values()
-                .map(|info| {
-                    let age = now.duration_since(info.start_time).unwrap_or_default();
-                    ContainerSummary {
-                        pid: info.pid,
-                        command: info.command.clone(),
-                        start_time: format!("{:.1}s", age.as_secs_f64()),
-                    }
-                })
-                .collect();
+            let containers: Vec<ContainerSummary> = with_state(state, |s| {
+                s.containers
+                    .values()
+                    .map(|info| {
+                        let age = now.duration_since(info.start_time).unwrap_or_default();
+                        ContainerSummary {
+                            pid: info.pid,
+                            command: info.command.clone(),
+                            start_time: format!("{:.1}s", age.as_secs_f64()),
+                        }
+                    })
+                    .collect()
+            });
             reply_datagram(datagram_fd, sender, sender_len, &ListResponse {
                 containers,
             });
         }
         Request::Kill { pid } => {
             let pid = pid as pid_t;
-            if !state.borrow().containers.contains_key(&pid) {
+            if !with_state(state, |s| s.containers.contains_key(&pid)) {
                 reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
                     ok: false,
                     error: Some(format!("container {pid} not found")),
@@ -1061,19 +1073,21 @@ async fn handle_datagram(
             if follow {
                 handle_follow(ctx, state, datagram_fd, sender, sender_len, pid).await;
             } else {
-                let lines = {
-                    let mut s = state.borrow_mut();
+                let lines = with_state_mut(state, |s| {
                     if let Some(info) = s.containers.get_mut(&pid) {
-                        info.gateway.collect_lines()
-                    } else if let Some(cache) = s.log_graveyard.get_mut(&pid) {
-                        cache.collect_lines()
+                        Some(info.gateway.collect_lines())
                     } else {
-                        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
-                            ok: false,
-                            error: format!("container {pid} not found"),
-                        });
-                        return;
+                        s.log_graveyard
+                            .get_mut(&pid)
+                            .map(|cache| cache.collect_lines())
                     }
+                });
+                let Some(lines) = lines else {
+                    reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+                        ok: false,
+                        error: format!("container {pid} not found"),
+                    });
+                    return;
                 };
                 reply_datagram(datagram_fd, sender, sender_len, &LogsResponse { lines });
             }
@@ -1117,15 +1131,16 @@ async fn handle_follow(
 ) {
     tracing::debug!(%pid, "handle_follow");
 
-    let backlog = match state.borrow_mut().containers.get_mut(&pid) {
-        Some(info) => info.gateway.snapshot(),
-        None => {
-            reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
-                ok: false,
-                error: format!("container {pid} not found"),
-            });
-            return;
-        }
+    let backlog = with_state_mut(state, |s| match s.containers.get_mut(&pid) {
+        Some(info) => Some(info.gateway.snapshot()),
+        None => None,
+    });
+    let Some(backlog) = backlog else {
+        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+            ok: false,
+            error: format!("container {pid} not found"),
+        });
+        return;
     };
 
     let mut pipe_fds = sys::FdPair {
@@ -1165,18 +1180,21 @@ async fn handle_follow(
         }
     }
 
-    {
-        let mut s = state.borrow_mut();
+    let attached = with_state_mut(state, |s| {
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
         let Some(info) = s.containers.get_mut(&pid) else {
-            let _ = unsafe { libc::close(pipe_fds.write) };
-            let _ = unsafe { libc::close(pipe_fds.read) };
-            return;
+            return false;
         };
         info.gateway
             .pipes
             .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
+        true
+    });
+    if !attached {
+        let _ = unsafe { libc::close(pipe_fds.write) };
+        let _ = unsafe { libc::close(pipe_fds.read) };
+        return;
     }
 
     // Pass the read end to the client with SCM_RIGHTS.
@@ -1358,8 +1376,7 @@ fn handle_run(
                 .join(" ");
             let has_pty = ptm_fd >= 0;
 
-            {
-                let mut s = state.borrow_mut();
+            with_state_mut(state, |s| {
                 s.outputs.insert(pid, Output { fd: pipe_fds.read });
                 s.containers.insert(pid, ContainerInfo {
                     pid,
@@ -1372,25 +1389,23 @@ fn handle_run(
                     ptm_fd,
                     drains_pending: 0,
                 });
-            }
+            });
 
             match rt.spawn(TaskKind::ContainerOutput { pid }) {
-                Some(_) => {
-                    let mut s = state.borrow_mut();
+                Some(_) => with_state_mut(state, |s| {
                     if let Some(info) = s.containers.get_mut(&pid) {
                         info.drains_pending += 1;
                     }
-                }
+                }),
                 None => tracing::error!("task slab full, failed to spawn container output task"),
             }
             if has_pty {
                 match rt.spawn(TaskKind::ContainerPtyOutput { pid }) {
-                    Some(_) => {
-                        let mut s = state.borrow_mut();
+                    Some(_) => with_state_mut(state, |s| {
                         if let Some(info) = s.containers.get_mut(&pid) {
                             info.drains_pending += 1;
                         }
-                    }
+                    }),
                     None => tracing::error!("task slab full, failed to spawn pty output task"),
                 }
             }
@@ -1462,26 +1477,23 @@ async fn write_lines(
     lines: Vec<Vec<u8>>,
 ) {
     for line in lines {
-        let pending = {
-            let mut s = state.borrow_mut();
-            match s.containers.get_mut(&pid) {
-                Some(info) => {
-                    let mut pend = Vec::new();
-                    for id in info.gateway.push(&line) {
-                        if let Some(fd) = info.gateway.pipe_fd(id) {
-                            pend.push((id, fd));
-                        }
+        let pending = with_state_mut(state, |s| match s.containers.get_mut(&pid) {
+            Some(info) => {
+                let mut pend = Vec::new();
+                for id in info.gateway.push(&line) {
+                    if let Some(fd) = info.gateway.pipe_fd(id) {
+                        pend.push((id, fd));
                     }
-                    pend
                 }
-                None => {
-                    if let Some(cache) = s.log_graveyard.get_mut(&pid) {
-                        cache.push(&line);
-                    }
-                    Vec::new()
-                }
+                pend
             }
-        };
+            None => {
+                if let Some(cache) = s.log_graveyard.get_mut(&pid) {
+                    cache.push(&line);
+                }
+                Vec::new()
+            }
+        });
         if pending.is_empty() {
             continue;
         }
@@ -1496,12 +1508,11 @@ async fn write_lines(
                     break;
                 }
             }
-            {
-                let mut s = state.borrow_mut();
+            with_state_mut(state, |s| {
                 if let Some(info) = s.containers.get_mut(&pid) {
                     info.gateway.complete_write(id, ok);
                 }
-            }
+            });
         }
     }
 }
@@ -1511,18 +1522,13 @@ async fn write_lines(
 /// closes its fds and follow pipes, and cleans up its overlay. No-op when the
 /// container is already gone (reaper cleaned it up, or it had no drain tasks).
 fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let removed = {
-        let mut s = state.borrow_mut();
-        let Some(info) = s.containers.get_mut(&pid) else {
-            return;
-        };
+    let removed = with_state_mut(state, |s| {
+        let info = s.containers.get_mut(&pid)?;
         info.drains_pending = info.drains_pending.saturating_sub(1);
         if info.drains_pending > 0 {
-            return;
+            return None;
         }
-        let Some(mut info) = s.containers.remove(&pid) else {
-            return;
-        };
+        let mut info = s.containers.remove(&pid)?;
         let cache = std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
         s.log_graveyard.insert(pid, cache);
         if info.ptm_fd >= 0 {
@@ -1534,7 +1540,10 @@ fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
             info.stdin_fd = -1;
         }
         info.gateway.close_all_pipes();
-        info
+        Some(info)
+    });
+    let Some(removed) = removed else {
+        return;
     };
     if let Some(ref overlay) = removed.overlay_dir
         && !removed.save
@@ -1547,13 +1556,11 @@ fn finish_drain(state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
 /// buffer and line assembly live in this task's locals; the gateway and pipe
 /// bookkeeping are touched only inside short synchronous borrows.
 async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let fd = match state.borrow().outputs.get(&pid) {
-        Some(o) => o.fd,
-        None => {
-            tracing::warn!(%pid, "container output task: no output entry");
-            finish_drain(state, pid);
-            return;
-        }
+    let fd = with_state(state, |s| s.outputs.get(&pid).map(|o| o.fd));
+    let Some(fd) = fd else {
+        tracing::warn!(%pid, "container output task: no output entry");
+        finish_drain(state, pid);
+        return;
     };
     let mut line_buf: Vec<u8> = Vec::new();
     loop {
@@ -1574,26 +1581,23 @@ async fn container_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>
         }
     }
     // EOF: drop the output entry, close the pipe, and finish this drain.
-    {
-        let mut s = state.borrow_mut();
+    with_state_mut(state, |s| {
         if let Some(o) = s.outputs.remove(&pid)
             && o.fd >= 0
         {
             sys::close(o.fd);
         }
-    }
+    });
     finish_drain(state, pid);
 }
 
 /// Drains a detached TTY container's pty master echo into its log gateway.
 /// The pipe drain captures stdout/stderr; this captures the terminal echo.
 async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, pid: pid_t) {
-    let ptm_fd = match state.borrow().containers.get(&pid) {
-        Some(info) => info.ptm_fd,
-        None => {
-            finish_drain(state, pid);
-            return;
-        }
+    let ptm_fd = with_state(state, |s| s.containers.get(&pid).map(|info| info.ptm_fd));
+    let Some(ptm_fd) = ptm_fd else {
+        finish_drain(state, pid);
+        return;
     };
     if ptm_fd < 0 {
         finish_drain(state, pid);
@@ -1617,15 +1621,14 @@ async fn container_pty_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonSt
     }
     // EOF/error: close the pty master, clear it on the container, and finish
     // this drain.
-    {
-        let mut s = state.borrow_mut();
+    with_state_mut(state, |s| {
         if let Some(info) = s.containers.get_mut(&pid)
             && info.ptm_fd >= 0
         {
             sys::close(info.ptm_fd);
             info.ptm_fd = -1;
         }
-    }
+    });
     finish_drain(state, pid);
 }
 
@@ -1636,7 +1639,7 @@ async fn accept_task(
     rt: RuntimeContext<TaskKind, ()>,
     state: &Rc<RefCell<DaemonState>>,
 ) {
-    let listener_fd = state.borrow().attach_listener_fd;
+    let listener_fd = with_state(state, |s| s.attach_listener_fd);
     loop {
         let stream_fd = match accept(ctx, listener_fd).await {
             Ok(fd) => fd,
@@ -1645,11 +1648,10 @@ async fn accept_task(
                 continue;
             }
         };
-        let session_id = {
-            let mut s = state.borrow_mut();
-            let id = s.next_session_id;
+        with_state_mut(state, |s| {
+            let session_id = s.next_session_id;
             s.next_session_id += 1;
-            s.attach_sessions.insert(id, AttachSession {
+            s.attach_sessions.insert(session_id, AttachSession {
                 stream_fd,
                 ptm_fd: -1,
                 input_fd: -1,
@@ -1658,27 +1660,30 @@ async fn accept_task(
                 child_exited: false,
                 exit_code: None,
             });
-            s.session_notify.insert(id, SessionNotify {
+            s.session_notify.insert(session_id, SessionNotify {
                 child_exit: Notify::new(),
             });
-            id
-        };
-        match rt.spawn(TaskKind::SessionRead { session_id }) {
-            Some(_) => {}
-            None => {
-                tracing::error!("task slab full, closing attach session");
-                let mut s = state.borrow_mut();
-                s.attach_sessions.remove(&session_id);
-                s.session_notify.remove(&session_id);
-                sys::close(stream_fd);
+
+            match rt.spawn(TaskKind::SessionRead { session_id }) {
+                Some(_) => {}
+                None => {
+                    tracing::error!("task slab full, closing attach session");
+                    with_state_mut(state, |s| {
+                        s.attach_sessions.remove(&session_id);
+                        s.session_notify.remove(&session_id);
+                    });
+                    sys::close(stream_fd);
+                }
             }
-        }
+        });
     }
 }
 
 fn close_session(state: &Rc<RefCell<DaemonState>>, session_id: u64) {
-    let mut s = state.borrow_mut();
-    if let Some(sess) = s.attach_sessions.remove(&session_id) {
+    with_state_mut(state, |s| {
+        let Some(sess) = s.attach_sessions.remove(&session_id) else {
+            return;
+        };
         tracing::info!(%session_id, "closing attach session");
         // Wake the session's output task if it is waiting on the child exit,
         // so it can stop even when the client disconnects before the reaper.
@@ -1698,7 +1703,7 @@ fn close_session(state: &Rc<RefCell<DaemonState>>, session_id: u64) {
         if sess.input_fd >= 0 {
             sys::close(sess.input_fd);
         }
-    }
+    });
 }
 
 /// Reads client frames from the session's stream and dispatches them. Keeps
@@ -1710,9 +1715,11 @@ async fn session_read_task(
     state: &Rc<RefCell<DaemonState>>,
     session_id: u64,
 ) {
-    let stream_fd = match state.borrow().attach_sessions.get(&session_id) {
-        Some(s) => s.stream_fd,
-        None => return,
+    let stream_fd = with_state(state, |s| {
+        s.attach_sessions.get(&session_id).map(|s| s.stream_fd)
+    });
+    let Some(stream_fd) = stream_fd else {
+        return;
     };
     loop {
         // 3-byte header: frame type + u16 payload length (LE).
@@ -1780,19 +1787,16 @@ async fn dispatch_frame(
         }
         0x10 => {
             if !payload.is_empty() {
-                let fd = {
-                    let s = state.borrow();
-                    match s.attach_sessions.get(&session_id) {
-                        Some(sess) => {
-                            if sess.ptm_fd >= 0 {
-                                sess.ptm_fd
-                            } else {
-                                sess.input_fd
-                            }
+                let fd = with_state(state, |s| match s.attach_sessions.get(&session_id) {
+                    Some(sess) => {
+                        if sess.ptm_fd >= 0 {
+                            sess.ptm_fd
+                        } else {
+                            sess.input_fd
                         }
-                        None => -1,
                     }
-                };
+                    None => -1,
+                });
                 if fd >= 0
                     && let Err(e) = write_all(ctx, fd, payload).await
                 {
@@ -1802,8 +1806,7 @@ async fn dispatch_frame(
             true
         }
         0x11 => {
-            {
-                let mut s = state.borrow_mut();
+            with_state_mut(state, |s| {
                 if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
                     let fd = if sess.ptm_fd >= 0 {
                         let fd = sess.ptm_fd;
@@ -1820,7 +1823,7 @@ async fn dispatch_frame(
                         sys::close(fd);
                     }
                 }
-            }
+            });
             true
         }
         0x20 => {
@@ -1831,12 +1834,12 @@ async fn dispatch_frame(
             }
             match serde_json::from_slice::<WinSize>(&payload) {
                 Ok(ws) => {
-                    let ptm_fd = state
-                        .borrow()
-                        .attach_sessions
-                        .get(&session_id)
-                        .map(|s| s.ptm_fd)
-                        .unwrap_or(-1);
+                    let ptm_fd = with_state(state, |s| {
+                        s.attach_sessions
+                            .get(&session_id)
+                            .map(|s| s.ptm_fd)
+                            .unwrap_or(-1)
+                    });
                     if ptm_fd >= 0 {
                         let mut w: libc::winsize = unsafe { std::mem::zeroed() };
                         w.ws_row = ws.rows;
@@ -1867,12 +1870,12 @@ async fn send_attach_frame(
     frame_type: u8,
     payload: &[u8],
 ) -> io::Result<()> {
-    let stream_fd = state
-        .borrow()
-        .attach_sessions
-        .get(&session_id)
-        .map(|s| s.stream_fd)
-        .unwrap_or(-1);
+    let stream_fd = with_state(state, |s| {
+        s.attach_sessions
+            .get(&session_id)
+            .map(|s| s.stream_fd)
+            .unwrap_or(-1)
+    });
     if stream_fd < 0 {
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
     }
@@ -1892,12 +1895,12 @@ async fn send_data_frame(
     session_id: u64,
     data: &Bytes,
 ) -> io::Result<()> {
-    let stream_fd = state
-        .borrow()
-        .attach_sessions
-        .get(&session_id)
-        .map(|s| s.stream_fd)
-        .unwrap_or(-1);
+    let stream_fd = with_state(state, |s| {
+        s.attach_sessions
+            .get(&session_id)
+            .map(|s| s.stream_fd)
+            .unwrap_or(-1)
+    });
     if stream_fd < 0 {
         return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
     }
@@ -1939,12 +1942,9 @@ async fn handle_run_attach(
         },
         _ => return false,
     };
-    let Some(stream_fd) = state
-        .borrow()
-        .attach_sessions
-        .get(&session_id)
-        .map(|s| s.stream_fd)
-    else {
+    let Some(stream_fd) = with_state(state, |s| {
+        s.attach_sessions.get(&session_id).map(|s| s.stream_fd)
+    }) else {
         return false;
     };
 
@@ -2060,8 +2060,7 @@ async fn handle_run_attach(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            {
-                let mut s = state.borrow_mut();
+            with_state_mut(state, |s| {
                 s.containers.insert(pid, ContainerInfo {
                     pid,
                     command: cmd_str,
@@ -2078,7 +2077,7 @@ async fn handle_run_attach(
                     sess.log_read_fd = pipe_fds.read;
                     sess.container_pid = pid;
                 }
-            }
+            });
 
             tracing::info!(%pid, %session_id, "attach container started");
 
@@ -2112,20 +2111,17 @@ async fn handle_attach(
     pid: i32,
 ) -> bool {
     let pid = pid as pid_t;
-    let (found, input_fd) = {
-        let s = state.borrow();
-        match s.containers.get(&pid) {
-            Some(info) => (
-                true,
-                if info.ptm_fd >= 0 {
-                    info.ptm_fd
-                } else {
-                    info.stdin_fd
-                },
-            ),
-            None => (false, -1),
-        }
-    };
+    let (found, input_fd) = with_state(state, |s| match s.containers.get(&pid) {
+        Some(info) => (
+            true,
+            if info.ptm_fd >= 0 {
+                info.ptm_fd
+            } else {
+                info.stdin_fd
+            },
+        ),
+        None => (false, -1),
+    });
     if !found {
         let payload = serde_json::to_vec(&ErrorResponse {
             ok: false,
@@ -2147,27 +2143,29 @@ async fn handle_attach(
         return false;
     }
 
-    {
-        let mut s = state.borrow_mut();
+    let attached = with_state_mut(state, |s| {
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
         let Some(info) = s.containers.get_mut(&pid) else {
-            sys::close(pipe_fds.read);
-            sys::close(pipe_fds.write);
-            close_session(state, session_id);
             return false;
         };
         info.gateway
             .pipes
             .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
-    }
-    {
-        let mut s = state.borrow_mut();
+
         if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
             sess.log_read_fd = pipe_fds.read;
             sess.input_fd = input_fd;
             sess.container_pid = pid;
         }
+
+        true
+    });
+    if !attached {
+        sys::close(pipe_fds.read);
+        sys::close(pipe_fds.write);
+        close_session(state, session_id);
+        return false;
     }
 
     let payload = serde_json::to_vec(&RunResponse {
@@ -2190,25 +2188,25 @@ async fn handle_attach(
 /// then — once the drain hits EOF and the child has been reaped — sends the
 /// deferred `0x02` exit frame and closes the session.
 async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>, session_id: u64) {
-    let fd = {
-        let s = state.borrow();
-        match s.attach_sessions.get(&session_id) {
-            Some(sess) => {
-                if sess.ptm_fd >= 0 {
-                    sess.ptm_fd
-                } else {
-                    sess.log_read_fd
-                }
+    let fd = with_state(state, |s| match s.attach_sessions.get(&session_id) {
+        Some(sess) => {
+            if sess.ptm_fd >= 0 {
+                sess.ptm_fd
+            } else {
+                sess.log_read_fd
             }
-            None => return,
         }
-    };
+        None => -1,
+    });
     if fd < 0 {
         return;
     }
-    let child_notify = match state.borrow().session_notify.get(&session_id) {
-        Some(n) => n.child_exit.clone(),
-        None => return,
+    let Some(child_notify) = with_state(state, |s| {
+        s.session_notify
+            .get(&session_id)
+            .map(|n| n.child_exit.clone())
+    }) else {
+        return;
     };
 
     // Drain output into 0x10 frames until EOF/error.
@@ -2223,13 +2221,12 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
         if bytes.is_empty() {
             break;
         }
-        let stream_fd = {
-            let s = state.borrow();
+        let stream_fd = with_state(state, |s| {
             s.attach_sessions
                 .get(&session_id)
                 .map(|se| se.stream_fd)
                 .unwrap_or(-1)
-        };
+        });
         if stream_fd < 0 {
             break;
         }
@@ -2241,33 +2238,23 @@ async fn session_output_task(ctx: TaskContext, state: &Rc<RefCell<DaemonState>>,
 
     // Wait for the child to exit (fired by the reaper, or by close_session
     // when the client disconnected first), then send the deferred 0x02 frame.
-    let exit_code = {
-        let s = state.borrow();
-        match s.attach_sessions.get(&session_id) {
-            Some(sess) if sess.child_exited => sess.exit_code,
-            Some(_) => None,
-            None => return,
-        }
+    let Some(child_exited) = with_state(state, |s| {
+        s.attach_sessions.get(&session_id).map(|se| se.child_exited)
+    }) else {
+        return;
     };
-    if exit_code.is_none() {
+    if !child_exited {
         child_notify.wait(ctx).await;
     }
-    let stream_fd = {
-        let s = state.borrow();
+    let (stream_fd, exit_code) = with_state(state, |s| {
         s.attach_sessions
             .get(&session_id)
-            .map(|se| se.stream_fd)
-            .unwrap_or(-1)
-    };
+            .map(|se| (se.stream_fd, se.exit_code))
+            .unwrap_or((-1, None))
+    });
     if stream_fd < 0 {
         return;
     }
-    let exit_code = {
-        let s = state.borrow();
-        s.attach_sessions
-            .get(&session_id)
-            .and_then(|se| se.exit_code)
-    };
     let payload =
         serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code.unwrap_or(0) })).unwrap();
     let _ = send_attach_frame(ctx, state, session_id, 0x02, &payload).await;
