@@ -354,7 +354,7 @@ fn net_pid_joins_container_netns() {
     let script = format!(
         // Start a detached sandbox container (prints PID via --detach).
         // Then run a joiner container with --net-pid.
-        "C=$({conrt} run {sock_arg} --detach --rootfs {rootfs} -- /bin/sleep inf) && sleep 0.3 && \
+        "C=$({conrt} run {sock_arg} --detach --rootfs {rootfs} -- /bin/sleep inf) && sleep 0.1 && \
          {conrt} run {sock_arg} --rootfs {rootfs} --net-pid $C -- /bin/sh -c 'echo netns_joined' \
          2>&1; EC=$?; kill $C 2>/dev/null; exit $EC",
         conrt = conrt,
@@ -390,7 +390,7 @@ fn net_pid_localhost_communication() {
         // Start a detached server container (prints PID via --detach).
         // Then run a client that joins its netns and connects to localhost.
         "C=$({conrt} run {sock_arg} --detach --rootfs {rootfs} -- /bin/sh -c 'while true; do echo \
-         pong | /bin/busybox nc -lp 9999; done') && sleep 0.5 && {conrt} run {sock_arg} --rootfs \
+         pong | /bin/busybox nc -lp 9999; done') && sleep 0.1 && {conrt} run {sock_arg} --rootfs \
          {rootfs} --net-pid $C -- /bin/sh -c '/bin/busybox nc -w 3 127.0.0.1 9999' 2>&1; EC=$?; \
          kill $C 2>/dev/null; exit $EC",
         conrt = conrt,

@@ -50,6 +50,15 @@ enum Cli {
         #[arg(short, long)]
         detach: bool,
 
+        /// Use a custom init binary as PID 1 (user command is passed after
+        /// `--`)
+        #[arg(long)]
+        init: Option<PathBuf>,
+
+        /// Run the user command directly as PID 1 (no init, no death pipe)
+        #[arg(long)]
+        no_init: bool,
+
         /// Daemon socket path
         #[arg(long)]
         socket_path: Option<PathBuf>,
@@ -124,19 +133,22 @@ fn main() -> ExitCode {
             tty,
             interactive,
             detach,
+            init,
+            no_init,
             socket_path,
             command,
         } => {
             if detach {
-                run_detach(
-                    socket_path.unwrap_or_else(default_socket_path),
+                run_detach(socket_path.unwrap_or_else(default_socket_path), RunArgs {
                     rootfs,
-                    net_pid.map(|p| p as libc::pid_t),
+                    net_pid: net_pid.map(|p| p as libc::pid_t),
                     save,
                     tty,
                     interactive,
+                    init,
+                    no_init,
                     command,
-                )
+                })
             } else {
                 let socket = socket_path.unwrap_or_else(default_socket_path);
                 let mut sock = socket.into_os_string();
@@ -147,6 +159,8 @@ fn main() -> ExitCode {
                     save,
                     tty,
                     interactive,
+                    init,
+                    no_init,
                     command,
                 })
             }
@@ -183,24 +197,32 @@ fn run_daemon(socket_path: PathBuf) -> ExitCode {
     }
 }
 
-fn run_detach(
-    socket_path: PathBuf,
+struct RunArgs {
     rootfs: Option<PathBuf>,
     net_pid: Option<libc::pid_t>,
     save: bool,
     tty: bool,
     interactive: bool,
+    init: Option<PathBuf>,
+    no_init: bool,
     command: Vec<CString>,
-) -> ExitCode {
-    let rootfs_str = rootfs.as_ref().map(|p| p.to_string_lossy().into_owned());
+}
+
+fn run_detach(socket_path: PathBuf, args: RunArgs) -> ExitCode {
+    let rootfs_str = args
+        .rootfs
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
 
     let request = daemon::Request::Run {
         rootfs: rootfs_str,
-        net_pid,
-        save,
-        command: daemon::CStringSerde::from_inner_vec(command),
-        interactive: Some(interactive),
-        tty: Some(tty),
+        net_pid: args.net_pid,
+        save: args.save,
+        command: daemon::CStringSerde::from_inner_vec(args.command),
+        interactive: Some(args.interactive),
+        tty: Some(args.tty),
+        no_init: args.no_init,
+        init_path: args.init.map(|p| p.to_string_lossy().into_owned()),
     };
 
     let resp = match daemon::send_request(&socket_path, &request) {
@@ -235,15 +257,6 @@ fn run_detach(
     }
 }
 
-struct RunArgs {
-    rootfs: Option<PathBuf>,
-    net_pid: Option<libc::pid_t>,
-    save: bool,
-    tty: bool,
-    interactive: bool,
-    command: Vec<CString>,
-}
-
 /// Run a container attached to the daemon via Unix stream.
 fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
     let stream = match std::os::unix::net::UnixStream::connect(&stream_path) {
@@ -265,6 +278,8 @@ fn run_attach(stream_path: PathBuf, args: RunArgs) -> ExitCode {
         command: daemon::CStringSerde::from_inner_vec(args.command),
         interactive: Some(args.interactive),
         tty: Some(args.tty),
+        no_init: args.no_init,
+        init_path: args.init.map(|p| p.to_string_lossy().into_owned()),
     };
     let payload = serde_json::to_vec(&request).unwrap();
     if let Err(e) = send_frame(raw_fd, 0x00, &payload) {

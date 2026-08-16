@@ -114,3 +114,16 @@ No root required — user namespaces handle privilege escalation.
 - Daemon-side PTY/pipe I/O relay via io_uring ping-pong (backpressure on output)
 - Client: raw terminal, SIGWINCH handler, reader thread, stdin relay
 - Exit-code propagation with deferred send on pending writes
+
+### Phase 6 — Built-in init 
+
+- By default the container PID 1 is a built-in init that forks the user
+  command as PID 2 and monitors a **death pipe**
+- The daemon keeps the write end of the death pipe; when the daemon dies the
+  kernel closes it, the init sees `POLLHUP`, and kills the whole namespace
+  (`kill(-1, SIGKILL)` + `_exit`), so containers die with the daemon
+- `--init <path>` execs a custom init as PID 1 (user command passed after
+  `--`); `--no-init` execs the user command directly — both survive daemon
+  death and are mutually exclusive
+- Signals are forwarded to the grandchild via `signalfd`; `SIGCHLD` reaps it
+  and the init exits with the grandchild's status

@@ -69,6 +69,10 @@ pub enum Request {
         command: Vec<CStringSerde>,
         interactive: Option<bool>,
         tty: Option<bool>,
+        #[serde(default)]
+        no_init: bool,
+        #[serde(default)]
+        init_path: Option<String>,
     },
     List,
     Kill {
@@ -165,6 +169,8 @@ struct RunArgs {
     command: Vec<CString>,
     tty: bool,
     interactive: bool,
+    no_init: bool,
+    init_path: Option<String>,
 }
 
 // ── TaskKinds: coio spawn user_data ───────────────────────────────────────
@@ -410,6 +416,10 @@ struct ContainerInfo {
     gateway: LogGateway,
     stdin_fd: RawFd, // write end of stdin pipe (-1 if none)
     ptm_fd: RawFd,   // PTY master fd (-1 if none)
+    /// Write end of the death pipe (-1 if none). Held open for the container's
+    /// lifetime; the kernel closes it when the daemon exits, which wakes the
+    /// built-in init's `poll()` with `POLLHUP` and kills the namespace.
+    death_pipe_write: RawFd,
     /// Number of output-drain tasks still running for this container (the
     /// stdout/stderr drain and, for `--tty`, the pty-echo drain). The container
     /// is kept in `containers` until the count reaches zero, so the drains can
@@ -745,6 +755,10 @@ fn reap_children(state: &DaemonStateShared) {
                         sys::close(info.stdin_fd);
                         info.stdin_fd = -1;
                     }
+                    if info.death_pipe_write >= 0 {
+                        sys::close(info.death_pipe_write);
+                        info.death_pipe_write = -1;
+                    }
                     info.gateway.close_all_pipes();
                     Some(info)
                 }) else {
@@ -846,6 +860,14 @@ struct PreparedResources {
     clone_flags: libc::c_int,
     needs_userns_maps: bool,
     command: Vec<CString>,
+    /// Death pipe for the default init: `(read, write)`. Present only when
+    /// running the built-in init. The daemon keeps the write end; the init
+    /// monitors the read end for `POLLHUP` on daemon exit.
+    death_pipe: Option<sys::FdPair>,
+    /// Prebuilt argv for a custom init: `[init_path, "--", cmd, ...]`.
+    init_argv: Option<Vec<CString>>,
+    /// Run the user command directly as PID 1 (no init, no death pipe).
+    no_init: bool,
 }
 
 /// Resolve all container resources needed before `clone3`: canonicalize
@@ -854,6 +876,10 @@ struct PreparedResources {
 /// Cleanup of acquired resources (overlay dir, signal) is the caller's
 /// responsibility on error.
 fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
+    if args.no_init && args.init_path.is_some() {
+        return Err("--init and --no-init are mutually exclusive".into());
+    }
+
     let rootfs = match args.rootfs {
         Some(p) => match Path::new(&p).canonicalize() {
             Ok(path) => Some(path),
@@ -901,6 +927,32 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
         ),
     };
 
+    // Death pipe for the built-in init. Created before `clone3` so the child
+    // inherits the read end; the daemon keeps the write end and the kernel
+    // closes it when the daemon exits (SIGTERM, SIGKILL, crash — anything).
+    let death_pipe = if args.init_path.is_none() && !args.no_init {
+        let mut pipe_fds = sys::FdPair {
+            read: -1,
+            write: -1,
+        };
+        match sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
+            Ok(_) => Some(pipe_fds),
+            Err(e) => return Err(format!("death pipe creation failed: {e}")),
+        }
+    } else {
+        None
+    };
+
+    // Custom init: build the full argv so the child can exec it directly.
+    // The user command follows `--`, matching the tini/s6 convention.
+    let init_argv = args.init_path.as_ref().map(|path| {
+        let mut argv = Vec::with_capacity(args.command.len() + 2);
+        argv.push(CString::from(path.as_str()));
+        argv.push(CString::from("--"));
+        argv.extend(args.command.iter().cloned());
+        argv
+    });
+
     Ok(PreparedResources {
         rootfs,
         overlay_dir,
@@ -908,6 +960,9 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
         clone_flags,
         needs_userns_maps,
         command: args.command,
+        death_pipe,
+        init_argv,
+        no_init: args.no_init,
     })
 }
 
@@ -927,10 +982,19 @@ fn parent_setup_maps_and_signal(
 
 /// Called in the child process after `clone3`. Never returns — either execs
 /// successfully or calls `process::exit(1)`.
+///
+/// Three modes:
+/// - `init_argv: Some(...)` — exec a custom init (user command follows `--`)
+/// - `no_init` — exec the user command directly as PID 1
+/// - otherwise — run the built-in init: fork the user command as PID 2 and
+///   monitor the death pipe (`death_pipe_read`) for daemon exit
 fn child_init_environment(
     rootfs: &Option<PathBuf>,
     overlay_dir: &Option<PathBuf>,
     command: Vec<CString>,
+    death_pipe_read: Option<RawFd>,
+    init_argv: Option<Vec<CString>>,
+    no_init: bool,
 ) -> ! {
     if let Err(e) = sys::bring_up_lo() {
         tracing::warn!(%e, "bring_up_lo failed");
@@ -959,10 +1023,135 @@ fn child_init_environment(
         }
     }
 
-    let argv = sys::Argv::new(command);
-    let errno = execvp(argv.as_slice());
-    tracing::error!(%errno, "execvp failed");
-    std::process::exit(1)
+    if let Some(argv) = init_argv {
+        let argv = sys::Argv::new(argv);
+        let errno = execvp(argv.as_slice());
+        tracing::error!(%errno, "custom init exec failed");
+        std::process::exit(127);
+    }
+
+    if no_init {
+        let argv = sys::Argv::new(command);
+        let errno = execvp(argv.as_slice());
+        tracing::error!(%errno, "execvp failed");
+        std::process::exit(1);
+    }
+
+    let death_pipe_read = death_pipe_read.expect("death pipe read end for default init");
+    run_init_loop(death_pipe_read, command)
+}
+
+/// Built-in init: PID 1 in the container namespace. Forks the user command as
+/// PID 2, then loops on the death pipe and a signalfd.
+///
+/// - `POLLHUP`/`POLLERR` on the death pipe read end means the daemon exited and
+///   the kernel closed the write end: kill the whole namespace and exit
+///   (SIGKILL cannot harm PID 1, so `_exit` is required).
+/// - A signal from the signalfd is forwarded to the grandchild, except
+///   `SIGCHLD`, which means the grandchild exited: reap it and exit with its
+///   status so the daemon reports the real exit code.
+fn run_init_loop(death_pipe_read: RawFd, command: Vec<CString>) -> ! {
+    // Block catchable signals and SIGCHLD so they arrive via the signalfd.
+    // The grandchild resets its mask before exec, so the user command sees a
+    // normal signal environment.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGHUP);
+        libc::sigaddset(&mut mask, libc::SIGCHLD);
+    }
+    if let Err(e) = sys::sigprocmask(libc::SIG_BLOCK, Some(&mask), None) {
+        tracing::error!(%e, "sigprocmask failed in init");
+        std::process::exit(1);
+    }
+    let sigfd = match sys::signalfd(-1, &mask, libc::SFD_CLOEXEC) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::error!(%e, "signalfd failed in init");
+            std::process::exit(1);
+        }
+    };
+
+    let gpid = unsafe { libc::fork() };
+    if gpid < 0 {
+        tracing::error!("fork failed in init");
+        std::process::exit(1);
+    }
+    if gpid == 0 {
+        // Grandchild: exec the user command as PID 2.
+        sys::close(death_pipe_read);
+        sys::close(sigfd);
+        let mut empty: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut empty) };
+        let _ = sys::sigprocmask(libc::SIG_SETMASK, Some(&empty), None);
+        let argv = sys::Argv::new(command);
+        let errno = execvp(argv.as_slice());
+        tracing::error!(%errno, "execvp failed in init grandchild");
+        std::process::exit(127);
+    }
+
+    let mut pollfds = [
+        libc::pollfd {
+            fd: death_pipe_read,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: sigfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            tracing::error!(%e, "poll failed in init");
+            std::process::exit(1);
+        }
+
+        if pollfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLIN) != 0 {
+            unsafe { libc::kill(-1, libc::SIGKILL) };
+            std::process::exit(137);
+        }
+
+        if pollfds[1].revents & libc::POLLIN != 0 {
+            let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+            let info_buf = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (&mut info as *mut libc::signalfd_siginfo).cast::<u8>(),
+                    std::mem::size_of::<libc::signalfd_siginfo>(),
+                )
+            };
+            if let Err(e) = sys::read(sigfd, info_buf) {
+                tracing::error!(%e, "signalfd read failed in init");
+                std::process::exit(1);
+            }
+
+            if info.ssi_signo as libc::c_int == libc::SIGCHLD {
+                let mut status: libc::c_int = 0;
+                let reaped = sys::wait4(gpid, &mut status, libc::WNOHANG, None).unwrap_or(-1);
+                if reaped == gpid {
+                    let exit_code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else if libc::WIFSIGNALED(status) {
+                        128 + libc::WTERMSIG(status)
+                    } else {
+                        1
+                    };
+                    std::process::exit(exit_code);
+                }
+            } else {
+                unsafe { libc::kill(gpid, info.ssi_signo as libc::c_int) };
+            }
+        }
+    }
 }
 
 // ── Async request handlers ──────────────────────────────────────────────────
@@ -1033,6 +1222,8 @@ async fn handle_datagram(
             command,
             interactive,
             tty,
+            no_init,
+            init_path,
         } => handle_run(rt, state, datagram_fd, sender, sender_len, RunArgs {
             rootfs,
             net_pid,
@@ -1040,6 +1231,8 @@ async fn handle_datagram(
             command: CStringSerde::into_inner_vec(command),
             tty: tty.unwrap_or(false),
             interactive: interactive.unwrap_or(false),
+            no_init,
+            init_path,
         }),
         Request::List => {
             let now = SystemTime::now();
@@ -1302,6 +1495,10 @@ fn handle_run(
             }
             drop(pty_master);
             drop(pty_slave);
+            if let Some(dp) = &prep.death_pipe {
+                sys::close(dp.read);
+                sys::close(dp.write);
+            }
             err(&format!("clone3 failed: {e}"));
         }
         Ok(None) => {
@@ -1353,12 +1550,35 @@ fn handle_run(
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
             }
-            child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
+            // Default init: drop the write end so the daemon is the sole
+            // holder; keep the read end for the init loop.
+            let death_pipe_read = prep.death_pipe.map(|dp| {
+                sys::close(dp.write);
+                dp.read
+            });
+            child_init_environment(
+                &prep.rootfs,
+                &prep.overlay_dir,
+                prep.command,
+                death_pipe_read,
+                prep.init_argv,
+                prep.no_init,
+            );
         }
         Ok(Some(pid)) => {
             // Parent.
             sys::close(pipe_fds.write);
             drop(pty_slave);
+
+            // Keep only the write end of the death pipe; the init holds the
+            // read end. The kernel closes the write end when the daemon dies.
+            let death_pipe_write = match prep.death_pipe {
+                Some(dp) => {
+                    sys::close(dp.read);
+                    dp.write
+                }
+                None => -1,
+            };
 
             let stdin_write_fd = if use_stdin_pipe {
                 sys::close(stdin_pipe_fds.read);
@@ -1379,6 +1599,9 @@ fn handle_run(
                 }
                 if ptm_fd >= 0 {
                     sys::close(ptm_fd);
+                }
+                if death_pipe_write >= 0 {
+                    sys::close(death_pipe_write);
                 }
                 err(&format!("container aborted: {e}"));
                 return;
@@ -1403,6 +1626,7 @@ fn handle_run(
                     gateway: LogGateway::new(LOG_CAPACITY),
                     stdin_fd: stdin_write_fd,
                     ptm_fd,
+                    death_pipe_write,
                     drains_pending: 0,
                 });
             });
@@ -1941,6 +2165,8 @@ async fn handle_run_attach(
             command,
             interactive,
             tty,
+            no_init,
+            init_path,
         } => RunArgs {
             rootfs,
             net_pid,
@@ -1948,6 +2174,8 @@ async fn handle_run_attach(
             command: CStringSerde::into_inner_vec(command),
             tty: tty.unwrap_or(false),
             interactive: interactive.unwrap_or(false),
+            no_init,
+            init_path,
         },
         _ => return false,
     };
@@ -2010,6 +2238,10 @@ async fn handle_run_attach(
             if pipe_fds.write >= 0 {
                 sys::close(pipe_fds.write);
             }
+            if let Some(dp) = &prep.death_pipe {
+                sys::close(dp.read);
+                sys::close(dp.write);
+            }
             err(&format!("clone3 failed: {e}"));
             false
         }
@@ -2042,12 +2274,34 @@ async fn handle_run_attach(
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
             }
-            child_init_environment(&prep.rootfs, &prep.overlay_dir, prep.command);
+            let death_pipe_read = prep.death_pipe.map(|dp| {
+                sys::close(dp.write);
+                dp.read
+            });
+            child_init_environment(
+                &prep.rootfs,
+                &prep.overlay_dir,
+                prep.command,
+                death_pipe_read,
+                prep.init_argv,
+                prep.no_init,
+            );
         }
         Ok(Some(pid)) => {
             drop(slave);
 
+            let death_pipe_write = match prep.death_pipe {
+                Some(dp) => {
+                    sys::close(dp.read);
+                    dp.write
+                }
+                None => -1,
+            };
+
             if let Err(e) = parent_setup_maps_and_signal(pid, prep.needs_userns_maps, prep.signal) {
+                if death_pipe_write >= 0 {
+                    sys::close(death_pipe_write);
+                }
                 err(&format!("container aborted: {e}"));
                 return false;
             }
@@ -2078,6 +2332,7 @@ async fn handle_run_attach(
                     gateway: LogGateway::new(LOG_CAPACITY),
                     stdin_fd: -1,
                     ptm_fd: -1, // run_attach holds the ptm in the session
+                    death_pipe_write,
                     drains_pending: 0,
                 });
                 if let Some(sess) = s.attach_sessions.get_mut(&session_id) {

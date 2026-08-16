@@ -83,6 +83,23 @@ impl Daemon {
         self.kill();
         let _ = self.0.wait();
     }
+
+    /// Send a signal to just the daemon process (not its process group).
+    pub fn signal(&self, sig: libc::c_int) {
+        let ret = unsafe { libc::kill(self.0.id() as libc::pid_t, sig) };
+        assert_eq!(
+            ret,
+            0,
+            "kill({}, {}) failed: {}",
+            self.0.id(),
+            sig,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+fn pid_exists(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 fn send_request(socket: &PathBuf, payload: &[u8]) -> Vec<u8> {
@@ -885,5 +902,234 @@ fn attach_to_detached_tty_container() {
         "attach TTY output should contain 'hello-tty', got: {out_str:?}"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn daemon_crash_kills_default_init_container() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sleep",
+        "100",
+    ]);
+    assert!(ok, "detached run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+    assert!(pid_exists(pid), "container should be running after start");
+
+    daemon.signal(libc::SIGKILL);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let alive = pid_exists(pid);
+    if alive {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        !alive,
+        "container should be killed when the daemon dies (default init)"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn detached_user_command_is_pid_2_with_default_init() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo pid_is_$$",
+    ]);
+    assert!(ok, "detached run should succeed, stderr: {stderr}");
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp = send_request(&socket, br#"{"type":"List"}"#);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        if v["containers"].as_array().unwrap().is_empty() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not exit within 5s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "logs",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        &pid.to_string(),
+    ]);
+    assert!(ok, "logs should succeed, stderr: {stderr}");
+    assert!(
+        stdout.contains("pid_is_2"),
+        "user command should be PID 2 with the default init, logs: {stdout:?}"
+    );
+
+    daemon.kill_and_wait();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn init_and_no_init_mutually_exclusive() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let resp = send_request(
+        &socket,
+        br#"{"type":"Run","rootfs":null,"net_pid":null,"save":false,"command":["/bin/sleep","100"],"interactive":false,"tty":false,"no_init":true,"init_path":"/usr/bin/env"}"#,
+    );
+    let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+    let ok = v["ok"].as_bool().unwrap();
+    if ok && let Some(pid) = v["pid"].as_i64() {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    assert!(
+        !ok,
+        "no_init and init_path together should be rejected: {v:?}"
+    );
+
+    daemon.kill_and_wait();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn daemon_crash_no_init_leaves_container_alive() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--no-init",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sleep",
+        "100",
+    ]);
+    assert!(
+        ok,
+        "detached run with --no-init should succeed, stderr: {stderr}"
+    );
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    daemon.signal(libc::SIGKILL);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let alive = pid_exists(pid);
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(
+        alive,
+        "container should survive daemon death with --no-init"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn daemon_crash_custom_init_leaves_container_alive() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--init",
+        "/usr/bin/env",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sleep",
+        "100",
+    ]);
+    assert!(
+        ok,
+        "detached run with --init should succeed, stderr: {stderr}"
+    );
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    daemon.signal(libc::SIGKILL);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let alive = pid_exists(pid);
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(
+        alive,
+        "container should survive daemon death with a custom init"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn no_init_user_command_stays_pid_1() {
+    let dir = test_dir();
+    let socket = dir.join("conrt.sock");
+    let daemon = Daemon::new(&socket);
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "run",
+        "--detach",
+        "--no-init",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo pid_is_$$",
+    ]);
+    assert!(
+        ok,
+        "detached run with --no-init should succeed, stderr: {stderr}"
+    );
+    let pid: i32 = stdout.trim().parse().expect("stdout should be a PID");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp = send_request(&socket, br#"{"type":"List"}"#);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        if v["containers"].as_array().unwrap().is_empty() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("container did not exit within 5s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (ok, stdout, stderr) = run_conrt(&[
+        "logs",
+        "--socket-path",
+        socket.to_str().unwrap(),
+        &pid.to_string(),
+    ]);
+    assert!(ok, "logs should succeed, stderr: {stderr}");
+    assert!(
+        stdout.contains("pid_is_1"),
+        "user command should be PID 1 with --no-init, logs: {stdout:?}"
+    );
+
+    daemon.kill_and_wait();
     std::fs::remove_dir_all(&dir).ok();
 }
