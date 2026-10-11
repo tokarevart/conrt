@@ -585,12 +585,12 @@ impl AsMut<[u8]> for BytesMut {
 
 fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
     use crate::runtime::active_gen_matches;
-    use crate::runtime::with_runtime;
+    use crate::runtime::with_pools;
     assert!(
         active_gen_matches(generation),
         "capacity() called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| r.with_slab(bid, |slab, _| slab.slot_size()))
+    with_pools(|p| p.with_slab(bid, |slab, _| slab.slot_size()))
 }
 
 fn split_exclusive(bid: u32, generation: NonZeroU32) {
@@ -598,7 +598,7 @@ fn split_exclusive(bid: u32, generation: NonZeroU32) {
         return;
     }
 
-    runtime::with_runtime(|r| {
+    runtime::with_pools(|r| {
         r.with_slab(bid, |slab, local| slab.tracker_mut().split_exclusive(local))
     })
 }
@@ -623,7 +623,7 @@ pub fn alloc<T>() -> Option<Ref<MaybeUninit<T>>> {
         core::mem::size_of::<T>() > 0,
         "alloc: zero-sized types cannot be pooled"
     );
-    runtime::with_runtime(|r| {
+    runtime::with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
         r.fixed_pool.acquire_ref::<MaybeUninit<T>>(class)
     })
@@ -645,7 +645,7 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
         core::mem::size_of::<T>() > 0,
         "alloc_mut: zero-sized types cannot be pooled"
     );
-    runtime::with_runtime(|r| {
+    runtime::with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
         r.fixed_pool.acquire_mut::<MaybeUninit<T>>(class)
     })
@@ -668,7 +668,7 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
 ///
 /// Calling this outside an active runtime panics.
 pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
-    runtime::with_runtime(|r| -> io::Result<BytesMut> {
+    runtime::with_pools(|r| -> io::Result<BytesMut> {
         let class = r
             .fixed_pool
             .class_for(size)
@@ -701,5 +701,5 @@ pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
 /// Everything else is checked: `class` out of range panics, and using the
 /// returned view outside the runtime that owns it panics on access.
 pub fn provided_bytes(class: u8, local: u16, len: u32) -> Bytes {
-    runtime::with_runtime(|r| r.provided_pool.select(class, local, len))
+    runtime::with_pools(|r| r.provided_pool.select(class, local, len))
 }

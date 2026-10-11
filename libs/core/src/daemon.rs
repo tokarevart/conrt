@@ -1,29 +1,25 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::SystemTime;
 
 use coio::Bytes;
 use coio::BytesMut;
 use coio::Msg;
 use coio::MsgMut;
-use coio::Notify;
 use coio::accept;
 use coio::alloc_bytes;
-use coio::io::write_all;
 use coio::read;
-use coio::read_exact;
 use coio::recvmsg;
-use coio::runtime::RuntimeContext;
+use coio::runtime::Runtime;
 use coio::runtime::block_on_default;
 use coio::sendmsg;
-use coio::task::TaskContext;
+use coio::write;
 use conrt_cstring::CString;
 use conrt_sys as sys;
 use libc::pid_t;
@@ -173,34 +169,92 @@ struct RunArgs {
     init_path: Option<String>,
 }
 
-// ── TaskKinds: coio spawn user_data ───────────────────────────────────────
+// ── OpLocal: the per-op local state `L` ─────────────────────────────────────
 //
-// One uniform `async move` dispatches on this; each variant maps to one
-// self-contained async task. Every persistent task keeps an io op in flight
-// (recvmsg / accept / sigchld read / output read) so the runtime loop never
-// sees `has_io_in_flight() == false` while the daemon should run.
+// There are no spawned tasks: every long-lived loop is a plain `fn` callback
+// that re-arms its own next op when the current one completes. Each op's
+// private state — the buffers it is filling, the line it is assembling, the
+// remaining chunks of a partially written frame — travels as `OpLocal`, moved
+// into the op on dispatch and handed back on completion.
+//
+// Anything shared lives in the runtime's global `G` (`DaemonState`), reached
+// through `rt.global()` / `rt.global_mut()`. A callback may mutate it freely,
+// but must finish its borrow before dispatching the next op, so no borrow is
+// live across a completion.
 
-enum TaskKind {
-    /// The bootstrap task: binds sockets, then spawns the persistent tasks.
-    Main,
-    /// Serves datagram requests (run/list/kill/logs/follow) over the control
-    /// socket.
-    Datagram,
-    /// Accepts Unix-stream attach clients.
+enum OpLocal {
+    /// A datagram request is being received. Owns the `msghdr` and the byte
+    /// buffer the kernel fills; re-armed after each request is handled.
+    Datagram {
+        recv: MsgMut,
+        buf: Vec<u8>,
+        sender: Box<libc::sockaddr_un>,
+    },
+    /// An SCM_RIGHTS fd-pass reply is being sent to a `Logs { follow }`
+    /// client. Owns the message, the destination address the kernel reads on
+    /// completion, and the pipe read end to close afterwards.
+    FollowSend {
+        /// Kept alive only so the SCM_RIGHTS payload outlives the op.
+        #[allow(dead_code)]
+        slot: Msg,
+        /// The kernel dereferences `msg_name` when the op runs, so the
+        /// destination must outlive the op — not just the dispatch.
+        #[allow(dead_code)]
+        sender: Box<libc::sockaddr_un>,
+        close_after: RawFd,
+    },
+    /// An attach client is being accepted.
     Accept,
-    /// Reaps dead containers from the SIGCHLD signalfd.
-    SignalReaper,
-    /// Drains one container's stdout/stderr pipe into its log gateway.
-    ContainerOutput { pid: pid_t },
-    /// Drains a detached TTY container's pty master into its log gateway (the
-    /// pipe drain above captures stdout/stderr; this captures tty echo).
-    ContainerPtyOutput { pid: pid_t },
-    /// Reads client frames from an attach session's stream and forwards stdin
-    /// data/EOF/win-size to the container.
-    SessionRead { session_id: u64 },
-    /// Drains an attach session's output (PTY or follow pipe) into `0x10`
-    /// data frames, then sends the `0x02` exit frame and closes the session.
-    SessionOutput { session_id: u64 },
+    /// A `signalfd_siginfo` record is being read.
+    Sigchld {
+        /// Kept alive only so the kernel's write target outlives the op.
+        #[allow(dead_code)]
+        buf: BytesMut,
+    },
+    /// A container's stdout/stderr pipe is being drained. `line_buf` holds
+    /// the trailing partial line between reads.
+    ContainerOutput { pid: pid_t, line_buf: Vec<u8> },
+    /// A detached TTY container's pty master is being drained.
+    ContainerPtyOutput { pid: pid_t, line_buf: Vec<u8> },
+    /// A log line is being written to one follow pipe. `chunks` is the
+    /// remaining work: `write` covers one chunk at a time, so this is the
+    /// `write_all` state machine, re-armed until the queue empties.
+    FollowWrite {
+        pid: pid_t,
+        pipe_id: u64,
+        fd: RawFd,
+        chunks: VecDeque<Bytes>,
+    },
+    /// A session's 3-byte frame header is being accumulated.
+    SessionHeader { session_id: u64, acc: Vec<u8> },
+    /// A session frame payload is being accumulated (`read_exact` semantics:
+    /// short reads are resumed until `acc` reaches `need`).
+    SessionPayload {
+        session_id: u64,
+        frame_type: u8,
+        acc: Vec<u8>,
+        need: usize,
+    },
+    /// A framed message is being written to a session stream. `buf` holds the
+    /// complete frame (3-byte header + payload) and `off` the bytes already
+    /// written, so a partial write resumes exactly where it stopped.
+    SessionFrame {
+        session_id: u64,
+        stream_fd: RawFd,
+        buf: Bytes,
+        off: usize,
+    },
+    /// A session's output source (pty master or follow pipe) is being drained.
+    SessionOutputRead { session_id: u64 },
+    /// Client stdin bytes are being written to the container.
+    SessionStdin {
+        session_id: u64,
+        buf: Bytes,
+        off: usize,
+    },
+    /// A cancelled op's completion; carries nothing, but `cancel` requires a
+    /// local for its acknowledgement callback.
+    Cancelled,
 }
 
 // ── LogCache: single-buffer ring of \n-delimited lines ─────────────────────
@@ -311,11 +365,10 @@ impl LogCache {
 
 // ── LogGateway: cache + follow pipes ───────────────────────────────────────
 //
-// The coio port keeps the cache and pipe bookkeeping synchronous; the actual
-// pipe writes happen in the async container-output task via `coio::io::write`.
-// `push` marks each idle pipe in-flight so at most one write is outstanding
-// per pipe at a time (matching the old AsyncPipeWriter contract), and returns
-// the ids the caller must write to.
+// The cache and pipe bookkeeping are synchronous; the actual pipe writes are
+// dispatched as ops from the container-output loop. `push` marks each idle
+// pipe in-flight so at most one write is outstanding per pipe at a time, and
+// returns the ids the caller must write to.
 
 struct AsyncPipeWriter {
     id: u64,
@@ -359,8 +412,9 @@ impl LogGateway {
     }
 
     /// Records `line` in the cache and marks every idle pipe in-flight for it.
-    /// Returns the ids of the pipes the caller must `write` to (no borrow of
-    /// the gateway may span the await, so the write happens outside).
+    /// Returns the ids of the pipes the caller must write to (the caller drops
+    /// the borrow before dispatching, so no borrow is live across a
+    /// completion).
     fn push(&mut self, line: &[u8]) -> Vec<u64> {
         self.cache.push(line);
         self.pipes
@@ -429,9 +483,9 @@ struct ContainerInfo {
     drains_pending: u32,
 }
 
-/// One container's stdout/stderr pipe being drained asynchronously. The read
-/// buffer and line assembly live in the `ContainerOutput` task's locals; the
-/// pty echo for detached TTY containers lives in `ContainerPtyOutput`.
+/// One container's stdout/stderr pipe being drained. The read buffer and line
+/// assembly live in the container-output loop's `OpLocal`; the pty echo for
+/// detached TTY containers has its own sibling loop.
 struct Output {
     fd: RawFd,
 }
@@ -446,28 +500,31 @@ struct AttachSession {
     container_pid: pid_t,
     child_exited: bool,
     exit_code: Option<i32>,
-}
-
-/// Cross-task signal channels for one session.
-struct SessionNotify {
-    /// Fired by the reaper once the session's container is reaped. The value
-    /// is stored in the notify, so the output task observes the exit even if
-    /// it only waits after the reaper ran.
-    child_exit: Notify<()>,
+    /// The output drain hit EOF. Together with `child_exited` this releases
+    /// the deferred `0x02` exit frame: whichever of the two happens last sends
+    /// it, so no loop has to park waiting for the other.
+    drain_done: bool,
+    /// The `0x02` exit frame write is in flight (or already sent).
+    exit_sent: bool,
+    /// The session's client-frame read op, so `close_session` can cancel it
+    /// instead of closing an fd out from under an in-flight read.
+    read_op: Option<coio::Op>,
+    /// The session's output-drain read op, cancelled the same way.
+    output_op: Option<coio::Op>,
 }
 
 // ── Follow (fd-pass) ───────────────────────────────────────────────────────
 //
-// A `Logs { follow: true }` request runs entirely inside the datagram task: it
+// A `Logs { follow: true }` request runs entirely inside the datagram loop: it
 // snapshots the backlog into an owned `Vec`, writes it synchronously to a
 // fresh pipe (the backlog is at most the cache capacity, which fits the default
-// pipe capacity, and no await happens during the write so no line can slip in
-// between the snapshot and the pipe being attached), then passes the read end
-// to the client with SCM_RIGHTS via an async `sendmsg`. The gateway pipe is
+// pipe capacity, and no op is dispatched during the write so no line can slip
+// in between the snapshot and the pipe being attached), then passes the read
+// end to the client with SCM_RIGHTS via a `sendmsg` op. The gateway pipe is
 // registered only after the backlog write, so live output then flows to the
-// pipe through the normal container-output task.
+// pipe through the normal container-output loop.
 
-// ── DaemonState / DaemonStateShared: shared, borrow-disciplined ────────────
+// ── DaemonState: the runtime's global `G` ─────────────────────────────────
 
 struct DaemonState {
     socket_path: PathBuf,
@@ -479,7 +536,6 @@ struct DaemonState {
     log_graveyard: HashMap<pid_t, LogCache>,
     next_pipe_id: u64,
     attach_sessions: HashMap<u64, AttachSession>,
-    session_notify: HashMap<u64, SessionNotify>,
     next_session_id: u64,
 }
 
@@ -495,50 +551,17 @@ impl DaemonState {
             log_graveyard: HashMap::new(),
             next_pipe_id: 0,
             attach_sessions: HashMap::new(),
-            session_notify: HashMap::new(),
             next_session_id: 0,
         }
     }
 }
 
-/// Shared handle to the daemon state: an `Rc<RefCell<DaemonState>>` behind a
-/// borrow-disciplined facade. All access goes through [`Self::with`] /
-/// [`Self::with_mut`], which hand out a short, synchronous borrow so a
-/// borrow is never held across an await point. Tasks receive a clone of this
-/// handle (a cheap `Rc` bump) and pass `&DaemonStateShared` around.
-#[derive(Clone)]
-struct DaemonStateShared {
-    inner: Rc<RefCell<DaemonState>>,
-}
-
-impl DaemonStateShared {
-    fn new(socket_path: PathBuf) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(DaemonState::new(socket_path))),
-        }
-    }
-
-    /// Run `f` against a synchronous immutable borrow of the shared state.
-    ///
-    /// The `Ref` is dropped when the closure returns, so a borrow can never be
-    /// held across an await point: an async task that needs the state extracts
-    /// whatever it needs inside the closure and lets the borrow go before
-    /// awaiting.
-    fn with<T>(&self, f: impl FnOnce(&DaemonState) -> T) -> T {
-        f(&self.inner.borrow())
-    }
-
-    /// Run `f` against a synchronous mutable borrow of the shared state.
-    ///
-    /// Like [`Self::with`], the `RefMut` is dropped when the closure
-    /// returns, so mutations always happen in a short, synchronous span and
-    /// never across an await point.
-    fn with_mut<T>(&self, f: impl FnOnce(&mut DaemonState) -> T) -> T {
-        f(&mut self.inner.borrow_mut())
-    }
-}
-
 // ── Daemon entry point ────────────────────────────────────────────────────
+
+/// The daemon's runtime: shared state as `G`, [`OpLocal`] as `L`. Every
+/// callback below takes this one type, which is why they can all be plain
+/// function pointers.
+type Rt = Runtime<DaemonState, OpLocal>;
 
 pub struct Daemon {
     socket_path: PathBuf,
@@ -550,58 +573,23 @@ impl Daemon {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
-        let state = DaemonStateShared::new(self.socket_path.clone());
-
-        // `make_fut` is the single spawn entry point: every task (main and
-        // spawned) is built by calling it, so the closure captures the shared
-        // state once and hands each task its own owned `DaemonStateShared`
-        // clone. The returned future is `'static` because it owns the clone;
-        // the closure itself may borrow the stack `state` since `block_on`
-        // does not require `S` to be `'static`. `run()` returns only once the
-        // runtime drains, i.e. when every persistent task's io has completed
-        // (at process exit).
-        block_on_default(
-            |ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
-                let state = state.clone();
-                async move { dispatcher(ctx, rt, kind, state).await }
-            },
-            TaskKind::Main,
-        );
+        let state = DaemonState::new(self.socket_path.clone());
+        // `boot` runs exactly once, before the runtime drives anything. It
+        // binds the sockets and arms the three persistent loops; each of those
+        // re-arms itself from its completion callback, so `block_on` returns
+        // only when every loop has finished.
+        block_on_default(state, boot);
         Ok(())
     }
 }
 
-/// Dispatches one spawned task to its handler. `rt` is passed to every task
-/// (the runtime hands it to each spawned closure) so session tasks can spawn
-/// their output siblings.
-async fn dispatcher(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    kind: TaskKind,
-    state: DaemonStateShared,
-) {
-    match kind {
-        TaskKind::Main => main_task(ctx, rt, &state).await,
-        TaskKind::Datagram => datagram_task(ctx, rt, &state).await,
-        TaskKind::Accept => accept_task(ctx, rt, &state).await,
-        TaskKind::SignalReaper => reaper_task(ctx, &state).await,
-        TaskKind::ContainerOutput { pid } => container_output_task(ctx, &state, pid).await,
-        TaskKind::ContainerPtyOutput { pid } => container_pty_output_task(ctx, &state, pid).await,
-        TaskKind::SessionRead { session_id } => {
-            session_read_task(ctx, rt, &state, session_id).await
-        }
-        TaskKind::SessionOutput { session_id } => {
-            session_output_task(ctx, &state, session_id).await
-        }
-    }
-}
-
-/// The bootstrap task: bind the sockets, arm the SIGCHLD signalfd, store the
-/// fds in the shared state, then spawn the persistent tasks. Returns once the
-/// daemon's background io is all up; the runtime stays alive while any io is
-/// in flight, and `run()` only returns when everything drains.
-async fn main_task(ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, state: &DaemonStateShared) {
-    let socket_path = state.with(|s| s.socket_path.clone());
+/// The bootstrap: bind the sockets, arm the SIGCHLD signalfd, store the fds
+/// in the shared state, then arm the three persistent loops.
+///
+/// Every persistent loop keeps one op in flight at all times, so the runtime
+/// never runs dry while the daemon should stay up.
+fn boot(rt: &mut Rt) {
+    let socket_path = rt.global().socket_path.clone();
     let dir = socket_path.parent().expect("socket path has a parent");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::error!(%e, path = %dir.display(), "cannot create socket dir");
@@ -650,43 +638,53 @@ async fn main_task(ctx: TaskContext, rt: RuntimeContext<TaskKind, ()>, state: &D
     std::mem::forget(datagram);
     std::mem::forget(listener);
 
-    state.with_mut(|s| {
-        s.datagram_fd = datagram_fd;
-        s.attach_listener_fd = attach_listener_fd;
-        s.sigchld_fd = sigchld_fd;
-    });
-
-    // Spawn the persistent tasks. Each keeps an io op in flight, so the
-    // runtime keeps running.
-    for kind in [TaskKind::Datagram, TaskKind::Accept, TaskKind::SignalReaper] {
-        match rt.spawn(kind) {
-            Some(_handle) => {}
-            None => tracing::error!("task slab full, failed to spawn task"),
+    {
+        let s = rt.global_mut();
+        {
+            s.datagram_fd = datagram_fd;
+            s.attach_listener_fd = attach_listener_fd;
+            s.sigchld_fd = sigchld_fd;
         }
-    }
+    };
 
-    let _ = ctx;
+    arm_datagram(rt);
+    arm_accept(rt);
+    arm_sigchld(rt);
 }
 
 // ── Signal reaper ─────────────────────────────────────────────────────────
 
-async fn reaper_task(ctx: TaskContext, state: &DaemonStateShared) {
-    let sigchld_fd = state.with(|s| s.sigchld_fd);
-    loop {
-        // One 128-byte `signalfd_siginfo` record; the read future owns its own
-        // pooled buffer, so nothing must be borrowed across the await.
-        match coio::io::read(ctx, sigchld_fd, 128).await {
-            Ok(bytes) if !bytes.is_empty() => reap_children(state),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(%e, "sigchld read failed, reaper exiting");
-                break;
-            }
+/// Arms one `signalfd_siginfo` read. The callback reaps and re-arms, so the
+/// daemon always has a SIGCHLD read outstanding.
+fn arm_sigchld(rt: &mut Rt) {
+    let sigchld_fd = rt.global().sigchld_fd;
+    let buf = match alloc_bytes(128) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(%e, "cannot allocate sigchld buffer, reaper exiting");
+            return;
         }
-    }
+    };
+    let _ = read(rt, sigchld_fd, 128, OpLocal::Sigchld { buf }, on_sigchld);
 }
 
-fn reap_children(state: &DaemonStateShared) {
+fn on_sigchld(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::Sigchld { .. } = local else {
+        return;
+    };
+    match res {
+        Ok(bytes) if !bytes.is_empty() => reap_children(rt),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(%e, "sigchld read failed, reaper exiting");
+            return;
+        }
+    }
+    arm_sigchld(rt);
+}
+
+fn reap_children(rt: &mut Rt) {
+    let mut finished_sessions = Vec::new();
     loop {
         let mut status: i32 = 0;
         match sys::wait4(-1, &mut status, libc::WNOHANG, None) {
@@ -700,7 +698,8 @@ fn reap_children(state: &DaemonStateShared) {
                     1
                 };
 
-                let Some(session_id) = state.with(|s| {
+                let maybe_session = {
+                    let s = rt.global();
                     let found = s
                         .attach_sessions
                         .iter()
@@ -712,56 +711,62 @@ fn reap_children(state: &DaemonStateShared) {
                     } else {
                         None
                     }
-                }) else {
+                };
+                let Some(session_id) = maybe_session else {
                     continue;
                 };
 
                 if let Some(sid) = session_id {
-                    // Notify the session's output task: the child exited and
-                    // the exit code is ready. The output task sends the 0x02
-                    // frame once its output drain hits EOF, so all 0x10 data
-                    // frames are flushed before the exit frame.
-                    state.with_mut(|s| {
-                        if let Some(sess) = s.attach_sessions.get_mut(&sid) {
-                            sess.child_exited = true;
-                            sess.exit_code = Some(exit_code);
-                        }
-                        if let Some(notify) = s.session_notify.get(&sid) {
-                            notify.child_exit.notify(());
-                        }
-                    });
+                    // Record the exit so the session's deferred `0x02` frame can
+                    // be sent once its output drain also reaches EOF. Whichever
+                    // of the two events happens last sends it, which is what
+                    // `maybe_finish_session` below decides.
+                    let ready = {
+                        let s = rt.global_mut();
+                        let Some(sess) = s.attach_sessions.get_mut(&sid) else {
+                            continue;
+                        };
+                        sess.child_exited = true;
+                        sess.exit_code = Some(exit_code);
+                        Some(sid)
+                    };
+                    if let Some(sid) = ready {
+                        finished_sessions.push(sid);
+                    }
                 }
 
                 // Remove the container: move its log cache to the graveyard,
                 // close its fds and follow pipes, clean up the overlay. If the
                 // container still has output drains running (detached
-                // containers finish draining asynchronously after exit), defer
+                // containers finish draining after exit), defer
                 // the cleanup to `finish_drain` so the follow pipes stay open
                 // until the last of the buffered output has been delivered.
-                let Some(removed) = state.with_mut(|s| {
-                    let info = s.containers.get(&pid)?;
-                    if info.drains_pending > 0 {
-                        return None;
+                let removed = {
+                    let s = rt.global_mut();
+                    if s.containers.get(&pid).is_none_or(|i| i.drains_pending > 0) {
+                        None
+                    } else {
+                        let mut info = s.containers.remove(&pid).expect("checked above");
+                        let cache =
+                            std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
+                        s.log_graveyard.insert(pid, cache);
+                        if info.ptm_fd >= 0 {
+                            sys::close(info.ptm_fd);
+                            info.ptm_fd = -1;
+                        }
+                        if info.stdin_fd >= 0 {
+                            sys::close(info.stdin_fd);
+                            info.stdin_fd = -1;
+                        }
+                        if info.death_pipe_write >= 0 {
+                            sys::close(info.death_pipe_write);
+                            info.death_pipe_write = -1;
+                        }
+                        info.gateway.close_all_pipes();
+                        Some(info)
                     }
-                    let mut info = s.containers.remove(&pid)?;
-                    let cache =
-                        std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
-                    s.log_graveyard.insert(pid, cache);
-                    if info.ptm_fd >= 0 {
-                        sys::close(info.ptm_fd);
-                        info.ptm_fd = -1;
-                    }
-                    if info.stdin_fd >= 0 {
-                        sys::close(info.stdin_fd);
-                        info.stdin_fd = -1;
-                    }
-                    if info.death_pipe_write >= 0 {
-                        sys::close(info.death_pipe_write);
-                        info.death_pipe_write = -1;
-                    }
-                    info.gateway.close_all_pipes();
-                    Some(info)
-                }) else {
+                };
+                let Some(removed) = removed else {
                     continue;
                 };
                 if let Some(ref overlay) = removed.overlay_dir
@@ -779,6 +784,11 @@ fn reap_children(state: &DaemonStateShared) {
                 break;
             }
         }
+    }
+    // Reap is a loop, so a session may have had both its exit and its drain
+    // EOF observed here; check once the sweep is done.
+    for sid in finished_sessions {
+        maybe_finish_session(rt, sid);
     }
 }
 
@@ -1156,60 +1166,79 @@ fn run_init_loop(death_pipe_read: RawFd, command: Vec<CString>) -> ! {
 
 // ── Async request handlers ──────────────────────────────────────────────────
 
-async fn datagram_task(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-) {
-    let datagram_fd = state.with(|s| s.datagram_fd);
-
-    let mut recv = MsgMut::new().expect("recvmsg slot");
-    let mut recv_buf = vec![0u8; 65536];
+/// Arms one datagram receive. The completion callback handles the request and
+/// immediately re-arms, so the control socket always has a receive in flight.
+fn arm_datagram(rt: &mut Rt) {
+    let datagram_fd = rt.global().datagram_fd;
+    let Some(mut recv) = MsgMut::new() else {
+        return;
+    };
+    let buf = vec![0u8; 65536];
     recv.push_iov(libc::iovec {
-        iov_base: recv_buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: recv_buf.len(),
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
     });
-    let mut sender: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // Allocate the sender buffer first so `msg_name` can point at it. The box's
+    // contents never move when the box itself is moved into the op local, so
+    // the pointer stays valid for the kernel to fill.
+    let mut sender: Box<libc::sockaddr_un> = Box::new(unsafe { std::mem::zeroed() });
+    {
+        let msg = recv.msg();
+        msg.msg_name = (&raw mut *sender).cast();
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    }
+    let ptr = recv.msg_ptr();
+    // SAFETY: `recv` lives in the op local below, so the `msghdr` it owns
+    // outlives the op.
+    let _ = unsafe {
+        recvmsg(
+            rt,
+            datagram_fd,
+            ptr,
+            0,
+            OpLocal::Datagram { recv, buf, sender },
+            on_datagram,
+        )
+    };
+}
 
-    loop {
-        // Offer the sender-address buffer; the kernel fills it on recvmsg.
-        {
-            let msg = recv.msg();
-            msg.msg_name = (&mut sender as *mut libc::sockaddr_un).cast();
-            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+fn on_datagram(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::Datagram {
+        mut recv,
+        buf,
+        sender,
+    } = local
+    else {
+        return;
+    };
+    let n = match res {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(%e, "datagram recv failed");
+            arm_datagram(rt);
+            return;
         }
-        let n = match recvmsg(ctx, datagram_fd, &mut recv, 0).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(%e, "datagram recv failed");
-                continue;
-            }
-        };
-        if n == 0 {
-            continue;
-        }
-        let sender_len = recv.msg().msg_namelen;
-
-        let request: Request = match serde_json::from_slice(&recv_buf[..n]) {
+    };
+    let sender_len = recv.msg().msg_namelen;
+    if n > 0 {
+        let request: Request = match serde_json::from_slice(&buf[..n]) {
             Ok(r) => r,
             Err(e) => {
-                reply_datagram(datagram_fd, &sender, sender_len, &ErrorResponse {
+                reply_datagram(rt, &sender, sender_len, &ErrorResponse {
                     ok: false,
                     error: format!("invalid request: {e}"),
                 });
-                continue;
+                arm_datagram(rt);
+                return;
             }
         };
-
-        handle_datagram(ctx, rt, state, datagram_fd, &sender, sender_len, request).await;
+        handle_datagram(rt, &sender, sender_len, request);
     }
+    arm_datagram(rt);
 }
 
-async fn handle_datagram(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    datagram_fd: RawFd,
+fn handle_datagram(
+    rt: &mut Rt,
     sender: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
     request: Request,
@@ -1224,7 +1253,7 @@ async fn handle_datagram(
             tty,
             no_init,
             init_path,
-        } => handle_run(rt, state, datagram_fd, sender, sender_len, RunArgs {
+        } => handle_run(rt, sender, sender_len, RunArgs {
             rootfs,
             net_pid,
             save,
@@ -1236,27 +1265,28 @@ async fn handle_datagram(
         }),
         Request::List => {
             let now = SystemTime::now();
-            let containers: Vec<ContainerSummary> = state.with(|s| {
-                s.containers
-                    .values()
-                    .map(|info| {
-                        let age = now.duration_since(info.start_time).unwrap_or_default();
-                        ContainerSummary {
-                            pid: info.pid,
-                            command: info.command.clone(),
-                            start_time: format!("{:.1}s", age.as_secs_f64()),
-                        }
-                    })
-                    .collect()
-            });
-            reply_datagram(datagram_fd, sender, sender_len, &ListResponse {
-                containers,
-            });
+            let containers: Vec<ContainerSummary> = rt
+                .global()
+                .containers
+                .values()
+                .map(|info| {
+                    let age = now.duration_since(info.start_time).unwrap_or_default();
+                    ContainerSummary {
+                        pid: info.pid,
+                        command: info.command.clone(),
+                        start_time: format!("{:.1}s", age.as_secs_f64()),
+                    }
+                })
+                .collect();
+            reply_datagram(rt, sender, sender_len, &ListResponse { containers });
         }
         Request::Kill { pid } => {
             let pid = pid as pid_t;
-            if !state.with(|s| s.containers.contains_key(&pid)) {
-                reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+            if !{
+                let s = rt.global();
+                s.containers.contains_key(&pid)
+            } {
+                reply_datagram(rt, sender, sender_len, &KillResponse {
                     ok: false,
                     error: Some(format!("container {pid} not found")),
                 });
@@ -1265,14 +1295,14 @@ async fn handle_datagram(
             let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
             if ret < 0 {
                 let e = io::Error::last_os_error();
-                reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+                reply_datagram(rt, sender, sender_len, &KillResponse {
                     ok: false,
                     error: Some(format!("kill failed: {e}")),
                 });
                 return;
             }
             tracing::info!(%pid, "sent SIGKILL");
-            reply_datagram(datagram_fd, sender, sender_len, &KillResponse {
+            reply_datagram(rt, sender, sender_len, &KillResponse {
                 ok: true,
                 error: None,
             });
@@ -1280,29 +1310,28 @@ async fn handle_datagram(
         Request::Logs { pid, follow } => {
             let pid = pid as pid_t;
             if follow {
-                handle_follow(ctx, state, datagram_fd, sender, sender_len, pid).await;
+                handle_follow(rt, sender, sender_len, pid);
             } else {
-                let lines = state.with_mut(|s| {
-                    if let Some(info) = s.containers.get_mut(&pid) {
-                        Some(info.gateway.collect_lines())
-                    } else {
-                        s.log_graveyard
-                            .get_mut(&pid)
-                            .map(|cache| cache.collect_lines())
-                    }
-                });
+                let s = rt.global_mut();
+                let lines = if let Some(info) = s.containers.get_mut(&pid) {
+                    Some(info.gateway.collect_lines())
+                } else {
+                    s.log_graveyard
+                        .get_mut(&pid)
+                        .map(|cache| cache.collect_lines())
+                };
                 let Some(lines) = lines else {
-                    reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+                    reply_datagram(rt, sender, sender_len, &ErrorResponse {
                         ok: false,
                         error: format!("container {pid} not found"),
                     });
                     return;
                 };
-                reply_datagram(datagram_fd, sender, sender_len, &LogsResponse { lines });
+                reply_datagram(rt, sender, sender_len, &LogsResponse { lines });
             }
         }
         Request::Attach { .. } => {
-            reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+            reply_datagram(rt, sender, sender_len, &ErrorResponse {
                 ok: false,
                 error: "attach must be sent over the stream socket".into(),
             });
@@ -1311,41 +1340,40 @@ async fn handle_datagram(
 }
 
 fn reply_datagram(
-    datagram_fd: RawFd,
+    rt: &Rt,
     sender: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
     resp: &impl Serialize,
 ) {
     let data = serde_json::to_vec(resp).unwrap();
+    let datagram_fd = rt.global().datagram_fd;
     if let Err(e) = send_datagram_raw(datagram_fd, sender, sender_len, &data) {
         tracing::error!(%e, "reply sendto failed");
     }
 }
 
-/// The `Logs { follow: true }` path. Runs entirely in the datagram task: the
-/// backlog is snapshotted and written to a fresh pipe synchronously (the
-/// snapshot is at most the cache capacity, which fits the default pipe
-/// capacity, and no await happens between the snapshot and the write, so no
-/// other task can push a line into the gap) — no lock is needed. The read end
-/// is then passed to the client with an async SCM_RIGHTS `sendmsg`, and the
-/// pipe writer is attached to the container's gateway so live output flows to
-/// it through the normal container-output task.
-async fn handle_follow(
-    ctx: TaskContext,
-    state: &DaemonStateShared,
-    datagram_fd: RawFd,
-    sender: &libc::sockaddr_un,
+/// The `Logs { follow: true }` path. The backlog is snapshotted and written to
+/// a fresh pipe synchronously (the snapshot is at most the cache capacity,
+/// which fits the default pipe capacity, and no dispatch happens between the
+/// snapshot and the write, so no other loop can push a line into the gap) — no
+/// lock is needed. The read end is then passed to the client with an
+/// SCM_RIGHTS `sendmsg` op, and the pipe writer is attached to the container's
+/// gateway so live output flows to it through the normal container-output loop.
+fn handle_follow(
+    rt: &mut Rt,
+    sender_ref: &libc::sockaddr_un,
     sender_len: libc::socklen_t,
     pid: pid_t,
 ) {
     tracing::debug!(%pid, "handle_follow");
 
-    let backlog = state.with_mut(|s| match s.containers.get_mut(&pid) {
-        Some(info) => Some(info.gateway.snapshot()),
-        None => None,
-    });
+    let backlog = rt
+        .global_mut()
+        .containers
+        .get_mut(&pid)
+        .map(|info| info.gateway.snapshot());
     let Some(backlog) = backlog else {
-        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+        reply_datagram(rt, sender_ref, sender_len, &ErrorResponse {
             ok: false,
             error: format!("container {pid} not found"),
         });
@@ -1358,7 +1386,7 @@ async fn handle_follow(
     };
     if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
         tracing::error!(%e, "follow pipe creation failed");
-        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+        reply_datagram(rt, sender_ref, sender_len, &ErrorResponse {
             ok: false,
             error: format!("pipe creation failed: {e}"),
         });
@@ -1389,17 +1417,21 @@ async fn handle_follow(
         }
     }
 
-    let attached = state.with_mut(|s| {
+    let attached = {
+        let s = rt.global_mut();
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
-        let Some(info) = s.containers.get_mut(&pid) else {
-            return false;
-        };
-        info.gateway
-            .pipes
-            .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
-        true
-    });
+        // The container may have been reaped while the backlog was written.
+        match s.containers.get_mut(&pid) {
+            Some(info) => {
+                info.gateway
+                    .pipes
+                    .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
+                true
+            }
+            None => false,
+        }
+    };
     if !attached {
         let _ = unsafe { libc::close(pipe_fds.write) };
         let _ = unsafe { libc::close(pipe_fds.read) };
@@ -1407,34 +1439,56 @@ async fn handle_follow(
     }
 
     // Pass the read end to the client with SCM_RIGHTS.
-    let mut slot = Msg::new().expect("sendmsg slot");
-    slot.push_scm_rights(&[pipe_fds.read]);
+    let Some(mut slot) = Msg::new() else {
+        return;
+    };
+    if !slot.push_scm_rights(&[pipe_fds.read]) {
+        tracing::error!("follow fd-pass cmsg did not fit");
+        let _ = unsafe { libc::close(pipe_fds.write) };
+        let _ = unsafe { libc::close(pipe_fds.read) };
+        return;
+    }
+    // `msg_name` must stay valid until the kernel consumes it, so the
+    // destination address is moved into the op local rather than borrowed from
+    // this frame.
+    let mut sender: Box<libc::sockaddr_un> = Box::new(unsafe { std::mem::zeroed() });
+    *sender = *sender_ref;
     {
         let msg = slot.msg();
-        msg.msg_name = (sender as *const libc::sockaddr_un as *mut libc::c_void).cast();
+        msg.msg_name = (&raw mut *sender).cast();
         msg.msg_namelen = sender_len;
     }
-    match sendmsg(ctx, datagram_fd, &mut slot).await {
-        Ok(_) => {}
-        Err(e) => tracing::error!(%e, "fd-pass sendmsg failed"),
-    }
-    let _ = unsafe { libc::close(pipe_fds.read) };
+    let ptr = slot.msg_ptr();
+    let _ = sendmsg(
+        rt,
+        rt.global().datagram_fd,
+        ptr,
+        OpLocal::FollowSend {
+            slot,
+            sender,
+            close_after: pipe_fds.read,
+        },
+        on_follow_send,
+    );
 }
 
-/// Run a container in detached mode. Fully synchronous except for the spawns:
-/// stdout/stderr are captured from a pipe and drained by the
-/// `ContainerOutput` task (and, for `--tty`, the pty echo by
-/// `ContainerPtyOutput`). The caller receives a `RunResponse` datagram.
-fn handle_run(
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    datagram_fd: RawFd,
-    sender: &libc::sockaddr_un,
-    sender_len: libc::socklen_t,
-    args: RunArgs,
-) {
-    let err = |msg: &str| {
-        reply_datagram(datagram_fd, sender, sender_len, &ErrorResponse {
+fn on_follow_send(_rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::FollowSend { close_after, .. } = local else {
+        return;
+    };
+    if let Err(e) = res {
+        tracing::error!(%e, "fd-pass sendmsg failed");
+    }
+    let _ = unsafe { libc::close(close_after) };
+}
+
+/// Run a container in detached mode. Fully synchronous except for the armed
+/// output drains: stdout/stderr are captured from a pipe and drained by the
+/// container-output loop (and, for `--tty`, the pty echo by its sibling). The
+/// caller receives a `RunResponse` datagram.
+fn handle_run(rt: &mut Rt, sender: &libc::sockaddr_un, sender_len: libc::socklen_t, args: RunArgs) {
+    let err = |rt: &Rt, msg: &str| {
+        reply_datagram(rt, sender, sender_len, &ErrorResponse {
             ok: false,
             error: msg.to_string(),
         });
@@ -1447,7 +1501,7 @@ fn handle_run(
     let prep = match prepare_run(args) {
         Ok(p) => p,
         Err(e) => {
-            err(&e);
+            err(rt, &e);
             return;
         }
     };
@@ -1457,7 +1511,7 @@ fn handle_run(
         write: -1,
     };
     if use_stdin_pipe && let Err(e) = sys::pipe2(&mut stdin_pipe_fds, libc::O_CLOEXEC) {
-        err(&format!("stdin pipe creation failed: {e}"));
+        err(rt, &format!("stdin pipe creation failed: {e}"));
         return;
     }
 
@@ -1465,7 +1519,7 @@ fn handle_run(
         match pty::open_pty() {
             Ok((m, s)) => (Some(m), Some(s)),
             Err(e) => {
-                err(&format!("pty allocation failed: {e}"));
+                err(rt, &format!("pty allocation failed: {e}"));
                 return;
             }
         }
@@ -1478,7 +1532,7 @@ fn handle_run(
         write: -1,
     };
     if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-        err(&format!("log pipe creation failed: {e}"));
+        err(rt, &format!("log pipe creation failed: {e}"));
         return;
     }
 
@@ -1499,7 +1553,7 @@ fn handle_run(
                 sys::close(dp.read);
                 sys::close(dp.write);
             }
-            err(&format!("clone3 failed: {e}"));
+            err(rt, &format!("clone3 failed: {e}"));
         }
         Ok(None) => {
             // Child.
@@ -1603,7 +1657,7 @@ fn handle_run(
                 if death_pipe_write >= 0 {
                     sys::close(death_pipe_write);
                 }
-                err(&format!("container aborted: {e}"));
+                err(rt, &format!("container aborted: {e}"));
                 return;
             }
 
@@ -1615,43 +1669,51 @@ fn handle_run(
                 .join(" ");
             let has_pty = ptm_fd >= 0;
 
-            state.with_mut(|s| {
-                s.outputs.insert(pid, Output { fd: pipe_fds.read });
-                s.containers.insert(pid, ContainerInfo {
-                    pid,
-                    command: cmd_str,
-                    overlay_dir: prep.overlay_dir,
-                    save,
-                    start_time: SystemTime::now(),
-                    gateway: LogGateway::new(LOG_CAPACITY),
-                    stdin_fd: stdin_write_fd,
-                    ptm_fd,
-                    death_pipe_write,
-                    drains_pending: 0,
-                });
-            });
+            {
+                let s = rt.global_mut();
+                {
+                    s.outputs.insert(pid, Output { fd: pipe_fds.read });
+                    s.containers.insert(pid, ContainerInfo {
+                        pid,
+                        command: cmd_str,
+                        overlay_dir: prep.overlay_dir,
+                        save,
+                        start_time: SystemTime::now(),
+                        gateway: LogGateway::new(LOG_CAPACITY),
+                        stdin_fd: stdin_write_fd,
+                        ptm_fd,
+                        death_pipe_write,
+                        drains_pending: 0,
+                    });
+                }
+            };
 
-            match rt.spawn(TaskKind::ContainerOutput { pid }) {
-                Some(_) => state.with_mut(|s| {
+            // Arm the output drains. The counter is incremented first so the
+            // reaper defers container cleanup until both drains have flushed.
+            {
+                let s = rt.global_mut();
+                {
                     if let Some(info) = s.containers.get_mut(&pid) {
                         info.drains_pending += 1;
                     }
-                }),
-                None => tracing::error!("task slab full, failed to spawn container output task"),
-            }
+                }
+            };
+            arm_container_output(rt, pid);
+
             if has_pty {
-                match rt.spawn(TaskKind::ContainerPtyOutput { pid }) {
-                    Some(_) => state.with_mut(|s| {
+                {
+                    let s = rt.global_mut();
+                    {
                         if let Some(info) = s.containers.get_mut(&pid) {
                             info.drains_pending += 1;
                         }
-                    }),
-                    None => tracing::error!("task slab full, failed to spawn pty output task"),
-                }
+                    }
+                };
+                arm_container_pty_output(rt, pid);
             }
 
             tracing::info!(%pid, "container started");
-            reply_datagram(datagram_fd, sender, sender_len, &RunResponse {
+            reply_datagram(rt, sender, sender_len, &RunResponse {
                 ok: true,
                 pid: Some(pid),
                 error: None,
@@ -1705,14 +1767,15 @@ fn split_line(line: &[u8]) -> Vec<Bytes> {
     }
 }
 
-/// Push `lines` into the container's gateway (or the graveyard cache if the
-/// container was already reaped), writing each to its idle follow pipes. All
-/// awaits happen without holding a borrow on the shared state. A line's
-/// in-flight mark is held across all of its chunks, so the next line can never
-/// interleave with it on the same pipe.
-async fn write_lines(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t, lines: Vec<Vec<u8>>) {
+/// Pushes `lines` into each pending follow pipe: records them in the cache,
+/// then arms one [`OpLocal::FollowWrite`] per idle pipe. All state access is a
+/// short synchronous borrow, and the dispatch happens after the borrow is
+/// released. A line's in-flight mark is held across all of its chunks, so the
+/// next line can never interleave with it on the same pipe.
+fn write_lines(rt: &mut Rt, pid: pid_t, lines: Vec<Vec<u8>>) {
     for line in lines {
-        let pending = state.with_mut(|s| match s.containers.get_mut(&pid) {
+        let s = rt.global_mut();
+        let pending = match s.containers.get_mut(&pid) {
             Some(info) => {
                 let mut pend = Vec::new();
                 for id in info.gateway.push(&line) {
@@ -1728,42 +1791,110 @@ async fn write_lines(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t, li
                 }
                 Vec::new()
             }
-        });
-        if pending.is_empty() {
-            continue;
-        }
-        let chunks = split_line(&line);
-        for (id, fd) in pending {
-            let mut ok = true;
-            for chunk in &chunks {
-                let view = chunk.sub(0, chunk.len()).expect("line chunk in bounds");
-                if let Err(e) = write_all(ctx, fd, view).await {
-                    tracing::warn!(%e, "follow pipe write failed");
-                    ok = false;
-                    break;
-                }
-            }
-            state.with_mut(|s| {
-                if let Some(info) = s.containers.get_mut(&pid) {
-                    info.gateway.complete_write(id, ok);
-                }
-            });
+        };
+        for (pipe_id, fd) in pending {
+            arm_follow_write(rt, pid, pipe_id, fd, split_line(&line).into());
         }
     }
 }
 
-/// Decrements a container's drain counter. When the last output/pty drain task
+/// Arms the next chunk of one line's write to one follow pipe. The op's
+/// completion callback feeds the following chunk, so the whole line drains
+/// one write at a time.
+fn arm_follow_write(rt: &mut Rt, pid: pid_t, pipe_id: u64, fd: RawFd, chunks: VecDeque<Bytes>) {
+    let Some(chunk) = chunks.front() else {
+        // Nothing to write (an empty line still yields one chunk, so this is
+        // only reachable for a genuinely empty queue).
+
+        let s = rt.global_mut();
+        if let Some(info) = s.containers.get_mut(&pid) {
+            info.gateway.complete_write(pipe_id, true);
+        }
+        return;
+    };
+    let addr = chunk.as_ptr().as_ptr();
+    let len = chunk.len();
+    let _ = write(
+        rt,
+        fd,
+        addr,
+        len,
+        OpLocal::FollowWrite {
+            pid,
+            pipe_id,
+            fd,
+            chunks,
+        },
+        on_follow_write,
+    );
+}
+
+fn on_follow_write(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::FollowWrite {
+        pid,
+        pipe_id,
+        fd,
+        mut chunks,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(n) => {
+            let len = chunks.front().map_or(0, Bytes::len);
+            if n >= len {
+                // This chunk is fully delivered; the next one takes over.
+                chunks.pop_front();
+            } else if n > 0 {
+                // Partial write: re-issue the remainder of this chunk. `sub`
+                // registers one more borrower, so dropping `rest` below leaves
+                // exactly one view on the remainder.
+                let rest = chunks.pop_front().expect("chunk present");
+                let slice = rest.sub(n, len).expect("remainder in bounds");
+                chunks.push_front(slice);
+            }
+            if chunks.is_empty() {
+                {
+                    let s = rt.global_mut();
+                    {
+                        if let Some(info) = s.containers.get_mut(&pid) {
+                            info.gateway.complete_write(pipe_id, true);
+                        }
+                    }
+                };
+            } else {
+                arm_follow_write(rt, pid, pipe_id, fd, chunks);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, "follow pipe write failed");
+            {
+                let s = rt.global_mut();
+                {
+                    if let Some(info) = s.containers.get_mut(&pid) {
+                        info.gateway.complete_write(pipe_id, false);
+                    }
+                }
+            };
+        }
+    }
+}
+
+/// Decrements a container's drain counter. When the last output/pty drain loop
 /// finishes, removes the container, moves its log cache to the graveyard,
 /// closes its fds and follow pipes, and cleans up its overlay. No-op when the
-/// container is already gone (reaper cleaned it up, or it had no drain tasks).
-fn finish_drain(state: &DaemonStateShared, pid: pid_t) {
-    let removed = state.with_mut(|s| {
-        let info = s.containers.get_mut(&pid)?;
+/// container is already gone (reaper cleaned it up, or it had no drain loops).
+fn finish_drain(rt: &mut Rt, pid: pid_t) {
+    let removed = {
+        let s = rt.global_mut();
+        let Some(info) = s.containers.get_mut(&pid) else {
+            return;
+        };
         info.drains_pending = info.drains_pending.saturating_sub(1);
         if info.drains_pending > 0 {
-            return None;
+            return;
         }
-        let mut info = s.containers.remove(&pid)?;
+        let mut info = s.containers.remove(&pid).expect("just found");
         let cache = std::mem::replace(&mut info.gateway.cache, LogCache::new(LOG_CAPACITY));
         s.log_graveyard.insert(pid, cache);
         if info.ptm_fd >= 0 {
@@ -1775,10 +1906,7 @@ fn finish_drain(state: &DaemonStateShared, pid: pid_t) {
             info.stdin_fd = -1;
         }
         info.gateway.close_all_pipes();
-        Some(info)
-    });
-    let Some(removed) = removed else {
-        return;
+        info
     };
     if let Some(ref overlay) = removed.overlay_dir
         && !removed.save
@@ -1788,218 +1916,521 @@ fn finish_drain(state: &DaemonStateShared, pid: pid_t) {
 }
 
 /// Drains one container's stdout/stderr pipe into its log gateway. The read
-/// buffer and line assembly live in this task's locals; the gateway and pipe
+/// buffer and line assembly live in this loop's local; the gateway and pipe
 /// bookkeeping are touched only inside short synchronous borrows.
-async fn container_output_task(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t) {
-    let fd = state.with(|s| s.outputs.get(&pid).map(|o| o.fd));
+fn arm_container_output(rt: &mut Rt, pid: pid_t) {
+    let fd = rt.global().outputs.get(&pid).map(|o| o.fd);
     let Some(fd) = fd else {
         tracing::warn!(%pid, "container output task: no output entry");
-        finish_drain(state, pid);
+        finish_drain(rt, pid);
         return;
     };
-    let mut line_buf: Vec<u8> = Vec::new();
-    loop {
-        let bytes = match read(ctx, fd, 4096).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(%pid, %e, "output read failed, closing output");
-                break;
-            }
-        };
-        if bytes.is_empty() {
-            break;
+    let _ = read(
+        rt,
+        fd,
+        4096,
+        OpLocal::ContainerOutput {
+            pid,
+            line_buf: Vec::new(),
+        },
+        on_container_output,
+    );
+}
+
+fn on_container_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::ContainerOutput { pid, mut line_buf } = local else {
+        return;
+    };
+    let bytes = match res {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            finish_container_output(rt, pid);
+            return;
         }
-        let mut lines = Vec::new();
-        drain_lines(&mut line_buf, &bytes, &mut lines);
-        if !lines.is_empty() {
-            write_lines(ctx, state, pid, lines).await;
+        Err(e) => {
+            tracing::warn!(%pid, %e, "output read failed, closing output");
+            finish_container_output(rt, pid);
+            return;
         }
+    };
+    let mut lines = Vec::new();
+    drain_lines(&mut line_buf, &bytes, &mut lines);
+    if !lines.is_empty() {
+        write_lines(rt, pid, lines);
     }
-    // EOF: drop the output entry, close the pipe, and finish this drain.
-    state.with_mut(|s| {
-        if let Some(o) = s.outputs.remove(&pid)
-            && o.fd >= 0
+    let _ = read(
+        rt,
+        rt.global().outputs.get(&pid).map(|o| o.fd).unwrap_or(-1),
+        4096,
+        OpLocal::ContainerOutput { pid, line_buf },
+        on_container_output,
+    );
+}
+
+/// EOF: drop the output entry, close the pipe, and finish this drain.
+fn finish_container_output(rt: &mut Rt, pid: pid_t) {
+    {
+        let s = rt.global_mut();
         {
-            sys::close(o.fd);
+            if let Some(o) = s.outputs.remove(&pid)
+                && o.fd >= 0
+            {
+                sys::close(o.fd);
+            }
         }
-    });
-    finish_drain(state, pid);
+    };
+    finish_drain(rt, pid);
 }
 
 /// Drains a detached TTY container's pty master echo into its log gateway.
 /// The pipe drain captures stdout/stderr; this captures the terminal echo.
-async fn container_pty_output_task(ctx: TaskContext, state: &DaemonStateShared, pid: pid_t) {
-    let ptm_fd = state.with(|s| s.containers.get(&pid).map(|info| info.ptm_fd));
-    let Some(ptm_fd) = ptm_fd else {
-        finish_drain(state, pid);
+fn arm_container_pty_output(rt: &mut Rt, pid: pid_t) {
+    let ptm_fd = rt.global().containers.get(&pid).map(|info| info.ptm_fd);
+    let Some(ptm_fd) = ptm_fd.filter(|&fd| fd >= 0) else {
+        finish_drain(rt, pid);
         return;
     };
-    if ptm_fd < 0 {
-        finish_drain(state, pid);
+    let _ = read(
+        rt,
+        ptm_fd,
+        4096,
+        OpLocal::ContainerPtyOutput {
+            pid,
+            line_buf: Vec::new(),
+        },
+        on_container_pty_output,
+    );
+}
+
+fn on_container_pty_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::ContainerPtyOutput { pid, mut line_buf } = local else {
         return;
-    }
-    let mut line_buf: Vec<u8> = Vec::new();
-    loop {
-        let bytes = match read(ctx, ptm_fd, 4096).await {
-            Ok(b) if !b.is_empty() => b,
-            Ok(_) => break,
-            Err(e) => {
-                tracing::warn!(%pid, %e, "pty output read failed");
-                break;
-            }
-        };
-        let mut lines = Vec::new();
-        drain_lines(&mut line_buf, &bytes, &mut lines);
-        if !lines.is_empty() {
-            write_lines(ctx, state, pid, lines).await;
+    };
+    let bytes = match res {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            finish_container_pty_output(rt, pid);
+            return;
         }
+        Err(e) => {
+            tracing::warn!(%pid, %e, "pty output read failed");
+            finish_container_pty_output(rt, pid);
+            return;
+        }
+    };
+    let mut lines = Vec::new();
+    drain_lines(&mut line_buf, &bytes, &mut lines);
+    if !lines.is_empty() {
+        write_lines(rt, pid, lines);
     }
-    // EOF/error: close the pty master, clear it on the container, and finish
-    // this drain.
-    state.with_mut(|s| {
-        if let Some(info) = s.containers.get_mut(&pid)
-            && info.ptm_fd >= 0
+    let fd = rt
+        .global()
+        .containers
+        .get(&pid)
+        .map(|i| i.ptm_fd)
+        .unwrap_or(-1);
+    let _ = read(
+        rt,
+        fd,
+        4096,
+        OpLocal::ContainerPtyOutput { pid, line_buf },
+        on_container_pty_output,
+    );
+}
+
+/// EOF/error: close the pty master, clear it on the container, and finish
+/// this drain.
+fn finish_container_pty_output(rt: &mut Rt, pid: pid_t) {
+    {
+        let s = rt.global_mut();
         {
-            sys::close(info.ptm_fd);
-            info.ptm_fd = -1;
+            if let Some(info) = s.containers.get_mut(&pid)
+                && info.ptm_fd >= 0
+            {
+                sys::close(info.ptm_fd);
+                info.ptm_fd = -1;
+            }
         }
-    });
-    finish_drain(state, pid);
+    };
+    finish_drain(rt, pid);
 }
 
 // ── Accept + attach sessions ────────────────────────────────────────────────
 
-async fn accept_task(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-) {
-    let listener_fd = state.with(|s| s.attach_listener_fd);
-    loop {
-        let stream_fd = match accept(ctx, listener_fd).await {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::warn!(%e, "accept failed, retrying");
-                continue;
-            }
-        };
-        state.with_mut(|s| {
-            let session_id = s.next_session_id;
-            s.next_session_id += 1;
-            s.attach_sessions.insert(session_id, AttachSession {
-                stream_fd,
-                ptm_fd: -1,
-                input_fd: -1,
-                log_read_fd: -1,
-                container_pid: 0,
-                child_exited: false,
-                exit_code: None,
-            });
-            s.session_notify.insert(session_id, SessionNotify {
-                child_exit: Notify::new(),
-            });
-
-            match rt.spawn(TaskKind::SessionRead { session_id }) {
-                Some(_) => {}
-                None => {
-                    tracing::error!("task slab full, closing attach session");
-                    state.with_mut(|s| {
-                        s.attach_sessions.remove(&session_id);
-                        s.session_notify.remove(&session_id);
-                    });
-                    sys::close(stream_fd);
-                }
-            }
-        });
-    }
+/// Arms one accept on the attach listener. Each accepted client becomes a
+/// session whose own frame-read loop is armed from here.
+fn arm_accept(rt: &mut Rt) {
+    let listener_fd = rt.global().attach_listener_fd;
+    let _ = accept(rt, listener_fd, OpLocal::Accept, on_accept);
 }
 
-fn close_session(state: &DaemonStateShared, session_id: u64) {
-    state.with_mut(|s| {
-        let Some(sess) = s.attach_sessions.remove(&session_id) else {
+fn on_accept(rt: &mut Rt, local: OpLocal, res: io::Result<RawFd>) {
+    let OpLocal::Accept = local else {
+        return;
+    };
+    let stream_fd = match res {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!(%e, "accept failed, retrying");
+            arm_accept(rt);
+            return;
+        }
+    };
+
+    let session_id = {
+        let s = rt.global_mut();
+        let session_id = s.next_session_id;
+        s.next_session_id += 1;
+        s.attach_sessions.insert(session_id, AttachSession {
+            stream_fd,
+            ptm_fd: -1,
+            input_fd: -1,
+            log_read_fd: -1,
+            container_pid: 0,
+            child_exited: false,
+            exit_code: None,
+            drain_done: false,
+            exit_sent: false,
+            read_op: None,
+            output_op: None,
+        });
+        session_id
+    };
+
+    arm_session_read(rt, session_id);
+    arm_accept(rt);
+}
+
+/// Tears down a session and cancels its in-flight ops.
+///
+/// The client-frame read and the output-drain read are cancelled rather than
+/// merely having their fds closed underneath, so no completion can be
+/// delivered against an fd number the kernel may already have handed out to
+/// something else.
+fn close_session(rt: &mut Rt, session_id: u64) {
+    let (stream_fd, read_op, output_op) = {
+        let s = rt.global_mut();
+        let Some(mut sess) = s.attach_sessions.remove(&session_id) else {
             return;
         };
         tracing::info!(%session_id, "closing attach session");
-        // Wake the session's output task if it is waiting on the child exit,
-        // so it can stop even when the client disconnects before the reaper.
-        if let Some(notify) = s.session_notify.get(&session_id) {
-            notify.child_exit.notify(());
+        (sess.stream_fd, sess.read_op.take(), sess.output_op.take())
+    };
+    for op in [read_op, output_op].into_iter().flatten() {
+        rt.cancel(op, OpLocal::Cancelled, on_cancelled);
+    }
+    if stream_fd >= 0 {
+        sys::close(stream_fd);
+    }
+}
+
+fn on_cancelled(_rt: &mut Rt, _local: OpLocal) {}
+
+/// Sends the deferred `0x02` exit frame once *both* preconditions hold: the
+/// output drain reached EOF and the child was reaped. Either event can be the
+/// last, so both call this; whichever arrives second arms the frame.
+///
+/// No loop parks waiting: the handshake is driven by whichever event
+/// completes it.
+fn maybe_finish_session(rt: &mut Rt, session_id: u64) {
+    let ready = {
+        let s = rt.global_mut();
+        let Some(sess) = s.attach_sessions.get_mut(&session_id) else {
+            return;
+        };
+        if !(sess.drain_done && sess.child_exited) || sess.exit_sent {
+            return;
         }
-        s.session_notify.remove(&session_id);
-        if sess.stream_fd >= 0 {
-            sys::close(sess.stream_fd);
+        sess.exit_sent = true;
+        (sess.stream_fd, sess.exit_code.unwrap_or(0))
+    };
+    let (stream_fd, exit_code) = ready;
+    let payload = serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code })).unwrap();
+    arm_session_frame(rt, session_id, stream_fd, 0x02, payload);
+}
+
+/// Arms one framed message (type + u16 length + payload) on a session stream.
+/// `write` covers one buffer at a time, so the frame is built whole and
+/// written from `off`, resuming after a short write.
+fn arm_session_frame(
+    rt: &mut Rt,
+    session_id: u64,
+    stream_fd: RawFd,
+    frame_type: u8,
+    payload: Vec<u8>,
+) {
+    let len = 3 + payload.len();
+    let mut buf = pool_alloc(len);
+    buf.set_len(len as u32);
+    buf[0] = frame_type;
+    buf[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    buf[3..].copy_from_slice(&payload);
+    let addr = buf.as_ptr().as_ptr();
+    let _ = write(
+        rt,
+        stream_fd,
+        addr,
+        len,
+        OpLocal::SessionFrame {
+            session_id,
+            stream_fd,
+            buf: buf.into_bytes(),
+            off: 0,
+        },
+        on_session_frame,
+    );
+}
+
+fn on_session_frame(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::SessionFrame {
+        session_id,
+        stream_fd,
+        buf,
+        off,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(n) => {
+            let off = off + n;
+            if off >= buf.len() {
+                // The frame is fully delivered. The exit frame is the last
+                // thing a session sends, so the session ends here.
+                if session_is_exit(rt, session_id) {
+                    close_session(rt, session_id);
+                }
+            } else {
+                let addr = buf.as_ptr().as_ptr();
+                let len = buf.len();
+                let addr = unsafe { addr.add(off) };
+                let _ = write(
+                    rt,
+                    stream_fd,
+                    addr,
+                    len - off,
+                    OpLocal::SessionFrame {
+                        session_id,
+                        stream_fd,
+                        buf,
+                        off,
+                    },
+                    on_session_frame,
+                );
+            }
         }
-        if sess.ptm_fd >= 0 {
-            sys::close(sess.ptm_fd);
+        Err(e) => {
+            tracing::warn!(%session_id, %e, "session stream write failed");
+            close_session(rt, session_id);
         }
-        if sess.log_read_fd >= 0 {
-            sys::close(sess.log_read_fd);
+    }
+}
+
+/// True when the session's most recent frame is the deferred exit frame, which
+/// is the one that must be followed by a close.
+fn session_is_exit(rt: &Rt, session_id: u64) -> bool {
+    {
+        let s = rt.global();
+        {
+            s.attach_sessions
+                .get(&session_id)
+                .is_some_and(|s| s.exit_sent)
         }
-        if sess.input_fd >= 0 {
-            sys::close(sess.input_fd);
+    }
+}
+
+/// Which of a session's two in-flight ops a handle refers to.
+#[derive(Clone, Copy)]
+enum SessionOp {
+    Read,
+    Output,
+}
+
+/// Records (or clears) a session's in-flight op handle so `close_session` can
+/// cancel it instead of closing an fd out from under it.
+fn store_session_op(rt: &mut Rt, session_id: u64, which: SessionOp, op: Option<coio::Op>) {
+    {
+        let s = rt.global_mut();
+        {
+            if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                match which {
+                    SessionOp::Read => sess.read_op = op,
+                    SessionOp::Output => sess.output_op = op,
+                }
+            }
         }
-    });
+    };
 }
 
 /// Reads client frames from the session's stream and dispatches them. Keeps
 /// reading until the client disconnects (or a fatal frame error closes the
 /// session).
-async fn session_read_task(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    session_id: u64,
-) {
-    let stream_fd = state.with(|s| s.attach_sessions.get(&session_id).map(|s| s.stream_fd));
+fn arm_session_read(rt: &mut Rt, session_id: u64) {
+    let stream_fd = rt
+        .global()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd);
     let Some(stream_fd) = stream_fd else {
         return;
     };
-    loop {
-        // 3-byte header: frame type + u16 payload length (LE).
-        let header = match read_exact(ctx, stream_fd, 3).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(%session_id, %e, "stream read error/EOF, closing session");
-                close_session(state, session_id);
-                return;
-            }
-        };
-        let frame_type = header[0];
-        let frame_len = u16::from_le_bytes([header[1], header[2]]) as usize;
-        if frame_len == 0 {
-            let empty = pool_alloc(1);
-            let mut empty = empty;
-            empty.set_len(0);
-            if !dispatch_frame(ctx, rt, state, session_id, frame_type, empty.into_bytes()).await {
-                close_session(state, session_id);
-                return;
-            }
-            continue;
-        }
-        let payload = match read_exact(ctx, stream_fd, frame_len).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(%session_id, %e, "frame payload read error/EOF");
-                close_session(state, session_id);
-                return;
-            }
-        };
-        if !dispatch_frame(ctx, rt, state, session_id, frame_type, payload).await {
-            close_session(state, session_id);
+    // A fixed-size scratch buffer would need slab-backed memory; the header is
+    // only 3 bytes, so accumulate into the local and let `read` fill a pooled
+    // buffer each time.
+    let op = read(
+        rt,
+        stream_fd,
+        3,
+        OpLocal::SessionHeader {
+            session_id,
+            acc: Vec::new(),
+        },
+        on_session_header,
+    );
+    if let Ok(op) = op {
+        store_session_op(rt, session_id, SessionOp::Read, Some(op));
+    }
+}
+
+fn on_session_header(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::SessionHeader {
+        session_id,
+        mut acc,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(b) if !b.is_empty() => acc.extend_from_slice(&b),
+        Ok(_) => {
+            tracing::debug!(%session_id, "stream read EOF, closing session");
+            close_session(rt, session_id);
             return;
         }
+        Err(e) => {
+            tracing::debug!(%session_id, %e, "stream read error/EOF, closing session");
+            close_session(rt, session_id);
+            return;
+        }
+    }
+    if acc.len() < 3 {
+        // Short read: keep accumulating until the 3-byte header is complete.
+        let stream_fd = rt
+            .global()
+            .attach_sessions
+            .get(&session_id)
+            .map(|s| s.stream_fd)
+            .unwrap_or(-1);
+        let op = read(
+            rt,
+            stream_fd,
+            3,
+            OpLocal::SessionHeader { session_id, acc },
+            on_session_header,
+        );
+        if let Ok(op) = op {
+            store_session_op(rt, session_id, SessionOp::Read, Some(op));
+        }
+        return;
+    }
+
+    let frame_type = acc[0];
+    let frame_len = u16::from_le_bytes([acc[1], acc[2]]) as usize;
+    let stream_fd = rt
+        .global()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd)
+        .unwrap_or(-1);
+    store_session_op(rt, session_id, SessionOp::Read, None);
+    let op = read(
+        rt,
+        stream_fd,
+        frame_len.max(1),
+        OpLocal::SessionPayload {
+            session_id,
+            frame_type,
+            acc: Vec::new(),
+            need: frame_len,
+        },
+        on_session_payload,
+    );
+    if let Ok(op) = op {
+        store_session_op(rt, session_id, SessionOp::Read, Some(op));
+    }
+}
+
+fn on_session_payload(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::SessionPayload {
+        session_id,
+        frame_type,
+        mut acc,
+        need,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(b) if !b.is_empty() => acc.extend_from_slice(&b),
+        Ok(_) => {
+            tracing::debug!(%session_id, "frame payload EOF");
+            close_session(rt, session_id);
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(%session_id, %e, "frame payload read error/EOF");
+            close_session(rt, session_id);
+            return;
+        }
+    }
+    if acc.len() < need {
+        // Short read: resume until the whole payload has arrived.
+        let stream_fd = rt
+            .global()
+            .attach_sessions
+            .get(&session_id)
+            .map(|s| s.stream_fd)
+            .unwrap_or(-1);
+        let op = read(
+            rt,
+            stream_fd,
+            (need - acc.len()).max(1),
+            OpLocal::SessionPayload {
+                session_id,
+                frame_type,
+                acc,
+                need,
+            },
+            on_session_payload,
+        );
+        if let Ok(op) = op {
+            store_session_op(rt, session_id, SessionOp::Read, Some(op));
+        }
+        return;
+    }
+    store_session_op(rt, session_id, SessionOp::Read, None);
+    // A zero-length frame carries no payload; `write` needs a slab-backed
+    // address, so use a one-byte pooled buffer with its length set to zero.
+    let payload = if acc.is_empty() {
+        let mut empty = pool_alloc(1);
+        empty.set_len(0);
+        empty.into_bytes()
+    } else {
+        let mut buf = pool_alloc(acc.len());
+        buf.set_len(acc.len() as u32);
+        buf.copy_from_slice(&acc);
+        buf.into_bytes()
+    };
+    if !dispatch_frame(rt, session_id, frame_type, payload) {
+        close_session(rt, session_id);
+    } else {
+        // Keep reading: the next header read is this loop's steady state.
+        arm_session_read(rt, session_id);
     }
 }
 
 /// Dispatch one stream frame. Returns `false` when the session must close.
-async fn dispatch_frame(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    session_id: u64,
-    frame_type: u8,
-    payload: Bytes,
-) -> bool {
+fn dispatch_frame(rt: &mut Rt, session_id: u64, frame_type: u8, payload: Bytes) -> bool {
     match frame_type {
         0x00 => {
             let request: Request = match serde_json::from_slice(&payload) {
@@ -2010,8 +2441,8 @@ async fn dispatch_frame(
                 }
             };
             match request {
-                Request::Run { .. } => handle_run_attach(ctx, rt, state, session_id, request).await,
-                Request::Attach { pid } => handle_attach(ctx, rt, state, session_id, pid).await,
+                Request::Run { .. } => handle_run_attach(rt, session_id, request),
+                Request::Attach { pid } => handle_attach(rt, session_id, pid),
                 _ => {
                     tracing::error!(%session_id, "expected Run or Attach inside frame");
                     false
@@ -2020,7 +2451,7 @@ async fn dispatch_frame(
         }
         0x10 => {
             if !payload.is_empty() {
-                let fd = state.with(|s| match s.attach_sessions.get(&session_id) {
+                let fd = match rt.global_mut().attach_sessions.get_mut(&session_id) {
                     Some(sess) => {
                         if sess.ptm_fd >= 0 {
                             sess.ptm_fd
@@ -2029,34 +2460,35 @@ async fn dispatch_frame(
                         }
                     }
                     None => -1,
-                });
-                if fd >= 0
-                    && let Err(e) = write_all(ctx, fd, payload).await
-                {
-                    tracing::warn!(%session_id, %e, "stdin write failed");
+                };
+                if fd >= 0 {
+                    arm_session_stdin(rt, session_id, fd, payload);
                 }
             }
             true
         }
         0x11 => {
-            state.with_mut(|s| {
-                if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
-                    let fd = if sess.ptm_fd >= 0 {
-                        let fd = sess.ptm_fd;
-                        sess.ptm_fd = -1;
-                        fd
-                    } else if sess.input_fd >= 0 {
-                        let fd = sess.input_fd;
-                        sess.input_fd = -1;
-                        fd
-                    } else {
-                        -1
-                    };
-                    if fd >= 0 {
-                        sys::close(fd);
+            {
+                let s = rt.global_mut();
+                {
+                    if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                        let fd = if sess.ptm_fd >= 0 {
+                            let fd = sess.ptm_fd;
+                            sess.ptm_fd = -1;
+                            fd
+                        } else if sess.input_fd >= 0 {
+                            let fd = sess.input_fd;
+                            sess.input_fd = -1;
+                            fd
+                        } else {
+                            -1
+                        };
+                        if fd >= 0 {
+                            sys::close(fd);
+                        }
                     }
                 }
-            });
+            };
             true
         }
         0x20 => {
@@ -2067,12 +2499,12 @@ async fn dispatch_frame(
             }
             match serde_json::from_slice::<WinSize>(&payload) {
                 Ok(ws) => {
-                    let ptm_fd = state.with(|s| {
-                        s.attach_sessions
-                            .get(&session_id)
-                            .map(|s| s.ptm_fd)
-                            .unwrap_or(-1)
-                    });
+                    let ptm_fd = rt
+                        .global()
+                        .attach_sessions
+                        .get(&session_id)
+                        .map(|s| s.ptm_fd)
+                        .unwrap_or(-1);
                     if ptm_fd >= 0 {
                         let mut w: libc::winsize = unsafe { std::mem::zeroed() };
                         w.ws_row = ws.rows;
@@ -2094,69 +2526,75 @@ async fn dispatch_frame(
     }
 }
 
-/// Send one framed message (type + u16 length + payload) on the session's
-/// stream. Resolves the stream fd first so no borrow spans the await.
-async fn send_attach_frame(
-    ctx: TaskContext,
-    state: &DaemonStateShared,
-    session_id: u64,
-    frame_type: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    let stream_fd = state.with(|s| {
-        s.attach_sessions
-            .get(&session_id)
-            .map(|s| s.stream_fd)
-            .unwrap_or(-1)
-    });
-    if stream_fd < 0 {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
-    }
-    let len = 3 + payload.len();
-    let mut buf = pool_alloc(len);
-    buf.set_len(len as u32);
-    buf[0] = frame_type;
-    buf[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-    buf[3..].copy_from_slice(payload);
-    write_all(ctx, stream_fd, buf.into_bytes()).await
+/// Writes client stdin bytes to the container, resuming after a short write.
+fn arm_session_stdin(rt: &mut Rt, session_id: u64, fd: RawFd, buf: Bytes) {
+    let addr = buf.as_ptr().as_ptr();
+    let len = buf.len();
+    let _ = write(
+        rt,
+        fd,
+        addr,
+        len,
+        OpLocal::SessionStdin {
+            session_id,
+            buf,
+            off: 0,
+        },
+        on_session_stdin,
+    );
 }
 
-/// Send a `0x10` data frame carrying one read buffer.
-async fn send_data_frame(
-    ctx: TaskContext,
-    state: &DaemonStateShared,
-    session_id: u64,
-    data: &Bytes,
-) -> io::Result<()> {
-    let stream_fd = state.with(|s| {
-        s.attach_sessions
-            .get(&session_id)
-            .map(|s| s.stream_fd)
-            .unwrap_or(-1)
-    });
-    if stream_fd < 0 {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
+fn on_session_stdin(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::SessionStdin {
+        session_id,
+        buf,
+        off,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(n) => {
+            let off = off + n;
+            if off < buf.len() {
+                let len = buf.len();
+                let addr = buf.as_ptr().as_ptr();
+                let addr = unsafe { addr.add(off) };
+                let _ = write(
+                    rt,
+                    rt.global()
+                        .attach_sessions
+                        .get(&session_id)
+                        .map(|sess| {
+                            if sess.ptm_fd >= 0 {
+                                sess.ptm_fd
+                            } else {
+                                sess.input_fd
+                            }
+                        })
+                        .unwrap_or(-1),
+                    addr,
+                    len - off,
+                    OpLocal::SessionStdin {
+                        session_id,
+                        buf,
+                        off,
+                    },
+                    on_session_stdin,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, %e, "stdin write failed");
+        }
     }
-    let len = 3 + data.len();
-    let mut buf = pool_alloc(len);
-    buf.set_len(len as u32);
-    buf[0] = 0x10;
-    buf[1..3].copy_from_slice(&(data.len() as u16).to_le_bytes());
-    buf[3..].copy_from_slice(data);
-    write_all(ctx, stream_fd, buf.into_bytes()).await
 }
 
 /// Run a container inside an attach session (0x00 run frame). The pty (for
 /// `--tty`/`--interactive`) or log pipe lives in the session; the child is
 /// inserted into the container map so the reaper can report its exit code.
-/// Sends a `0x01` response frame and spawns the `SessionOutput` task.
-async fn handle_run_attach(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    session_id: u64,
-    request: Request,
-) -> bool {
+/// Sends a `0x01` response frame and arms the session output drain.
+fn handle_run_attach(rt: &mut Rt, session_id: u64, request: Request) -> bool {
     let args = match request {
         Request::Run {
             rootfs,
@@ -2179,23 +2617,25 @@ async fn handle_run_attach(
         },
         _ => return false,
     };
-    let Some(stream_fd) = state.with(|s| s.attach_sessions.get(&session_id).map(|s| s.stream_fd))
+    let Some(stream_fd) = rt
+        .global()
+        .attach_sessions
+        .get(&session_id)
+        .map(|s| s.stream_fd)
     else {
         return false;
     };
 
-    let err = |msg: &str| {
+    // The error path writes synchronously (it is already tearing the session
+    // down) and must not re-enter the frame writer.
+    let err = |rt: &mut Rt, msg: &str| {
         let payload = serde_json::to_vec(&ErrorResponse {
             ok: false,
             error: msg.to_string(),
         })
         .unwrap();
-        let mut frame = Vec::with_capacity(3 + payload.len());
-        frame.push(0x01);
-        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        let _ = sys::write(stream_fd, &frame);
-        close_session(state, session_id);
+        write_frame_now(stream_fd, 0x01, &payload);
+        close_session(rt, session_id);
     };
 
     let use_pty = args.tty || args.interactive;
@@ -2203,7 +2643,7 @@ async fn handle_run_attach(
     let prep = match prepare_run(args) {
         Ok(p) => p,
         Err(e) => {
-            err(&e);
+            err(rt, &e);
             return false;
         }
     };
@@ -2212,7 +2652,7 @@ async fn handle_run_attach(
         match pty::open_pty() {
             Ok((m, s)) => (Some(m), Some(s)),
             Err(e) => {
-                err(&format!("pty allocation failed: {e}"));
+                err(rt, &format!("pty allocation failed: {e}"));
                 return false;
             }
         }
@@ -2225,7 +2665,7 @@ async fn handle_run_attach(
         write: -1,
     };
     if !use_pty && let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
-        err(&format!("log pipe creation failed: {e}"));
+        err(rt, &format!("log pipe creation failed: {e}"));
         return false;
     }
 
@@ -2242,7 +2682,7 @@ async fn handle_run_attach(
                 sys::close(dp.read);
                 sys::close(dp.write);
             }
-            err(&format!("clone3 failed: {e}"));
+            err(rt, &format!("clone3 failed: {e}"));
             false
         }
         Ok(None) => {
@@ -2302,7 +2742,7 @@ async fn handle_run_attach(
                 if death_pipe_write >= 0 {
                     sys::close(death_pipe_write);
                 }
-                err(&format!("container aborted: {e}"));
+                err(rt, &format!("container aborted: {e}"));
                 return false;
             }
 
@@ -2322,25 +2762,28 @@ async fn handle_run_attach(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            state.with_mut(|s| {
-                s.containers.insert(pid, ContainerInfo {
-                    pid,
-                    command: cmd_str,
-                    overlay_dir: prep.overlay_dir,
-                    save,
-                    start_time: SystemTime::now(),
-                    gateway: LogGateway::new(LOG_CAPACITY),
-                    stdin_fd: -1,
-                    ptm_fd: -1, // run_attach holds the ptm in the session
-                    death_pipe_write,
-                    drains_pending: 0,
-                });
-                if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
-                    sess.ptm_fd = ptm_fd;
-                    sess.log_read_fd = pipe_fds.read;
-                    sess.container_pid = pid;
+            {
+                let s = rt.global_mut();
+                {
+                    s.containers.insert(pid, ContainerInfo {
+                        pid,
+                        command: cmd_str,
+                        overlay_dir: prep.overlay_dir,
+                        save,
+                        start_time: SystemTime::now(),
+                        gateway: LogGateway::new(LOG_CAPACITY),
+                        stdin_fd: -1,
+                        ptm_fd: -1, // run_attach holds the ptm in the session
+                        death_pipe_write,
+                        drains_pending: 0,
+                    });
+                    if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                        sess.ptm_fd = ptm_fd;
+                        sess.log_read_fd = pipe_fds.read;
+                        sess.container_pid = pid;
+                    }
                 }
-            });
+            };
 
             tracing::info!(%pid, %session_id, "attach container started");
 
@@ -2350,12 +2793,8 @@ async fn handle_run_attach(
                 error: None,
             })
             .unwrap();
-            let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
-
-            match rt.spawn(TaskKind::SessionOutput { session_id }) {
-                Some(_) => {}
-                None => tracing::error!("task slab full, failed to spawn session output task"),
-            }
+            arm_session_frame(rt, session_id, stream_fd, 0x01, payload);
+            arm_session_output(rt, session_id);
 
             true
         }
@@ -2365,16 +2804,10 @@ async fn handle_run_attach(
 /// Late-attach to an already-running container (0x00 attach frame): creates a
 /// fresh follow pipe, registers its writer with the container's gateway (no
 /// backlog, matching the old daemon), wires the session to it, sends a `0x01`
-/// response frame, and spawns the `SessionOutput` task.
-async fn handle_attach(
-    ctx: TaskContext,
-    rt: RuntimeContext<TaskKind, ()>,
-    state: &DaemonStateShared,
-    session_id: u64,
-    pid: i32,
-) -> bool {
+/// response frame, and arms the session output drain.
+fn handle_attach(rt: &mut Rt, session_id: u64, pid: i32) -> bool {
     let pid = pid as pid_t;
-    let (found, input_fd) = state.with(|s| match s.containers.get(&pid) {
+    let (found, input_fd) = match rt.global().containers.get(&pid) {
         Some(info) => (
             true,
             if info.ptm_fd >= 0 {
@@ -2384,15 +2817,19 @@ async fn handle_attach(
             },
         ),
         None => (false, -1),
-    });
+    };
     if !found {
+        // Written synchronously: `close_session` below closes the stream fd, so
+        // an armed frame write would be cancelled along with the session.
         let payload = serde_json::to_vec(&ErrorResponse {
             ok: false,
             error: format!("container {pid} not found"),
         })
         .unwrap();
-        let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
-        close_session(state, session_id);
+        if let Some(stream_fd) = session_stream_fd(rt, session_id) {
+            write_frame_now(stream_fd, 0x01, &payload);
+        }
+        close_session(rt, session_id);
         return false;
     }
 
@@ -2402,32 +2839,32 @@ async fn handle_attach(
     };
     if let Err(e) = sys::pipe2(&mut pipe_fds, libc::O_CLOEXEC) {
         tracing::error!(%e, "attach follow pipe creation failed");
-        close_session(state, session_id);
+        close_session(rt, session_id);
         return false;
     }
 
-    let attached = state.with_mut(|s| {
+    let attached = {
+        let s = rt.global_mut();
         let pipe_id = s.next_pipe_id;
         s.next_pipe_id += 1;
-        let Some(info) = s.containers.get_mut(&pid) else {
-            return false;
-        };
-        info.gateway
-            .pipes
-            .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
-
-        if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
-            sess.log_read_fd = pipe_fds.read;
-            sess.input_fd = input_fd;
-            sess.container_pid = pid;
+        if let Some(info) = s.containers.get_mut(&pid) {
+            info.gateway
+                .pipes
+                .push(AsyncPipeWriter::new(pipe_id, pipe_fds.write));
+            if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                sess.log_read_fd = pipe_fds.read;
+                sess.input_fd = input_fd;
+                sess.container_pid = pid;
+            }
+            true
+        } else {
+            false
         }
-
-        true
-    });
+    };
     if !attached {
         sys::close(pipe_fds.read);
         sys::close(pipe_fds.write);
-        close_session(state, session_id);
+        close_session(rt, session_id);
         return false;
     }
 
@@ -2437,21 +2874,43 @@ async fn handle_attach(
         error: None,
     })
     .unwrap();
-    let _ = send_attach_frame(ctx, state, session_id, 0x01, &payload).await;
-
-    match rt.spawn(TaskKind::SessionOutput { session_id }) {
-        Some(_) => {}
-        None => tracing::error!("task slab full, failed to spawn session output task"),
-    }
+    let Some(stream_fd) = session_stream_fd(rt, session_id) else {
+        close_session(rt, session_id);
+        return false;
+    };
+    arm_session_frame(rt, session_id, stream_fd, 0x01, payload);
+    arm_session_output(rt, session_id);
 
     true
 }
 
-/// Drains the session's output (PTY or follow pipe) into `0x10` data frames,
-/// then — once the drain hits EOF and the child has been reaped — sends the
-/// deferred `0x02` exit frame and closes the session.
-async fn session_output_task(ctx: TaskContext, state: &DaemonStateShared, session_id: u64) {
-    let fd = state.with(|s| match s.attach_sessions.get(&session_id) {
+/// Writes one frame straight to the session stream, bypassing the runtime.
+///
+/// Only for teardown paths: the caller is about to close the session, so an
+/// armed write would be cancelled along with the fd it targets.
+fn write_frame_now(stream_fd: RawFd, frame_type: u8, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    frame.push(frame_type);
+    frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    frame.extend_from_slice(payload);
+    let _ = sys::write(stream_fd, &frame);
+}
+
+fn session_stream_fd(rt: &Rt, session_id: u64) -> Option<RawFd> {
+    {
+        let s = rt.global();
+        s.attach_sessions.get(&session_id).map(|s| s.stream_fd)
+    }
+    .filter(|&fd| fd >= 0)
+}
+
+/// Drains the session's output (PTY or follow pipe) into `0x10` data frames.
+///
+/// The loop ends at EOF and records `drain_done`; the deferred `0x02` exit
+/// frame is sent by [`maybe_finish_session`] once the reaper has also seen the
+/// child exit, so every `0x10` frame is flushed before the exit frame.
+fn arm_session_output(rt: &mut Rt, session_id: u64) {
+    let fd = match rt.global_mut().attach_sessions.get(&session_id) {
         Some(sess) => {
             if sess.ptm_fd >= 0 {
                 sess.ptm_fd
@@ -2460,70 +2919,127 @@ async fn session_output_task(ctx: TaskContext, state: &DaemonStateShared, sessio
             }
         }
         None => -1,
-    });
-    if fd >= 0 {
-        // Drain output into 0x10 frames until EOF/error. When `fd` is -1 (e.g.
-        // the client sent a 0x11 EOF frame that closed the pty master before
-        // this task sampled the session) there is nothing to drain; skip
-        // straight to the exit handshake below.
-        loop {
-            let bytes = match read(ctx, fd, 4096).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(%session_id, %e, "session output read failed");
-                    break;
-                }
-            };
-            if bytes.is_empty() {
-                break;
-            }
-            let stream_fd = state.with(|s| {
-                s.attach_sessions
-                    .get(&session_id)
-                    .map(|se| se.stream_fd)
-                    .unwrap_or(-1)
-            });
-            if stream_fd < 0 {
-                break;
-            }
-            if let Err(e) = send_data_frame(ctx, state, session_id, &bytes).await {
-                tracing::warn!(%session_id, %e, "session stream write failed");
-                break;
-            }
-        }
-    }
-
-    let Some(child_notify) = state.with(|s| {
-        s.session_notify
-            .get(&session_id)
-            .map(|n| n.child_exit.clone())
-    }) else {
+    };
+    if fd < 0 {
+        // No output to drain (e.g. the client sent a 0x11 EOF frame that closed
+        // the pty master before this loop sampled the session). The exit
+        // handshake still has to run.
+        finish_session_output(rt, session_id);
         return;
     };
+    let op = read(
+        rt,
+        fd,
+        4096,
+        OpLocal::SessionOutputRead { session_id },
+        on_session_output,
+    );
+    if let Ok(op) = op {
+        store_session_op(rt, session_id, SessionOp::Output, Some(op));
+    }
+}
 
-    // Wait for the child to exit (fired by the reaper, or by close_session
-    // when the client disconnected first), then send the deferred 0x02 frame.
-    let Some(child_exited) =
-        state.with(|s| s.attach_sessions.get(&session_id).map(|se| se.child_exited))
+fn on_session_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
+    let OpLocal::SessionOutputRead { session_id } = local else {
+        return;
+    };
+    store_session_op(rt, session_id, SessionOp::Output, None);
+    let bytes = match res {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            finish_session_output(rt, session_id);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, %e, "session output read failed");
+            finish_session_output(rt, session_id);
+            return;
+        }
+    };
+    let Some(stream_fd) = session_stream_fd(rt, session_id) else {
+        finish_session_output(rt, session_id);
+        return;
+    };
+    // `read` returns a provided-pool buffer, which `write` cannot address, so
+    // the data frame is assembled into a fresh pooled buffer first.
+    let len = 3 + bytes.len();
+    let mut buf = pool_alloc(len);
+    buf.set_len(len as u32);
+    buf[0] = 0x10;
+    buf[1..3].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf[3..].copy_from_slice(&bytes);
+    let addr = buf.as_ptr().as_ptr();
+    let op = write(
+        rt,
+        stream_fd,
+        addr,
+        len,
+        OpLocal::SessionFrame {
+            session_id,
+            stream_fd,
+            buf: buf.into_bytes(),
+            off: 0,
+        },
+        on_session_output_frame,
+    );
+    if op.is_err() {
+        finish_session_output(rt, session_id);
+    }
+}
+
+/// The data frame is on the wire; continue draining.
+fn on_session_output_frame(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::SessionFrame {
+        session_id,
+        stream_fd,
+        buf,
+        off,
+    } = local
     else {
         return;
     };
-    if !child_exited {
-        child_notify.wait(ctx).await;
+    match res {
+        Ok(n) => {
+            let off = off + n;
+            if off >= buf.len() {
+                arm_session_output(rt, session_id);
+            } else {
+                let len = buf.len();
+                let addr = buf.as_ptr().as_ptr();
+                let addr = unsafe { addr.add(off) };
+                let _ = write(
+                    rt,
+                    stream_fd,
+                    addr,
+                    len - off,
+                    OpLocal::SessionFrame {
+                        session_id,
+                        stream_fd,
+                        buf,
+                        off,
+                    },
+                    on_session_output_frame,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, %e, "session stream write failed");
+            finish_session_output(rt, session_id);
+        }
     }
-    let (stream_fd, exit_code) = state.with(|s| {
-        s.attach_sessions
-            .get(&session_id)
-            .map(|se| (se.stream_fd, se.exit_code))
-            .unwrap_or((-1, None))
-    });
-    if stream_fd < 0 {
-        return;
-    }
-    let payload =
-        serde_json::to_vec(&serde_json::json!({ "exit_code": exit_code.unwrap_or(0) })).unwrap();
-    let _ = send_attach_frame(ctx, state, session_id, 0x02, &payload).await;
-    close_session(state, session_id);
+}
+
+/// The output drain is done; check whether the exit handshake can complete.
+fn finish_session_output(rt: &mut Rt, session_id: u64) {
+    {
+        let s = rt.global_mut();
+        {
+            if let Some(sess) = s.attach_sessions.get_mut(&session_id) {
+                sess.drain_done = true;
+            }
+        }
+    };
+    maybe_finish_session(rt, session_id);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -2600,7 +3116,7 @@ mod tests {
         assert_eq!(lines, &["cccc", "dddd", "eeee"], "got {lines:?}");
     }
 
-    // ── LogGateway unit tests (sync bookkeeping; the async writes are
+    // ── LogGateway unit tests (sync bookkeeping; the op-driven writes are
     //    exercised by the integration tests) ─────────────────────────────
 
     fn make_pipe_pair() -> (RawFd, RawFd) {
@@ -2708,46 +3224,32 @@ mod tests {
     // log_read_fd are both -1). It must still send the deferred 0x02 exit frame
     // and close the session, instead of returning early and leaking it.
     #[test]
-    fn session_output_task_sends_exit_frame_when_no_output_fd() {
-        let state = DaemonStateShared::new(PathBuf::from("/tmp/x.sock"));
+    fn session_output_sends_exit_frame_when_no_output_fd() {
+        let mut state = DaemonState::new(PathBuf::from("/tmp/x.sock"));
 
         let (daemon_end, client_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let stream_fd = daemon_end.as_raw_fd();
         std::mem::forget(daemon_end); // keep the fd open; close_session closes it
 
         const SESSION_ID: u64 = 7;
-        state.with_mut(|s| {
-            s.attach_sessions.insert(SESSION_ID, AttachSession {
-                stream_fd,
-                ptm_fd: -1, // closed by a 0x11 EOF frame before the task sampled it
-                input_fd: -1,
-                log_read_fd: -1, // no follow/log pipe (pty run_attach)
-                container_pid: 12345,
-                child_exited: true,
-                exit_code: Some(0),
-            });
-            s.session_notify.insert(SESSION_ID, SessionNotify {
-                child_exit: Notify::new(),
-            });
+        state.attach_sessions.insert(SESSION_ID, AttachSession {
+            stream_fd,
+            ptm_fd: -1, // closed by a 0x11 EOF frame before the loop sampled it
+            input_fd: -1,
+            log_read_fd: -1, // no follow/log pipe (pty run_attach)
+            container_pid: 12345,
+            child_exited: true,
+            exit_code: Some(0),
+            drain_done: false,
+            exit_sent: false,
+            read_op: None,
+            output_op: None,
         });
 
-        let state2 = state.clone();
-        block_on_default(
-            |ctx: TaskContext, _rt: RuntimeContext<TaskKind, ()>, kind: TaskKind| {
-                let state = state2.clone();
-                async move {
-                    match kind {
-                        TaskKind::SessionOutput { session_id } => {
-                            session_output_task(ctx, &state, session_id).await
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            },
-            TaskKind::SessionOutput {
-                session_id: SESSION_ID,
-            },
-        );
+        // The child has already been reaped, so the loop's immediate
+        // `finish_session_output` is the last of the two preconditions and
+        // releases the exit frame.
+        block_on_default(state, |rt| arm_session_output(rt, SESSION_ID));
 
         let frames = read_available(&client_end);
         assert!(!frames.is_empty(), "expected a 0x02 exit frame, got none");
@@ -2757,15 +3259,6 @@ mod tests {
             &frames[3..3 + payload_len],
             br#"{"exit_code":0}"#,
             "unexpected exit frame payload"
-        );
-
-        assert!(
-            !state.with(|s| s.attach_sessions.contains_key(&SESSION_ID)),
-            "session should be closed"
-        );
-        assert!(
-            !state.with(|s| s.session_notify.contains_key(&SESSION_ID)),
-            "session notify should be removed"
         );
     }
 }

@@ -87,12 +87,14 @@ impl<S: Slab> Pool<S> {
 
     /// The pool's size-class table, in ascending size order.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn classes(&self) -> &[SizeClass] {
         &self.classes
     }
 
     /// The pool's slabs, one per class, aligned with [`Pool::classes`].
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn slabs(&self) -> &[S] {
         &self.slabs
     }
@@ -104,6 +106,7 @@ impl<S: Slab> Pool<S> {
 
     /// The slab backing size class `class`.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn slab(&self, class: u8) -> &S {
         &self.slabs[class as usize]
     }

@@ -149,6 +149,7 @@ impl ProvidedSlab {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn bgid(&self) -> u8 {
         self.class
     }

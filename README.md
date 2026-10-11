@@ -59,7 +59,7 @@ container process ──write()──► PTY slave
 - `clap` — CLI argument parsing
 - `anyhow` + `thiserror` — error propagation
 - `tracing` + `tracing-subscriber` — structured logging
-- `coio` — single-threaded `io_uring`-based async runtime that powers the daemon event loop
+- `coio` — single-threaded `io_uring` callback runtime that powers the daemon event loop. Callbacks are plain `fn` pointers taking a shared global state `G` plus a per-op local `L`; there are no futures, tasks, or executor. Each long-lived loop is a callback that re-arms its own next op on completion.
 
 ## Usage
 

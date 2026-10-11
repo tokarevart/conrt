@@ -1,10 +1,7 @@
 use core::cell::Cell;
-use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
-use core::pin::Pin;
-use core::task::Context;
-use core::task::Poll;
-use core::task::Waker;
+use core::num::NonZeroU64;
 use std::alloc::Layout;
 use std::alloc::alloc;
 use std::alloc::dealloc;
@@ -23,20 +20,16 @@ use crate::classes::bid_class;
 use crate::classes::bid_local;
 use crate::classes::bid_provided;
 use crate::classes::layout_classes;
-use crate::task::IoSlot;
-use crate::task::IoUserData;
-use crate::task::IoVec;
-use crate::task::JoinHandle;
-use crate::task::NO_JOINER;
-use crate::task::Task;
-use crate::task::TaskContext;
-use crate::task::TaskSlab;
 
 thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_GEN: Cell<NonZeroU32> = const { Cell::new(NonZeroU32::new(1).unwrap()) };
-    static CURRENT_RUNTIME: Cell<*mut Runtime> = const { Cell::new(core::ptr::null_mut()) };
-    static CURRENT_TASK_INDEX: Cell<Option<u32>> = const { Cell::new(None) };
+    static CURRENT_POOLS: Cell<*mut Pools> = const { Cell::new(core::ptr::null_mut()) };
+    /// Per-thread, never-reset counter of dispatched op ids. A handle stamped
+    /// with an id from this counter can only ever name one op across the whole
+    /// lifetime of the thread — including across runtime restarts — so a stale
+    /// `Op` can never alias a later op's slot. Mirrors `NEXT_TASK_ID`.
+    static NEXT_OP_ID: Cell<NonZeroU64> = const { Cell::new(NonZeroU64::new(1).unwrap()) };
 }
 
 pub(crate) fn is_running() -> bool {
@@ -54,26 +47,23 @@ pub(crate) fn active_gen() -> Option<NonZeroU32> {
     Some(ACTIVE_GEN.with(|c| c.get()))
 }
 
+pub(crate) fn exit_active_gen() {
+    RUNNING.with(|c| c.set(false));
+}
+
 pub(crate) fn enter_active_gen() -> ActiveGenGuard {
     assert!(!RUNNING.with(|c| c.get()));
     RUNNING.with(|c| c.set(true));
     ACTIVE_GEN.with(|c| {
         c.update(|x| x.checked_add(1).expect("active gen overflow"));
-        ActiveGenGuard(c.get())
-    })
+    });
+    ActiveGenGuard
 }
 
-pub(crate) fn exit_active_gen() {
-    RUNNING.with(|c| c.set(false));
-}
-
-pub(crate) struct ActiveGenGuard(NonZeroU32);
-
-impl ActiveGenGuard {
-    pub fn get(&self) -> NonZeroU32 {
-        self.0
-    }
-}
+/// RAII guard that marks the runtime active for the duration of a
+/// [`block_on`] call, so buffer views taken during it stay valid and stale
+/// ones are detected across restarts.
+pub(crate) struct ActiveGenGuard;
 
 impl Drop for ActiveGenGuard {
     fn drop(&mut self) {
@@ -81,28 +71,31 @@ impl Drop for ActiveGenGuard {
     }
 }
 
-pub(crate) fn set_current_runtime(rt: *mut Runtime) {
-    CURRENT_RUNTIME.with(|c| c.set(rt));
+pub(crate) fn set_current_pools(pools: *mut Pools) {
+    CURRENT_POOLS.with(|c| c.set(pools));
 }
 
-pub(crate) fn clear_current_runtime() {
-    CURRENT_RUNTIME.with(|c| c.set(core::ptr::null_mut()));
+pub(crate) fn clear_current_pools() {
+    CURRENT_POOLS.with(|c| c.set(core::ptr::null_mut()));
 }
 
-pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
-    assert!(
-        is_running(),
-        "with_runtime called outside an active runtime"
-    );
-    let ptr = CURRENT_RUNTIME.with(|c| c.get());
+/// Gives `f` mutable access to the active runtime's buffer pools. `Pools` is
+/// the non-generic half of a runtime, so buffer views can reach their slabs
+/// without naming the runtime's `G`/`L`.
+pub(crate) fn with_pools<R>(f: impl FnOnce(&mut Pools) -> R) -> R {
+    assert!(is_running(), "with_pools called outside an active runtime");
+    let ptr = CURRENT_POOLS.with(|c| c.get());
     assert!(!ptr.is_null(), "no active runtime");
     unsafe { f(&mut *ptr) }
 }
 
-/// The index of the task currently being polled by the runtime loop, if any.
-/// Join futures use it to register their waiter in the target's waiter list.
-pub(crate) fn current_task_index() -> Option<u32> {
-    CURRENT_TASK_INDEX.with(|c| c.get())
+/// Allocates a fresh, never-reused op id from the per-thread counter.
+pub(crate) fn next_op_id() -> NonZeroU64 {
+    NEXT_OP_ID.with(|c| {
+        let id = c.get();
+        c.set(id.checked_add(1).expect("op id overflow"));
+        id
+    })
 }
 
 // ── View routing ─────────────────────────────────────────────────────
@@ -122,8 +115,8 @@ pub(crate) fn resolve_ptr(bid: u32, generation: NonZeroU32, offset: u32) -> NonN
         active_gen_matches(generation),
         "resolve_ptr called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| {
-        let base = r.with_slab(bid, |slab, local| slab.slot_ptr(local));
+    with_pools(|p| {
+        let base = p.with_slab(bid, |slab, local| slab.slot_ptr(local));
         unsafe { base.add(offset as usize) }
     })
 }
@@ -134,7 +127,7 @@ pub(crate) fn clone_view(bid: u32, generation: NonZeroU32) {
     if !active_gen_matches(generation) {
         return;
     }
-    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().clone_shared(local)))
+    with_pools(|p| p.with_slab(bid, |slab, local| slab.tracker_mut().clone_shared(local)))
 }
 
 /// Releases one borrower of a view's slot, recycling the slot when the last
@@ -144,7 +137,7 @@ pub(crate) fn drop_view(bid: u32, generation: NonZeroU32, exclusive: bool) {
     if !active_gen_matches(generation) {
         return;
     }
-    with_runtime(|r| r.with_slab(bid, |slab, local| slab.drop_view(exclusive, local)))
+    with_pools(|p| p.with_slab(bid, |slab, local| slab.drop_view(exclusive, local)))
 }
 
 /// Flips a sole shared `Ref` to an exclusive `RefMut`. Panics unless the slot
@@ -154,7 +147,7 @@ pub(crate) fn upgrade_view(bid: u32, generation: NonZeroU32) {
         active_gen_matches(generation),
         "upgrade_view called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().upgrade(local)))
+    with_pools(|p| p.with_slab(bid, |slab, local| slab.tracker_mut().upgrade(local)))
 }
 
 /// Flips a sole exclusive `RefMut` to a shared `Ref`. Panics unless the slot
@@ -164,7 +157,7 @@ pub(crate) fn downgrade_view(bid: u32, generation: NonZeroU32) {
         active_gen_matches(generation),
         "downgrade_view called outside the runtime that owns this buffer"
     );
-    with_runtime(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().downgrade(local)))
+    with_pools(|p| p.with_slab(bid, |slab, local| slab.tracker_mut().downgrade(local)))
 }
 
 /// Runs a closure exactly once when dropped, even on panic unwind.
@@ -184,36 +177,25 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
     }
 }
 
-pub(crate) struct Runtime {
-    pub tasks: TaskSlab,
-    pub wakeups: Vec<u32>,
-    /// Runtime-wide slab of per-op io states; a slot lives while the op it
-    /// tracks is in flight, then is recycled via `free_io_slots`.
-    pub io_slab: Vec<IoSlot>,
-    /// Indices of reusable io slab slots.
-    pub free_io_slots: Vec<u32>,
+/// The buffer-pool half of a runtime: the shared buffer slab plus the provided
+/// and fixed pools built over it. Deliberately non-generic — buffer views
+/// reach it through [`with_pools`] without naming the runtime's `G`/`L`.
+pub struct Pools {
     /// Start of the shared buffer slab, allocated aligned to at most one page.
     pub slab: NonNull<u8>,
     /// The layout of the slab allocation, used to free it on drop.
     slab_layout: Layout,
-    pub provided_pool: ProvidedPool,
-    pub fixed_pool: FixedPool,
-    pub ring: io_uring::IoUring,
-    pub make_fut: *const (),
+    pub(crate) provided_pool: ProvidedPool,
+    pub(crate) fixed_pool: FixedPool,
 }
 
-impl Drop for Runtime {
+impl Drop for Pools {
     fn drop(&mut self) {
-        // Unregister every provided buffer ring and the fixed write buffer
-        // slab while the io_uring fd is still open; the pools and slabs are
-        // dropped afterwards along with the other fields.
-        let _ = self.provided_pool.unregister_all(&self.ring);
-        let _ = self.ring.submitter().unregister_buffers();
         unsafe { dealloc(self.slab.as_ptr(), self.slab_layout) };
     }
 }
 
-impl Runtime {
+impl Pools {
     /// Hands the closure the slab of the `bid`'s direction and class, plus its
     /// slot local id, decoding `bid` once for all borrow operations.
     pub(crate) fn with_slab<R>(&mut self, bid: u32, f: impl FnOnce(&mut dyn Slab, u32) -> R) -> R {
@@ -225,189 +207,471 @@ impl Runtime {
             f(self.fixed_pool.slab_mut(class), local)
         }
     }
+}
 
-    /// Allocates an io slab slot and marks it submitted. The slot is reused
-    /// from the free list when available, otherwise the slab grows; it only
-    /// ever holds in-flight ops, so it stays bounded by peak concurrency.
-    pub(crate) fn alloc_io_slot(&mut self) -> u32 {
-        let index = match self.free_io_slots.pop() {
+// ── user_data encoding ────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserData {
+    index: u32,
+    /// High bit set marks a cancel completion; the rest is zero. The handler
+    /// routes on this bit: an op CQE invokes the target slot's `shim`, a
+    /// cancel CQE runs the cancel handshake for that cancel slot.
+    tag: u32,
+}
+
+const CANCEL_TAG: u32 = 1 << 31;
+
+impl From<UserData> for u64 {
+    fn from(ud: UserData) -> u64 {
+        ud.index as u64 | ((ud.tag as u64) << 32)
+    }
+}
+
+impl From<u64> for UserData {
+    fn from(raw: u64) -> Self {
+        UserData {
+            index: raw as u32,
+            tag: (raw >> 32) as u32,
+        }
+    }
+}
+
+// ── Op identity ─────────────────────────────────────────────────────
+//
+// The never-reset per-thread `NEXT_OP_ID` counter hands out ids that are
+// unique for the whole lifetime of the thread, so the low bits of a slot's
+// `id` uniquely identify one op across slot reuse *and* runtime restarts. The
+// top bit is spare and rides along as the first-wins `RESOLVED` mark: a winning
+// cancel sets it after taking the op's `local`, so the op's own (later) CQE
+// sees the mark and suppresses its callback instead of re-taking `local`.
+
+const RESOLVED: u64 = 1 << 63;
+
+/// The op id carried by the `id` field, with the `RESOLVED` bit stripped.
+fn id_bits(id: NonZeroU64) -> NonZeroU64 {
+    NonZeroU64::new(id.get() & !RESOLVED).expect("id bits clear RESOLVED")
+}
+
+/// Whether a winning cancel has already taken this op's `local`.
+fn is_resolved(id: NonZeroU64) -> bool {
+    id.get() & RESOLVED != 0
+}
+
+// ── Slots ─────────────────────────────────────────────────────────────
+
+/// The completion shim stored per op. Receives the moved-back `local`, the raw
+/// CQE (`result` — negative errno — and `flags`), the erased `done` fn pointer
+/// (which the shim casts back to its concrete type before invoking), and the
+/// slot's `state` byte (op metadata, e.g. the read size class).
+type OpShim<G, L> = fn(&mut Runtime<G, L>, L, i32, u32, *const (), u8);
+
+/// A handle to one in-flight op. `id` is stamped from the never-reset
+/// per-thread counter [`next_op_id`], so the pair `(slot, id)` uniquely
+/// identifies this op for the whole lifetime of the thread: a stale handle can
+/// neither name a slot the runtime has since recycled (the new occupant has a
+/// fresh id) nor be mistaken for an op of a later runtime (the counter never
+/// resets). Copyable and inert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Op {
+    pub(crate) slot: u32,
+    /// The op's per-dispatch `class` (e.g. the read size class), kept in the
+    /// handle (free in the padding) so `cancel` can rebuild the victim's exact
+    /// `user_data` for `ASYNC_CANCEL`.
+    pub(crate) class: u8,
+    id: NonZeroU64,
+}
+
+/// The result a `cancel` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelStatus {
+    /// The cancel was accepted; `done` fires — receiving the target op's
+    /// `local` — only if the cancellation beats the op's own completion.
+    Accepted,
+    /// The op had already completed (recycled slot or mismatched id), or the
+    /// submission failed. `done` is not called and nothing is pending.
+    AlreadyCompleted,
+}
+
+/// One in-flight op. `local` is the caller's per-op state, moved back into the
+/// shim on completion (first-wins with a winning cancel). `local` is a
+/// `ManuallyDrop` so a winning cancel can take it out (leaving the slot inert)
+/// and the later op CQE can detect that via [`is_resolved`] without an
+/// `Option` discriminant; the taken-out value is owned by whichever callback
+/// ran.
+struct IoSlot<G, L> {
+    shim: OpShim<G, L>,
+    done: *const (),
+    local: ManuallyDrop<L>,
+    id: NonZeroU64, // bit63 = RESOLVED; low bits = unique op id
+}
+
+/// One in-flight cancel. `target`/`target_id` name the op slot; `done` is the
+/// caller's cancel callback, receiving the cancel's own `local`.
+#[derive(Clone, Copy)]
+struct CancelSlot<G, L> {
+    target: u32,
+    target_id: NonZeroU64,
+    done: fn(&mut Runtime<G, L>, L),
+    local: ManuallyDrop<L>,
+}
+
+// ── Runtime ───────────────────────────────────────────────────────────
+
+/// The callback runtime. Owns the `io_uring` ring, the buffer pools, the op
+/// slabs, and the caller's global state `G`. Each op carries its own local
+/// state `L`, moved into the op on dispatch and back to a shim on completion.
+pub struct Runtime<G, L> {
+    /// Held in an `Option` only so [`Drop`] can close it at the exact point we
+    /// choose — see the `Drop` impl, which relies on this being the first
+    /// thing torn down. It is `Some` for the entire lifetime of the runtime
+    /// except inside `drop`.
+    pub(crate) ring: Option<io_uring::IoUring>,
+    pub(crate) pools: Pools,
+    /// One entry per dispatched op while in flight; `None` marks a free slot.
+    io_slab: Vec<Option<IoSlot<G, L>>>,
+    free_slots: Vec<u32>,
+    /// One entry per in-flight cancel request.
+    cancel_slab: Vec<Option<CancelSlot<G, L>>>,
+    free_cancels: Vec<u32>,
+    /// Number of ops submitted but not yet completed (their slot is `Some`).
+    inflight_ops: u32,
+    /// Number of cancel requests submitted but not yet completed.
+    inflight_cancels: u32,
+    /// The caller's global state, taken back out by [`block_on`] on return.
+    global: Option<G>,
+}
+
+impl<G, L> Runtime<G, L> {
+    /// The live ring. Only ever `None` inside [`Drop`], after it was closed.
+    pub fn ring_mut(&mut self) -> &mut io_uring::IoUring {
+        self.ring.as_mut().expect("ring closed")
+    }
+}
+
+impl<G, L> Runtime<G, L> {
+    /// Allocates an op slab slot and marks it submitted. Reuses a free slot
+    /// when available, otherwise the slab grows.
+    fn alloc_op_slot(&mut self) -> u32 {
+        self.inflight_ops += 1;
+        match self.free_slots.pop() {
             Some(index) => index,
             None => {
-                self.io_slab.push(IoSlot::default());
+                self.io_slab.push(None);
                 (self.io_slab.len() - 1) as u32
             }
-        };
-        self.io_slab[index as usize].submitted = 1;
-        index
+        }
     }
 
-    /// Returns `index` to the free list. Only call once the CQE for the op is
-    /// consumed, so a late completion can never land on a recycled slot.
-    pub(crate) fn free_io_slot(&mut self, index: u32) {
-        self.io_slab[index as usize] = IoSlot::default();
-        self.free_io_slots.push(index);
+    /// Returns `index` to the free list, dropping whatever the slot held. Only
+    /// call once the CQE for the op has been consumed, so a late completion can
+    /// never land on a recycled slot.
+    pub(crate) fn free_op_slot(&mut self, index: u32) {
+        self.inflight_ops -= 1;
+        self.io_slab[index as usize] = None;
+        self.free_slots.push(index);
     }
 
-    /// Whether any io op is still in flight. Scans the slab for submitted
-    /// slots that are not yet ready; a finished task's ops keep this true
-    /// until their CQEs are drained.
-    fn has_io_in_flight(&self) -> bool {
-        self.io_slab
-            .iter()
-            .any(|slot| slot.submitted != 0 && slot.ready == 0)
-    }
-
-    /// Recycles the io slots in `io` whose ops have already completed (ready),
-    /// removing them from `io`. Slots still in flight are left for their
-    /// pending CQE, which recycles them through [`Self::drain_cqes`].
-    fn reap_io_slots(&mut self, io: &mut IoVec) {
-        let mut i = 0;
-        while i < io.len() {
-            let slot = {
-                let mut it = io.iter();
-                it.nth(i).expect("index in bounds")
-            };
-            if self.io_slab[slot as usize].submitted != 0 && self.io_slab[slot as usize].ready != 0
-            {
-                self.free_io_slot(slot);
-                io.remove_value(slot);
-            } else {
-                i += 1;
+    fn alloc_cancel_slot(&mut self) -> u32 {
+        self.inflight_cancels += 1;
+        match self.free_cancels.pop() {
+            Some(index) => index,
+            None => {
+                self.cancel_slab.push(None);
+                (self.cancel_slab.len() - 1) as u32
             }
         }
     }
 
-    fn context_for(&mut self, task_idx: u32) -> TaskContext {
-        set_current_runtime(self as *mut Runtime);
-        self.tasks.context_for(task_idx)
+    fn free_cancel_slot(&mut self, index: u32) {
+        self.inflight_cancels -= 1;
+        self.cancel_slab[index as usize] = None;
+        self.free_cancels.push(index);
     }
 
-    /// Finalizes a finished task: recycles io slots whose ops already
-    /// completed, cancels the rest if [`JoinHandle::cancel`] was called on the
-    /// task, and removes the task once its io has fully drained, waking any
-    /// joiners. A task that finished on its own keeps its in-flight io running
-    /// to completion instead of issuing cancel requests. The task stays in its
-    /// slot until its io drains, so a CQE can never land on a recycled slot
-    /// and the finished-task branch of [`Self::drain_cqes`] is airtight.
-    fn finalize_task<F: 'static, R: 'static>(&mut self, idx: u32) {
-        let task_ptr = self.tasks.task_ptr(idx);
-        unsafe {
-            assert!((*task_ptr).finished);
-        }
-
-        // Recycle slots whose ops already completed; their CQEs are consumed,
-        // so only this path can free them.
-        self.reap_io_slots(unsafe { &mut (*task_ptr).io });
-
-        if unsafe { (*task_ptr).cancel_requested } {
-            // Cancel the still-in-flight ops. `push_cancel` only appends its
-            // cancel slots, so the first `n` entries stay the victims and the
-            // loop never touches the slots it adds.
-            let n = unsafe { (*task_ptr).io.len() };
-            for i in 0..n {
-                let slot = {
-                    let mut it = unsafe { (*task_ptr).io.iter() };
-                    it.nth(i).expect("index in bounds")
-                };
-                self.push_cancel(idx, slot);
-            }
-        }
-
-        if unsafe { (*task_ptr).io.is_empty() } {
-            self.remove_task::<F, R>(idx);
+    /// Registers a dispatched op: takes the caller's `local`, installs its
+    /// completion `shim` and erased `done`, and returns the op's handle. The
+    /// caller submits the SQE with [`Self::op_user_data`]. `class` is
+    /// dispatch-time metadata carried in the handle and in the op's
+    /// `user_data`, read back by the shim on completion.
+    pub(crate) fn register_op(
+        &mut self,
+        shim: OpShim<G, L>,
+        done: *const (),
+        local: L,
+        class: u8,
+    ) -> Op {
+        let index = self.alloc_op_slot();
+        let id = next_op_id();
+        self.io_slab[index as usize] = Some(IoSlot {
+            shim,
+            done,
+            local: ManuallyDrop::new(local),
+            id,
+        });
+        Op {
+            slot: index,
+            class,
+            id,
         }
     }
 
-    /// Submits an `IORING_OP_ASYNC_CANCEL` for one in-flight io slot of a
-    /// finished task. The cancel request occupies its own io slot, so its CQE
-    /// is recycled by the same finished-task drain path as the victim's.
-    fn push_cancel(&mut self, idx: u32, victim_slot: u32) {
-        let cancel_slot = self.alloc_io_slot();
-        self.tasks.task_mut(idx).io.push(cancel_slot);
+    /// The `user_data` for the SQE completing the op in `slot`. `class` is
+    /// dispatch-time metadata the shim reads back on completion. The handler
+    /// never checks the op `id` (a stale CQE is impossible by construction);
+    /// the `id` lives in the slot for `cancel` to validate the handle.
+    pub(crate) fn op_user_data(slot: u32, class: u8) -> u64 {
+        UserData {
+            index: slot,
+            tag: u32::from(class),
+        }
+        .into()
+    }
 
-        let victim_ud = IoUserData {
-            index: idx,
-            io_slot: victim_slot,
-        };
-        let cancel_ud = IoUserData {
-            index: idx,
-            io_slot: cancel_slot,
-        };
-        let entry = io_uring::opcode::AsyncCancel::new(victim_ud.into())
-            .build()
-            .user_data(cancel_ud.into());
-
-        let mut sq = self.ring.submission();
+    /// Submits an `ASYNC_CANCEL` naming `victim`'s `user_data`, carrying the
+    /// cancel's own `local` for `done`. Returns whether it was accepted.
+    fn submit_cancel(
+        &mut self,
+        victim: Op,
+        target_id: NonZeroU64,
+        done: fn(&mut Runtime<G, L>, L),
+        local: L,
+    ) -> bool {
+        let index = self.alloc_cancel_slot();
+        self.cancel_slab[index as usize] = Some(CancelSlot {
+            target: victim.slot,
+            target_id,
+            done,
+            local: ManuallyDrop::new(local),
+        });
+        let entry =
+            io_uring::opcode::AsyncCancel::new(Self::op_user_data(victim.slot, victim.class))
+                .build()
+                .user_data(
+                    UserData {
+                        index,
+                        tag: CANCEL_TAG,
+                    }
+                    .into(),
+                );
+        let mut sq = self.ring_mut().submission();
         let pushed = unsafe { sq.push(&entry) };
         drop(sq);
         if pushed.is_err() {
-            // Ring full: the victim's natural CQE will still recycle its slot,
-            // so give up the cancel slot.
-            self.free_io_slot(cancel_slot);
-            self.tasks.task_mut(idx).io.remove_value(cancel_slot);
+            // Ring full: the victim's natural completion still recycles its
+            // slot; give up the cancel slot and report no cancellation. The
+            // cancel's own local is dropped with the cleared slot.
+            self.free_cancel_slot(index);
+            return false;
+        }
+        true
+    }
+
+    /// Immutable access to the caller's global state.
+    pub fn global(&self) -> &G {
+        self.global.as_ref().expect("global already taken")
+    }
+
+    /// Mutable access to the caller's global state.
+    ///
+    /// This is sound because the runtime is single-threaded and exactly one
+    /// callback runs at a time: a completion callback is invoked from the
+    /// drive loop with `&mut self`, and the borrow of the global ends when the
+    /// callback returns. Dispatching a further op while holding it is fine —
+    /// the op cannot complete until the callback yields back to the drive loop,
+    /// by which point the borrow is gone.
+    ///
+    /// A callback must still not retain this reference past its own body; the
+    /// next callback is free to mutate the same state.
+    pub fn global_mut(&mut self) -> &mut G {
+        self.global.as_mut().expect("global already taken")
+    }
+
+    /// Cancels an in-flight op. On acceptance an `ASYNC_CANCEL` is submitted
+    /// and `done` fires — receiving the cancel's own `local` — only if the
+    /// cancellation beats the op's own completion. If the op already finished
+    /// (recycled slot or mismatched id), returns
+    /// [`CancelStatus::AlreadyCompleted`] and `done` is never called.
+    pub fn cancel(&mut self, op: Op, local: L, done: fn(&mut Runtime<G, L>, L)) -> CancelStatus {
+        let valid = matches!(
+            self.io_slab.get(op.slot as usize),
+            Some(Some(slot)) if id_bits(slot.id) == op.id
+        );
+        if !valid {
+            return CancelStatus::AlreadyCompleted;
+        }
+        if self.submit_cancel(op, op.id, done, local) {
+            CancelStatus::Accepted
+        } else {
+            CancelStatus::AlreadyCompleted
         }
     }
 
-    /// Removes a finished task whose io has fully drained, waking the task
-    /// blocked on its [`JoinHandle`], if any.
-    fn remove_task<F: 'static, R: 'static>(&mut self, idx: u32) {
-        assert!(self.tasks.task(idx).finished);
-        let joiner = self.tasks.task_mut(idx).joiner;
-        if joiner != NO_JOINER {
-            self.wakeups.push(joiner);
+    fn complete_op(&mut self, index: u32, result: i32, flags: u32, class: u8) {
+        let Some(mut slot) = self.io_slab.get_mut(index as usize).and_then(|s| s.take()) else {
+            return;
+        };
+        self.inflight_ops -= 1;
+        self.free_slots.push(index);
+        if is_resolved(slot.id) {
+            // A winning cancel already took the local out and ran its `done`.
+            // The ManuallyDrop is already empty, so nothing to drop.
+            return;
         }
-        self.tasks.remove::<F, R>(idx);
+        // SAFETY: the local is initialized (not previously taken) and the slot
+        // has been removed from the slab, so ownership moves out here.
+        let local = unsafe { ManuallyDrop::take(&mut slot.local) };
+        (slot.shim)(self, local, result, flags, slot.done, class);
     }
 
-    fn drain_cqes(&mut self, ready: &mut Vec<u32>) {
-        for cqe in self.ring.completion() {
-            let IoUserData {
-                index: task_index,
-                io_slot,
-            } = cqe.user_data().into();
-            let result = cqe.result();
+    fn complete_cancel(&mut self, index: u32) {
+        let Some(cancel) = self
+            .cancel_slab
+            .get(index as usize)
+            .and_then(|c| c.as_ref())
+        else {
+            return;
+        };
+        let (target, target_id, done) = (cancel.target, cancel.target_id, cancel.done);
+        let clocal = {
+            let slot = self.cancel_slab[index as usize]
+                .as_mut()
+                .expect("cancel slot present");
+            // SAFETY: taken once, then the slot is dropped to None below.
+            unsafe { ManuallyDrop::take(&mut slot.local) }
+        };
+        self.free_cancel_slot(index);
 
-            if io_slot as usize >= self.io_slab.len() {
-                continue;
-            }
+        // First-wins: take the target's local only if the op's own completion
+        // hasn't already resolved it. Set RESOLVED so the target's later CQE
+        // suppresses its callback.
+        let mut won = None;
+        if let Some(Some(ts)) = self.io_slab.get_mut(target as usize)
+            && id_bits(ts.id) == target_id
+            && !is_resolved(ts.id)
+        {
+            ts.id = NonZeroU64::new(ts.id.get() | RESOLVED).expect("still nonzero");
+            // SAFETY: not previously taken (RESOLVED clear); the slot stays in
+            // the slab until its own CQE, but ownership moves out here.
+            won = Some(unsafe { ManuallyDrop::take(&mut ts.local) });
+        }
+        if let Some(_victim_local) = won {
+            done(self, clocal);
+        }
+        // If the op already ran its own callback, `done` is suppressed; the
+        // cancel's `clocal` is dropped with the cleared cancel slot.
+    }
 
-            if !self.tasks.is_occupied(task_index) {
-                continue;
+    fn drain_cqes(&mut self) {
+        // Collect first: a shim may dispatch or cancel, pushing to the
+        // submission queue, which would conflict with holding the completion
+        // iterator.
+        let mut cqes = Vec::new();
+        {
+            for cqe in self.ring_mut().completion() {
+                let ud = UserData::from(cqe.user_data());
+                cqes.push((ud, cqe.result(), cqe.flags()));
             }
-            if self.tasks.task(task_index).finished {
-                // The task is done and only waiting for its io to drain:
-                // recycle the slot now and let the loop finalize the
-                // removal once the last slot is gone. `free_io_slot` is
-                // inlined since the ring borrow rules it out here.
-                self.tasks.task_mut(task_index).io.remove_value(io_slot);
-                self.io_slab[io_slot as usize] = IoSlot::default();
-                self.free_io_slots.push(io_slot);
-                if self.tasks.task(task_index).io.is_empty() {
-                    ready.push(task_index);
-                }
-                continue;
+        }
+        for (ud, result, flags) in cqes {
+            if ud.tag & CANCEL_TAG != 0 {
+                self.complete_cancel(ud.index);
+            } else {
+                let class = (ud.tag & 0x7f) as u8;
+                self.complete_op(ud.index, result, flags, class);
             }
-            let slot = &mut self.io_slab[io_slot as usize];
-            slot.result = result;
-            // Only reads report a selected buffer via the CQE flags;
-            // writes store their own slot id in `bids`, so leave it
-            // untouched when no buffer flag is present.
-            if let Some(bid) = io_uring::cqueue::buffer_select(cqe.flags()) {
-                slot.bid = bid;
+        }
+    }
+
+    fn has_inflight(&self) -> bool {
+        self.inflight_ops != 0 || self.inflight_cancels != 0
+    }
+
+    /// The main loop: run completions until nothing is in flight.
+    fn drive(&mut self) {
+        loop {
+            self.drain_cqes();
+            if !self.has_inflight() {
+                break;
             }
-            slot.ready = 1;
-            let task = self.tasks.task_mut(task_index);
-            if !task.ready {
-                task.ready = true;
-                ready.push(task_index);
+            match self.ring_mut().submit_and_wait(1) {
+                Ok(_) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                Err(_) => break,
             }
         }
     }
 }
 
+/// Teardown order matters and is load-bearing.
+///
+/// `Runtime` holds memory the kernel can still be writing into: `pools` backs
+/// every read's provided-buffer ring and every `write_fixed` buffer, and an
+/// op's `L` may own a `Bytes` pointing at that same slab. So the teardown must
+/// be strictly:
+///
+/// 1. unregister the buffer rings (needs the fd open),
+/// 2. close the ring fd — the kernel cancels every in-flight request and does
+///    not return until any worker mid-execution has finished, so after this
+///    returns **no kernel op can touch pool or local memory**,
+/// 3. only then drop the un-consumed op locals (which may return pooled
+///    buffers),
+/// 4. finally let `pools` free the slab.
+///
+/// The `io-uring` crate encodes the same invariant for its own maps by
+/// dropping `MemoryMap` before `fd`; we do the same for the slab by closing the
+/// fd before touching `L` or `pools`.
+///
+/// A normal `drive()` drains to quiescence, so steps 3–4 are no-ops there;
+/// they matter only when a panic unwinds out of `boot`/`drive`, or when
+/// `drive` breaks early on a ring error with ops still in flight.
+impl<G, L> Drop for Runtime<G, L> {
+    fn drop(&mut self) {
+        // 1. Unregister every provided buffer ring and the fixed write buffer slab
+        //    while the io_uring fd is still open.
+        if let Some(ring) = self.ring.as_ref() {
+            let _ = self.pools.provided_pool.unregister_all(ring);
+            let _ = ring.submitter().unregister_buffers();
+        }
+
+        // 2. Close the ring. `IoUring::drop` releases its own SQ/CQ maps and then
+        //    closes the fd, which tears down the ring and does not return until every
+        //    in-flight request is cancelled and any worker that was mid-execution has
+        //    finished.
+        drop(self.ring.take());
+
+        // 3. Safe now: no kernel op is live, so drop locals that no completion ever
+        //    consumed.
+        for entry in self.io_slab.iter_mut() {
+            if let Some(slot) = entry
+                && !is_resolved(slot.id)
+            {
+                // SAFETY: RESOLVED is clear, so a winning cancel never took
+                // this local. We are the first to drop it and the slot is
+                // cleared immediately after.
+                unsafe { ManuallyDrop::drop(&mut slot.local) };
+            }
+            *entry = None;
+        }
+        for entry in self.cancel_slab.iter_mut() {
+            if let Some(slot) = entry {
+                // SAFETY: a cancel slot still present in the slab was never
+                // resolved by its own CQE, so its local is still owned here.
+                unsafe { ManuallyDrop::drop(&mut slot.local) };
+            }
+            *entry = None;
+        }
+        // 4. `pools` (and the now-empty slabs) drop here, after the ring is
+        //    closed.
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RuntimeParams<'a> {
-    pub tasks_capacity: u32,
+    /// A hint for how many ops may be in flight at once; the slab grows if
+    /// more are dispatched.
+    pub ops_capacity: u32,
     pub ring_entries: u32,
     /// Provided-buffer size classes for reads. Each `count` must be a power of
     /// two no larger than 32768.
@@ -419,16 +683,13 @@ pub struct RuntimeParams<'a> {
 impl<'a> Default for RuntimeParams<'a> {
     fn default() -> Self {
         Self {
-            tasks_capacity: 1024,
+            ops_capacity: 1024,
             ring_entries: 1024,
             provided_size_classes: &DEFAULT_SIZE_CLASSES,
             size_classes: &DEFAULT_SIZE_CLASSES,
         }
     }
 }
-
-/// The shared buffer slab allocation plus the pools built over it.
-type BuiltPools = (NonNull<u8>, Layout, ProvidedPool, FixedPool);
 
 /// Builds both directions' pools over one shared slab: the provided classes
 /// occupy the start of the slab, the fixed classes follow them. Each provided
@@ -446,12 +707,10 @@ fn build_pools(
     ring: &io_uring::IoUring,
     provided_spec: &[SizeClass],
     fixed_spec: &[SizeClass],
-) -> BuiltPools {
+) -> Pools {
     let provided_layout = layout_classes(provided_spec, true);
     let fixed_layout = layout_classes(fixed_spec, false);
     let provided_total = provided_layout.last().map(|l| l.total).unwrap();
-    // The slab is aligned to at most one page: larger classes still land on
-    // page-aligned offsets, so no buffer ever exceeds a page's alignment.
     let align = provided_spec
         .iter()
         .chain(fixed_spec)
@@ -462,9 +721,6 @@ fn build_pools(
         align.is_power_of_two(),
         "buffer size class sizes must be powers of two so buffers can be aligned to their size"
     );
-    // Start the fixed region on an offset aligned to `align` (hence to every
-    // class size): the provided region's total need not be a multiple of the
-    // fixed class sizes.
     let fixed_start = provided_total.div_ceil(u64::from(align as u32)) * u64::from(align as u32);
     let total = fixed_start + fixed_layout.last().map(|l| l.total).unwrap();
     assert!(
@@ -509,7 +765,7 @@ fn build_pools(
             count: l.count,
         })
         .collect();
-    let fixed_slabs = fixed_layout
+    let fixed_slabs: Vec<FixedSlab> = fixed_layout
         .iter()
         .enumerate()
         .map(|(i, l)| {
@@ -541,26 +797,30 @@ fn build_pools(
     unsafe { ring.submitter().register_buffers(&[iovec]) }
         .expect("failed to register the fixed buffer region");
 
-    (base, layout, provided_pool, fixed_pool)
+    Pools {
+        slab: base,
+        slab_layout: layout,
+        provided_pool,
+        fixed_pool,
+    }
 }
 
-pub fn block_on_default<S, F, T, R>(make_fut: S, user_data: T) -> R
+pub fn block_on_default<G, L, F>(global: G, boot: F) -> G
 where
-    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
-    F: Future<Output = R> + 'static,
-    R: 'static,
+    F: FnOnce(&mut Runtime<G, L>),
 {
-    block_on(RuntimeParams::default(), make_fut, user_data)
+    block_on(RuntimeParams::default(), global, boot)
 }
 
-pub fn block_on<S, F, T, R>(params: RuntimeParams<'_>, make_fut: S, user_data: T) -> R
+/// Runs the callback runtime to completion (until no op is in flight) and
+/// returns the caller's global state `G`. `boot` is invoked once with the
+/// runtime to dispatch the initial ops; it is the one place a closure is
+/// allowed (it runs a single time, at startup).
+pub fn block_on<G, L, F>(params: RuntimeParams<'_>, global: G, boot: F) -> G
 where
-    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
-    F: Future<Output = R> + 'static,
-    R: 'static,
+    F: FnOnce(&mut Runtime<G, L>),
 {
     let _gen_guard = enter_active_gen();
-    let generation = _gen_guard.get();
 
     let ring = io_uring::IoUring::builder()
         .setup_single_issuer()
@@ -570,1458 +830,55 @@ where
             io_uring::IoUring::new(params.ring_entries).expect("failed to create io_uring")
         });
 
-    let (slab, slab_layout, provided_pool, fixed_pool) =
-        build_pools(&ring, params.provided_size_classes, params.size_classes);
+    let pools = build_pools(&ring, params.provided_size_classes, params.size_classes);
+
+    // Declared *before* `rt` so it drops *after* it: locals can own pooled bytes,
+    // and `Runtime::drop` must be able to route their release through the live
+    // pools. Clearing the pointer first would abort that drop.
+    let _rt_guard = DropGuard::new(clear_current_pools);
 
     let mut rt = Runtime {
-        tasks: TaskSlab::new::<F, R>(params.tasks_capacity),
-        wakeups: Vec::new(),
+        pools,
+        ring: Some(ring),
         io_slab: Vec::new(),
-        free_io_slots: Vec::new(),
-        slab,
-        slab_layout,
-        provided_pool,
-        fixed_pool,
-        ring,
-        make_fut: &raw const make_fut as *const (),
+        free_slots: Vec::new(),
+        cancel_slab: Vec::new(),
+        free_cancels: Vec::new(),
+        inflight_ops: 0,
+        inflight_cancels: 0,
+        global: Some(global),
     };
 
-    let rt_ptr: *mut Runtime = &mut rt;
-    set_current_runtime(rt_ptr);
-    let _rt_guard = DropGuard::new(clear_current_runtime);
-    let _drop_guard = DropGuard::new(move || unsafe {
-        TaskSlab::drop_futures_raw::<F>(&mut (*rt_ptr).tasks);
-        TaskSlab::drop_outputs_raw::<R>(&mut (*rt_ptr).tasks);
-    });
+    set_current_pools(&raw mut rt.pools);
 
-    let spawn: unsafe fn(RuntimeContext<T, R>, T) -> Option<JoinHandle<R>> = spawn::<S, F, T, R>;
+    // A panic in `boot` or `drive` simply unwinds: dropping `rt` runs the
+    // ordered teardown in `Runtime::drop`, which closes the ring before any
+    // local or pool memory is released.
+    boot(&mut rt);
+    rt.drive();
 
-    let ctx = RuntimeContext { generation, spawn };
-
-    let mut task = Task::new();
-    task.ready = true;
-    let task_idx = rt
-        .tasks
-        .insert(task, |task_ctx| (make_fut)(task_ctx, ctx, user_data))
-        .expect("failed to insert vacant task");
-    rt.wakeups.push(task_idx);
-
-    let mut ready_tasks = Vec::new();
-    let mut main_output: Option<R> = None;
-
-    loop {
-        core::mem::swap(&mut rt.wakeups, &mut ready_tasks);
-        assert!(rt.wakeups.is_empty());
-
-        rt.drain_cqes(&mut ready_tasks);
-
-        for &idx in &ready_tasks {
-            if !rt.tasks.is_occupied(idx) {
-                continue;
-            }
-
-            if rt.tasks.task(idx).finished {
-                rt.finalize_task::<F, R>(idx);
-                continue;
-            }
-
-            rt.tasks.task_mut(idx).ready = false;
-
-            CURRENT_TASK_INDEX.with(|c| c.set(Some(idx)));
-            let mut cx = Context::from_waker(Waker::noop());
-            let future_ptr = rt.tasks.future_ptr::<F>(idx);
-            let future = unsafe { Pin::new_unchecked(&mut *future_ptr) };
-            let poll_result = future.poll(&mut cx);
-            CURRENT_TASK_INDEX.with(|c| c.set(None));
-
-            if let Poll::Ready(output) = poll_result {
-                if idx == task_idx {
-                    main_output = Some(output);
-                } else {
-                    let joiner = rt.tasks.task_mut(idx).joiner;
-                    if joiner == NO_JOINER {
-                        drop(output);
-                    } else {
-                        rt.tasks.init_output::<R>(joiner, output);
-                    }
-                }
-                rt.tasks.task_mut(idx).finished = true;
-                rt.finalize_task::<F, R>(idx);
-            }
-        }
-
-        ready_tasks.clear();
-
-        if !rt.wakeups.is_empty() {
-            // Tasks were woken during the poll pass (e.g. Notify or spawn):
-            // re-poll them promptly instead of blocking on the ring. Flush
-            // any submissions issued this pass so they reach the kernel.
-            match rt.ring.submit() {
-                Ok(_) => {}
-                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                Err(_) => {
-                    return main_output
-                        .expect("block_on: submit failed before the main future completed");
-                }
-            }
-            continue;
-        }
-
-        if !rt.has_io_in_flight() {
-            break;
-        }
-
-        match rt.ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-            Err(_) => {
-                return main_output
-                    .expect("block_on: submit failed before the main future completed");
-            }
-        }
-    }
-
-    main_output.expect(
-        "block_on: the main future ended Pending with no pending io or wakeups and can never \
-         complete",
-    )
-}
-
-unsafe fn spawn<S, F, T, R>(ctx: RuntimeContext<T, R>, user_data: T) -> Option<JoinHandle<R>>
-where
-    S: Fn(TaskContext, RuntimeContext<T, R>, T) -> F,
-    F: Future<Output = R> + 'static,
-    R: 'static,
-{
-    with_runtime(|data| {
-        let closure = unsafe { &*(data.make_fut as *const S) };
-
-        let mut task = Task::new();
-        task.ready = true;
-        let index = data
-            .tasks
-            .insert(task, |task_ctx| closure(task_ctx, ctx, user_data))?;
-
-        let handle = JoinHandle::new(data.context_for(index));
-
-        data.wakeups.push(index);
-
-        Some(handle)
-    })
-}
-
-#[derive(Debug)]
-pub struct RuntimeContext<T, R> {
-    generation: NonZeroU32,
-    spawn: unsafe fn(RuntimeContext<T, R>, T) -> Option<JoinHandle<R>>,
-}
-
-impl<T, R> Clone for RuntimeContext<T, R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T, R> Copy for RuntimeContext<T, R> {}
-
-impl<T, R> RuntimeContext<T, R> {
-    pub fn spawn(&self, user_data: T) -> Option<JoinHandle<R>> {
-        assert!(
-            active_gen_matches(self.generation),
-            "RuntimeContext used outside the runtime it belongs to"
-        );
-        unsafe { (self.spawn)(*self, user_data) }
-    }
+    rt.global.take().expect("global already taken")
 }
 
 #[cfg(test)]
-mod tests {
-    use core::future::Ready;
-    use core::mem::MaybeUninit;
-    use core::pin::pin;
-    use core::task::Context;
-    use core::task::Poll;
-    use core::task::Waker;
-
+mod slot_layout_tests {
     use super::*;
-    use crate::buf::Bytes;
-    use crate::buf::BytesMut;
-    use crate::buf::Ref;
-    use crate::buf::RefMut;
-    use crate::buf::Slice;
-    use crate::buf::SliceMut;
-    use crate::buf::alloc;
-    use crate::buf::alloc_bytes;
-    use crate::classes::SizeClass;
-    use crate::classes::pack_bid;
-    use crate::io::MAX_CTRL_CAP;
-    use crate::io::MAX_IOV_CAP;
-    use crate::io::Msg;
-    use crate::io::MsgMut;
-    use crate::io::await_cqe;
-    use crate::io::cmsg_space;
-    use crate::io::yield_now;
-    use crate::task::IoUserData;
-    use crate::task::IoVec;
-    use crate::task::Task;
-    use crate::task::TaskSlab;
-
-    fn test_runtime_data(capacity: u32) -> Runtime {
-        let ring = io_uring::IoUring::new(8).unwrap();
-        // Class 0 (16) and 1 (64) feed the small-slot tests; class 2 (2048)
-        // fits MAX_CTRL_CAP and class 3 (16384) fits the MAX_IOV_CAP iov array
-        // that a non-generic Msg always allocates.
-        let (slab, slab_layout, provided_pool, fixed_pool) =
-            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
-                SizeClass { size: 16, count: 4 },
-                SizeClass { size: 64, count: 4 },
-                SizeClass {
-                    size: 2048,
-                    count: 4,
-                },
-                SizeClass {
-                    size: 16384,
-                    count: 2,
-                },
-            ]);
-        Runtime {
-            tasks: TaskSlab::new::<Ready<()>, ()>(capacity),
-            wakeups: Vec::new(),
-            io_slab: Vec::new(),
-            free_io_slots: Vec::new(),
-            slab,
-            slab_layout,
-            provided_pool,
-            fixed_pool,
-            ring,
-            make_fut: core::ptr::null(),
-        }
-    }
-
-    // ── io slab ───────────────────────────────────────────────────────
 
     #[test]
-    fn io_slot_alloc_marks_submitted() {
-        let mut data = test_runtime_data(64);
-        let slot = data.alloc_io_slot();
-        assert_eq!(slot, 0);
-        assert_eq!(data.io_slab[slot as usize].submitted, 1);
-        assert!(data.has_io_in_flight());
-    }
-
-    #[test]
-    fn io_slot_free_clears_and_reuses() {
-        let mut data = test_runtime_data(64);
-        let a = data.alloc_io_slot();
-        let b = data.alloc_io_slot();
-        assert_eq!(a, 0);
-        assert_eq!(b, 1);
-        data.free_io_slot(a);
-        assert_eq!(data.io_slab[a as usize].submitted, 0);
-        // The freed slot is reused before the slab grows.
-        let c = data.alloc_io_slot();
-        assert_eq!(c, 0);
-        assert_eq!(data.io_slab.len(), 2);
-    }
-
-    #[test]
-    fn io_slab_reaps_completed_unreaped_slot() {
-        let mut data = test_runtime_data(64);
-        let mut io = IoVec::new();
-        let slot = data.alloc_io_slot();
-        io.push(slot);
-        // The op completed but the task never reaped it.
-        data.io_slab[slot as usize].ready = 1;
-        data.reap_io_slots(&mut io);
-        assert_eq!(data.io_slab[slot as usize].submitted, 0);
-        assert_eq!(data.free_io_slots, vec![slot]);
-        assert!(!data.has_io_in_flight());
-    }
-
-    #[test]
-    fn io_slab_leaves_in_flight_slot_orphaned() {
-        let mut data = test_runtime_data(64);
-        let mut io = IoVec::new();
-        let slot = data.alloc_io_slot();
-        io.push(slot);
-        // Still in flight: reaping must leave it for the late CQE.
-        data.reap_io_slots(&mut io);
-        assert_eq!(data.io_slab[slot as usize].submitted, 1);
-        assert!(data.free_io_slots.is_empty());
-        assert!(data.has_io_in_flight());
-    }
-
-    #[test]
-    fn shared_slab_fixed_region_follows_provided_region() {
-        let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, provided_pool, fixed_pool) =
-            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
-                size: 32,
-                count: 2,
-            }]);
-        // The provided region is 4 x 16 = 64 bytes; the fixed class starts
-        // right after it in the same slab.
-        let base = slab.as_ptr() as usize;
+    fn io_slot_has_no_option_overhead() {
+        // Overhead must be exactly shim(8) + done(8) + id(8) + L, i.e. the local
+        // is stored inline with no discriminant and no separate state byte.
+        struct L(#[allow(dead_code)] u64, #[allow(dead_code)] u64);
         assert_eq!(
-            provided_pool.slab(0).slot_ptr(3).as_ptr() as usize - base,
-            48
-        );
-        assert_eq!(fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize - base, 64);
-        assert_eq!(fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize - base, 96);
-        // Every slot address is aligned to its class's buffer size.
-        assert_eq!(provided_pool.slab(0).slot_ptr(3).as_ptr() as usize % 16, 0);
-        assert_eq!(fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize % 32, 0);
-        assert_eq!(fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize % 32, 0);
-    }
-
-    #[test]
-    fn build_pools_aligns_every_slot_to_its_size() {
-        let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, provided_pool, fixed_pool) =
-            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[
-                SizeClass { size: 64, count: 2 },
-                SizeClass {
-                    size: 128,
-                    count: 2,
-                },
-            ]);
-        // The provided region is 4 x 16 = 64 bytes, not a multiple of the
-        // fixed classes' sizes: the fixed region must start padded to the
-        // largest size, or the 128-byte class would land 64 bytes off.
-        let base = slab.as_ptr() as usize;
-        assert_eq!(base % 128, 0, "slab base is aligned to the largest class");
-        for (class, slab) in provided_pool.classes().iter().zip(provided_pool.slabs()) {
-            for local in 0..class.count {
-                let addr = slab.slot_ptr(local).as_ptr() as usize;
-                assert_eq!(
-                    addr % class.size as usize,
-                    0,
-                    "provided slot {local} of size {} is misaligned",
-                    class.size
-                );
-            }
-        }
-        for (class, slab) in fixed_pool.classes().iter().zip(fixed_pool.slabs()) {
-            for local in 0..class.count {
-                let addr = slab.slot_ptr(local).as_ptr() as usize;
-                assert_eq!(
-                    addr % class.size.min(BUFFER_MAX_ALIGN) as usize,
-                    0,
-                    "fixed slot {local} of size {} is misaligned",
-                    class.size
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn build_pools_caps_alignment_at_one_page() {
-        let ring = io_uring::IoUring::new(8).unwrap();
-        let (slab, _layout, provided_pool, fixed_pool) =
-            build_pools(&ring, &[SizeClass { size: 16, count: 4 }], &[SizeClass {
-                size: 8192,
-                count: 2,
-            }]);
-        // The 16-byte provided region is 64 bytes; the fixed class must start
-        // padded to a page, and the 8 KiB slots are page-aligned — not aligned
-        // to their full size, since alignment never exceeds one page.
-        let base = slab.as_ptr() as usize;
-        assert_eq!(base % 4096, 0, "slab base is aligned to at most one page");
-        assert_eq!(
-            fixed_pool.slab(0).slot_ptr(0).as_ptr() as usize - base,
-            4096
-        );
-        assert_eq!(
-            fixed_pool.slab(0).slot_ptr(1).as_ptr() as usize - base,
-            12288
-        );
-        for local in 0..2 {
-            let addr = fixed_pool.slab(0).slot_ptr(local).as_ptr() as usize;
-            assert_eq!(addr % 4096, 0, "slot {local} is page-aligned");
-        }
-        // Small classes still get full alignment to their own size.
-        for local in 0..4 {
-            let addr = provided_pool.slab(0).slot_ptr(local).as_ptr() as usize;
-            assert_eq!(addr % 16, 0, "provided slot {local} is 16-byte aligned");
-        }
-    }
-
-    // ── Bytes (provided pool) ─────────────────────────────────────────
-
-    #[test]
-    fn provided_buffer_drop_recycles_slot() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let buf = data.provided_pool.select(0, local, 5);
-
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            1
-        );
-        drop(buf);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            0
-        );
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
-    }
-
-    #[test]
-    fn provided_buffer_stale_generation_skips_recycle() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        let local = 1u16;
-        data.provided_pool
-            .slab_mut(0)
-            .tracker_mut()
-            .take_shared(local as _);
-        // SAFETY: take_shared above registered a shared borrow on the slot,
-        // so 5 bytes stay within the class-0 slot size.
-        let buf: Slice<u8> = unsafe {
-            Slice::new(
-                Ref::new(pack_bid(true, 0, u32::from(local)), generation, 0),
-                5,
-            )
-        };
-
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-        drop(buf);
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-    }
-
-    #[test]
-    fn provided_buffer_into_vec_recycles_slot() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let buf = data.provided_pool.select(0, local, 5);
-
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-        let bytes = buf.into_vec();
-        assert_eq!(bytes.len(), 5);
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
-    }
-
-    #[test]
-    fn provided_bytes_into_mut_and_into_bytes_roundtrip() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let buf = data.provided_pool.select(0, local, 5);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            1
-        );
-
-        // Upgrade to an exclusive, writable view.
-        let mut buf = buf.into_mut();
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            -1
-        );
-        assert_eq!(buf.capacity(), 16);
-        buf.as_mut()[..5].copy_from_slice(b"hello");
-        buf.set_len(5);
-
-        // Downgrade back to a shared read buffer and read the data back.
-        let buf = buf.into_bytes();
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            1
-        );
-        assert_eq!(buf.as_ref(), b"hello");
-
-        drop(buf);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            0
-        );
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
-    }
-
-    #[test]
-    fn provided_bytesmut_split_at_recycles_after_both_halves_drop() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let buf = data.provided_pool.select(0, local, 5);
-        let buf = buf.into_mut();
-        let (head, tail) = buf.split_at(2).unwrap();
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            -2
-        );
-        drop(head);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            -1
-        );
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 4);
-        drop(tail);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            0
-        );
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
-    }
-
-    #[test]
-    fn provided_upgrade_panics_unless_sole_shared_holder() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let buf = data.provided_pool.select(0, local, 5);
-        data.provided_pool
-            .slab_mut(0)
-            .tracker_mut()
-            .clone_shared(local as _);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            2
-        );
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buf.into_mut()));
-        assert!(result.is_err());
-        // The failed upgrade left the borrows intact; the unwind dropped
-        // `buf`, releasing one of the two shared holders.
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            1
+            size_of::<IoSlot<(), L>>(),
+            24 + size_of::<L>(),
+            "IoSlot should be exactly 24 bytes of overhead plus L"
         );
     }
 
     #[test]
-    fn provided_select_mut_borrows_exclusive_and_recycles() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = 1u16;
-        let mut buf = data.provided_pool.select_mut(0, local, 5);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            -1
-        );
-        assert_eq!(buf.capacity(), 16);
-        assert_eq!(buf.len(), 5);
-        buf.as_mut()[..5].copy_from_slice(b"hello");
-
-        drop(buf);
-        assert_eq!(
-            data.provided_pool
-                .slab_mut(0)
-                .tracker_mut()
-                .borrows(local as _),
-            0
-        );
-        assert_eq!(data.provided_pool.slab(0).ring_tail(), 5);
-    }
-
-    #[test]
-    fn provided_select_double_selection_panics() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let buf = data.provided_pool.select(0, 1, 5);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            data.provided_pool.select(0, 1, 5);
-        }));
-        assert!(result.is_err());
-        drop(buf);
-        assert_eq!(data.provided_pool.slab_mut(0).tracker_mut().borrows(1), 0);
-    }
-
-    // ── BytesMut ─────────────────────────────────────────────────────
-
-    #[test]
-    fn buffer_bytes_drop_recycles_slot() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let buf = data.fixed_pool.acquire_bytes_mut(0).unwrap();
-
-        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
-        drop(buf);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), 4);
-    }
-
-    #[test]
-    fn buffer_bytes_stale_generation_skips_recycle() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let local = data.fixed_pool.slab_mut(0).acquire_slot().unwrap();
-        let generation = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        // SAFETY: the borrow is registered via acquire, but the generation is
-        // deliberately stale so drop leaks the slot instead of recycling it.
-        let buf: SliceMut<u8> =
-            unsafe { SliceMut::new(RefMut::new(pack_bid(false, 0, local), generation, 0), 16) };
-
-        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
-        drop(buf);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), 3);
-    }
-
-    #[test]
-    fn acquire_ref_shared_clone_and_drop() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let view: Ref<[u8; 16]> = data.fixed_pool.acquire_ref(0).unwrap();
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        let cloned = view.clone();
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 2);
-        drop(cloned);
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
-        drop(view);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn acquire_mut_exclusive_and_drop() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let view: RefMut<[u8; 16]> = data.fixed_pool.acquire_mut(0).unwrap();
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), -1);
-        drop(view);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn acquire_slices_cover_the_whole_slot() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let _ctx = data.context_for(index);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let bytes: Bytes = data.fixed_pool.acquire_bytes(0).unwrap();
-        assert_eq!(bytes.len(), 16);
-        drop(bytes);
-
-        let bytes_mut: BytesMut = data.fixed_pool.acquire_bytes_mut(0).unwrap();
-        assert_eq!(bytes_mut.len(), 16);
-        assert_eq!(bytes_mut.capacity(), 16);
-        drop(bytes_mut);
-
-        let slice: Slice<u32> = data.fixed_pool.acquire_slice(0).unwrap();
-        assert_eq!(slice.len(), 4);
-        drop(slice);
-
-        let slice_mut: SliceMut<u64> = data.fixed_pool.acquire_slice_mut(0).unwrap();
-        assert_eq!(slice_mut.len(), 2);
-        drop(slice_mut);
-
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn alloc_bytes_helper_returns_slot_capacity() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let buf = alloc_bytes(5).unwrap();
-        assert_eq!(buf.capacity(), 16);
-        assert_eq!(buf.len(), 16);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        drop(buf);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn alloc_bytes_as_mut_set_len_clear() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut buf = alloc_bytes(5).unwrap();
-        assert_eq!(buf.as_mut().len(), 16);
-        buf.as_mut()[..5].copy_from_slice(b"hello");
-        buf.set_len(5);
-        assert_eq!(buf.len(), 5);
-        assert_eq!(buf.as_ref(), b"hello");
-
-        buf.set_len(16);
-        assert_eq!(buf.len(), 16);
-
-        buf.clear();
-        assert_eq!(buf.len(), 0);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds capacity")]
-    fn alloc_bytes_set_len_above_capacity_panics() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut buf = alloc_bytes(5).unwrap();
-        buf.set_len(17);
-    }
-
-    // ── IoUserData ────────────────────────────────────────────────────
-
-    #[test]
-    fn io_user_data_u64_roundtrip() {
-        for raw in [0u64, 1, u64::MAX, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0] {
-            let ud: IoUserData = raw.into();
-            let back: u64 = ud.into();
-            assert_eq!(raw, back);
-        }
-    }
-
-    #[test]
-    fn io_user_data_struct_roundtrip() {
-        let ud = IoUserData {
-            index: 42,
-            io_slot: 7,
-        };
-        let raw: u64 = ud.into();
-        let back: IoUserData = raw.into();
-        assert_eq!(back.index, 42);
-        assert_eq!(back.io_slot, 7);
-    }
-
-    // ── Runtime::has_io_in_flight ────────────────────────────────────
-
-    #[test]
-    fn has_io_in_flight_empty_slab() {
-        let data = test_runtime_data(64);
-        assert!(!data.has_io_in_flight());
-    }
-
-    #[test]
-    fn has_io_in_flight_true_while_submitted_not_ready() {
-        let mut data = test_runtime_data(64);
-        data.alloc_io_slot();
-        assert!(data.has_io_in_flight());
-    }
-
-    #[test]
-    fn has_io_in_flight_false_when_ready() {
-        let mut data = test_runtime_data(64);
-        let slot = data.alloc_io_slot();
-        data.io_slab[slot as usize].ready = 1;
-        assert!(!data.has_io_in_flight());
-    }
-
-    #[test]
-    fn has_io_in_flight_false_after_free() {
-        let mut data = test_runtime_data(64);
-        let slot = data.alloc_io_slot();
-        data.free_io_slot(slot);
-        assert!(!data.has_io_in_flight());
-    }
-
-    // ── await_cqe ─────────────────────────────────────────────────────
-
-    #[test]
-    fn await_cqe_immediate_ready() {
-        let mut data = test_runtime_data(64);
-        let slot = data.alloc_io_slot();
-        data.io_slab[slot as usize].result = 42;
-        data.io_slab[slot as usize].ready = 1;
-
-        let index = data
-            .tasks
-            .insert(Task::new(), |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let fut = await_cqe(ctx, slot);
-        let mut fut = pin!(fut);
-        let mut cx = Context::from_waker(Waker::noop());
-
-        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(42));
-    }
-
-    #[test]
-    fn await_cqe_delayed_ready() {
-        let mut data = test_runtime_data(64);
-        let slot = data.alloc_io_slot();
-        // NOT setting ready yet
-
-        let index = data
-            .tasks
-            .insert(Task::new(), |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let fut = await_cqe(ctx, slot);
-        let mut fut = pin!(fut);
-        let mut cx = Context::from_waker(Waker::noop());
-
-        // First poll: not ready → Yield's first poll → Pending
-        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Pending);
-
-        // Now set ready externally
-        data.io_slab[slot as usize].result = 99;
-        data.io_slab[slot as usize].ready = 1;
-
-        // Second poll: Yield's second poll → Ready, loop sees ready → Ready(99)
-        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(99));
-    }
-
-    // ── Yield ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn yield_first_poll_returns_pending() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-        let mut y = yield_now(ctx);
-        let mut y = pin!(&mut y);
-        let mut cx = Context::from_waker(Waker::noop());
-
-        assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
-        assert!(y.polled);
-    }
-
-    #[test]
-    fn yield_second_poll_returns_ready() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-        let mut y = yield_now(ctx);
-        let mut y = pin!(&mut y);
-        let mut cx = Context::from_waker(Waker::noop());
-
-        assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
-        assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
-    }
-
-    #[test]
-    fn yield_calls_wake_on_first_poll() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-        let mut y = yield_now(ctx);
-        let mut y = pin!(&mut y);
-        let mut cx = Context::from_waker(Waker::noop());
-
-        let _ = y.as_mut().poll(&mut cx);
-        // wake should have pushed index into wakeups
-        assert_eq!(data.wakeups, vec![index]);
-    }
-
-    // ── TaskContext ───────────────────────────────────────────────────
-
-    #[test]
-    fn task_context_with_task_reads_correct_task() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let ready = ctx.with_task(|t| t.ready);
-        assert!(!ready);
-    }
-
-    #[test]
-    fn task_context_with_task_modifies() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        ctx.with_task(|t| t.ready = true);
-        assert!(data.tasks.task(index).ready);
-    }
-
-    #[test]
-    fn task_context_with_runtime_reads_buffer_pool() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let bgid = ctx.with_runtime(|r| r.provided_pool.slab(0).bgid());
-        assert_eq!(bgid, 0);
-    }
-
-    #[test]
-    fn task_context_with_runtime_after_removal_panics() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let _ = data.tasks.remove::<Ready<()>, ()>(index);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.with_runtime(|_r| ());
-        }));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn task_context_wake_pushes_index() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        ctx.wake();
-        ctx.wake();
-        assert_eq!(data.wakeups, vec![index, index]);
-    }
-
-    #[test]
-    fn task_context_after_removal_panics() {
-        let task = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let _ = data.tasks.remove::<Ready<()>, ()>(index);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.with_task(|_t| ());
-        }));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn task_context_after_slot_reuse_panics_without_touching_new_task() {
-        let task_a = Task::new();
-        let mut data = test_runtime_data(64);
-        let index = data
-            .tasks
-            .insert(task_a, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx = data.context_for(index);
-
-        let _ = data.tasks.remove::<Ready<()>, ()>(index);
-
-        let mut task_b = Task::new();
-        task_b.ready = true;
-        let index = data
-            .tasks
-            .insert(task_b, |_| core::future::ready(()))
-            .expect("slot should be free");
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.with_task(|t| t.ready = false);
-        }));
-
-        assert!(result.is_err());
-        assert!(data.tasks.task(index).ready);
-    }
-
-    #[test]
-    fn task_context_of_live_task_usable_alongside_other_tasks() {
-        let task_a = Task::new();
-        let mut data = test_runtime_data(64);
-        let index_a = data
-            .tasks
-            .insert(task_a, |_| core::future::ready(()))
-            .unwrap();
-
-        let mut task_b = Task::new();
-        task_b.ready = true;
-        let index_b = data
-            .tasks
-            .insert(task_b, |_| core::future::ready(()))
-            .unwrap();
-
-        let _gen = enter_active_gen();
-        let ctx_a = data.context_for(index_a);
-        let _ctx_b = data.context_for(index_b);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx_a.with_task(|t| t.ready = true);
-        }));
-
-        assert!(result.is_ok());
-        assert!(data.tasks.task(index_a).ready);
-    }
-
-    // ── Ref ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn alloc_drop_recycles_slot() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let alloc = alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        drop(alloc);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn alloc_cast_preserves_slot() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        // Casting strips the outer `MaybeUninit` but names the same slot.
-        let orig = alloc::<[u8; 16]>().unwrap();
-        let orig_ptr = orig.as_ptr();
-        let before = data.fixed_pool.slab(0).free_count();
-        let casted: Ref<[u8; 16]> = unsafe { orig.cast() };
-        assert_eq!(orig_ptr.cast::<u8>(), casted.as_ptr().cast::<u8>());
-
-        // The cast transfers the slot: it must not recycle it (which would
-        // hand the same slot out twice on the next alloc).
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-
-        // The slot still recycles on drop after the cast, exactly once.
-        drop(casted);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before + 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "zero-sized")]
-    fn alloc_zst_panics() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let _ = alloc::<()>();
-    }
-
-    #[test]
-    fn alloc_stale_generation_leaks_on_drop() {
-        let mut data = test_runtime_data(64);
-        let gen_guard = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let alloc = alloc::<[u8; 8]>().unwrap();
-        let before = data.fixed_pool.slab(0).free_count();
-        // The runtime shuts down: the drop must leak, not recycle.
-        drop(gen_guard);
-        drop(alloc);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    #[should_panic(expected = "outside the runtime")]
-    fn alloc_as_ptr_stale_generation_panics() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let stale = NonZeroU32::new(_gen.get().get() + 1).unwrap();
-        // SAFETY: a deliberately fabricated view over a never-borrowed slot
-        // with a stale generation: resolve panics before touching memory and
-        // drop would leak the slot rather than corrupt the slab.
-        let alloc: Ref<MaybeUninit<[u8; 16]>> =
-            unsafe { Ref::new(pack_bid(false, 0, 0), stale, 0) };
-        let _ = alloc.as_ptr();
-    }
-
-    #[test]
-    fn ref_clone_adds_and_drops_shared_borrows() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let alloc = alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
-        let clone = alloc.clone();
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 2);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        drop(alloc);
-        // One borrower left: the slot is still held by the clone.
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before - 1);
-        drop(clone);
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 0);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    #[test]
-    fn ref_upgrade_and_downgrade_sole_holder() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let before = data.fixed_pool.slab(0).free_count();
-        let alloc = alloc::<[u8; 8]>().unwrap();
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
-        let exclusive = alloc.into_mut();
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), -1);
-        let shared: Ref<[u8; 8]> = unsafe { exclusive.into_ref().cast() };
-        assert_eq!(data.fixed_pool.slab_mut(0).tracker_mut().borrows(0), 1);
-        drop(shared);
-        assert_eq!(data.fixed_pool.slab(0).free_count(), before);
-    }
-
-    // ── Msg / MsgMut ─────────────────────────────────────────────────
-
-    #[test]
-    fn msg_new_wires_iov_and_ctrl_to_pooled_memory() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        // A Msg always allocates the mandatory msghdr plus the full iov array
-        // and control buffer, all in pooled memory, starting empty.
-        let mut slot = Msg::new().unwrap();
-        {
-            let msg = slot.msg();
-            assert_eq!(msg.msg_iovlen, 0);
-            assert_eq!(msg.msg_controllen, 0);
-            assert!(!msg.msg_iov.is_null());
-            assert!(!msg.msg_control.is_null());
-        }
-        assert!(slot.iov(0).is_none());
-        assert!(slot.ctrl().unwrap().is_empty());
-    }
-
-    #[test]
-    fn msg_drop_recycles_all_slots() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        // The msghdr (56 B) lands in class 1 (64), the ctrl array
-        // (MAX_CTRL_CAP) in class 2 (2048) and the iov array (MAX_IOV_CAP *
-        // 16) in class 3 (16384).
-        let (free1, free2, free3) = (
-            data.fixed_pool.slab(1).free_count(),
-            data.fixed_pool.slab(2).free_count(),
-            data.fixed_pool.slab(3).free_count(),
-        );
-        let slot = Msg::new().unwrap();
-        assert_eq!(data.fixed_pool.slab(1).free_count(), free1 - 1);
-        assert_eq!(data.fixed_pool.slab(2).free_count(), free2 - 1);
-        assert_eq!(data.fixed_pool.slab(3).free_count(), free3 - 1);
-        drop(slot);
-        assert_eq!(data.fixed_pool.slab(1).free_count(), free1);
-        assert_eq!(data.fixed_pool.slab(2).free_count(), free2);
-        assert_eq!(data.fixed_pool.slab(3).free_count(), free3);
-    }
-
-    #[test]
-    fn msg_slot_wires_iov_to_pooled_memory() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut slot = Msg::new().unwrap();
-        let msg_iov = {
-            let msg = slot.msg();
-            assert_eq!(msg.msg_iovlen, 0);
-            assert_eq!(msg.msg_controllen, 0);
-            msg.msg_iov as *mut libc::iovec
-        };
-        // Nothing pushed yet: the accessor exposes no entries.
-        assert!(slot.iov(0).is_none());
-        assert!(!msg_iov.is_null());
-        // Pushes land in the pooled array and advance msg_iovlen.
-        assert!(slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 5,
-        }));
-        assert!(slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 6,
-        }));
-        assert_eq!(msg_iov, slot.iov(0).unwrap() as *mut libc::iovec);
-        assert_eq!(slot.msg().msg_iovlen, 2);
-        assert!(slot.iov(1).is_some());
-        assert!(slot.iov(2).is_none());
-        // Writes through the accessor land in the pooled memory.
-        slot.iov(0).unwrap().iov_len = 7;
-        assert_eq!(unsafe { (*msg_iov).iov_len }, 7);
-    }
-
-    #[test]
-    fn msg_slot_push_iov_rejects_past_capacity() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut slot = Msg::new().unwrap();
-        for _ in 0..MAX_IOV_CAP {
-            assert!(slot.push_iov(libc::iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 1,
-            }));
-        }
-        assert!(!slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 2,
-        }));
-        assert_eq!(slot.msg().msg_iovlen, MAX_IOV_CAP);
-    }
-
-    #[test]
-    fn msg_slot_wires_ctrl_to_pooled_memory() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut slot = Msg::new().unwrap();
-        let msg_control = {
-            let msg = slot.msg();
-            assert_eq!(msg.msg_controllen, 0);
-            msg.msg_control as *mut u8
-        };
-        assert_eq!(msg_control, slot.ctrl().unwrap().as_mut_ptr());
-        // push_cmsg wires msg_controllen to CMSG_SPACE of the pushed payload.
-        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[0u8; 4]));
-        assert_eq!(slot.msg().msg_controllen, cmsg_space(4));
-        assert!(slot.msg().msg_control as usize != 0);
-    }
-
-    #[test]
-    fn msg_slot_push_cmsg_accumulates_and_overflows() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut slot = Msg::new().unwrap();
-        let payload = [1u8, 2, 3, 4];
-        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &payload));
-        // The cmsg bytes land at the start of the pooled control buffer.
-        let ctrl = slot.ctrl().unwrap();
-        let hdr = ctrl.as_ptr() as *const libc::cmsghdr;
-        unsafe {
-            assert_eq!((*hdr).cmsg_level, libc::SOL_SOCKET);
-            assert_eq!((*hdr).cmsg_type, libc::SCM_RIGHTS);
-            assert_eq!((*hdr).cmsg_len, size_of::<libc::cmsghdr>() + payload.len());
-        }
-        // A second cmsg of the same size fits and accumulates its space.
-        assert!(slot.push_cmsg(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &payload));
-        assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
-        assert_eq!(slot.ctrl().unwrap().len(), 2 * cmsg_space(4));
-        // A cmsg that would exceed MAX_CTRL_CAP is rejected, lengths unchanged.
-        let huge = vec![0u8; MAX_CTRL_CAP];
-        assert!(!slot.push_cmsg(1, 2, &huge));
-        assert_eq!(slot.msg().msg_controllen, 2 * cmsg_space(4));
-    }
-
-    #[test]
-    fn msg_caps_and_sizes_are_kernel_maxima() {
-        // The caps are the kernel's limits: UIO_MAXIOV (1024 iovecs) and
-        // CMSG_SPACE of SCM_MAX_FD (253 fds).
-        assert_eq!(MAX_IOV_CAP, 1024);
-        assert_eq!(MAX_CTRL_CAP, cmsg_space(253 * size_of::<libc::c_int>()));
-        assert_eq!(size_of::<Msg>(), 36);
-        assert_eq!(size_of::<MsgMut>(), 36);
-    }
-
-    #[test]
-    fn msgmut_take_iov_copies_and_resets() {
-        let mut data = test_runtime_data(64);
-        let _gen = enter_active_gen();
-        set_current_runtime(&mut data);
-
-        let mut slot = MsgMut::new().unwrap();
-        assert!(slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 3,
-        }));
-        assert!(slot.push_iov(libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 4,
-        }));
-        let iovs = slot.take_iov();
-        assert_eq!(iovs.len(), 2);
-        assert_eq!(iovs[0].iov_len, 3);
-        assert_eq!(iovs[1].iov_len, 4);
-        // The pooled array is reset, so nothing remains to offer the kernel.
-        assert_eq!(slot.msg().msg_iovlen, 0);
-        assert!(slot.iov(0).is_none());
+    fn op_class_rides_in_padding() {
+        // slot(4) + class(1) + 3 padding + id(8) = 16, class is free.
+        assert_eq!(size_of::<Op>(), 16);
     }
 }

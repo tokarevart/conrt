@@ -1,55 +1,39 @@
-//! Async io operations driven by the runtime.
+//! Callback io operations driven by the runtime.
 //!
-//! Each function submits a single `io_uring` operation for the caller's task
-//! and awaits its completion. While an op is in flight it occupies a slot in
-//! the runtime's io slab, which is recycled once the CQE is consumed.
+//! Each function submits a single `io_uring` operation, moving the caller's
+//! per-op local state `L` into the op. When the op completes, the runtime
+//! hands that `L` back to a monomorphized shim together with the raw CQE; the
+//! shim decodes the result and invokes the caller's `done` callback.
 
-use core::future::Future;
 use core::mem::MaybeUninit;
-use core::pin::Pin;
-use core::task::Context;
-use core::task::Poll;
 use std::io;
 use std::os::fd::RawFd;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
-use crate::buf::alloc_bytes;
 use crate::buf::alloc_mut;
 use crate::buf::provided_bytes;
-use crate::task::TaskContext;
+use crate::runtime::Op;
+use crate::runtime::Runtime;
 
-/// Submits `entry` for the caller's task and awaits its CQE result, releasing
-/// the io slot on failure. On success the slot is still allocated (so the
-/// caller can read per-op metadata like a read's selected buffer) and must be
-/// released with [`release_io`].
-async fn submit_and_await(
-    ctx: TaskContext,
-    entry: io_uring::squeue::Entry,
-) -> io::Result<(u32, i32)> {
-    let slot = ctx.with_runtime(|r| r.alloc_io_slot());
-    ctx.with_task(|task| task.io.push(slot));
-
-    if let Err(e) = ctx.push_io(entry, slot) {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(e);
+/// Pushes a prepared SQE, returning the op handle on success. On failure the
+/// op slot is released.
+fn push<G, L>(rt: &mut Runtime<G, L>, op: Op, entry: io_uring::squeue::Entry) -> io::Result<Op> {
+    let entry = entry.user_data(Runtime::<G, L>::op_user_data(op.slot, op.class));
+    let mut sq = rt.ring_mut().submission();
+    let pushed = unsafe { sq.push(&entry) };
+    drop(sq);
+    match pushed {
+        Ok(()) => Ok(op),
+        Err(_) => {
+            rt.free_op_slot(op.slot);
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        }
     }
-
-    let result = await_cqe(ctx, slot).await;
-    if result < 0 {
-        ctx.with_runtime(|r| r.free_io_slot(slot));
-        ctx.with_task(|task| task.io.remove_value(slot));
-        return Err(io::Error::from_raw_os_error(-result));
-    }
-    Ok((slot, result))
 }
 
-/// Returns an io slot allocated by [`submit_and_await`] to the runtime's free
-/// list and unlinks it from the task's in-flight set.
-fn release_io(ctx: TaskContext, slot: u32) {
-    ctx.with_runtime(|r| r.free_io_slot(slot));
-    ctx.with_task(|task| task.io.remove_value(slot));
+fn errno(result: i32) -> Option<io::Error> {
+    (result < 0).then(|| io::Error::from_raw_os_error(-result))
 }
 
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
@@ -57,16 +41,40 @@ fn release_io(ctx: TaskContext, slot: u32) {
 /// size class whose slot size is at least `max_len`; `max_len` larger than
 /// the largest class's slot size fails with `EFBIG`.
 ///
-/// The returned [`Bytes`] borrows the selected slot from its slab: the slot is
-/// recycled back to the ring when the last view is dropped, so the runtime
-/// must still be alive while the buffer is in use.
-pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Bytes> {
-    let class = ctx.with_runtime(|r| -> io::Result<u8> {
-        r.provided_pool
-            .class_for(max_len)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))
-    })?;
+/// `done` receives the caller's `local` back along with the selected [`Bytes`]
+/// (borrowed from the pool; recycled when the last view drops).
+pub fn read<G, L>(
+    rt: &mut Runtime<G, L>,
+    fd: RawFd,
+    max_len: usize,
+    local: L,
+    done: fn(&mut Runtime<G, L>, L, io::Result<Bytes>),
+) -> io::Result<Op> {
+    fn shim<G, L>(
+        rt: &mut Runtime<G, L>,
+        local: L,
+        result: i32,
+        flags: u32,
+        done: *const (),
+        class: u8,
+    ) {
+        let done: fn(&mut Runtime<G, L>, L, io::Result<Bytes>) =
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        let out = match errno(result) {
+            Some(e) => Err(e),
+            None => match io_uring::cqueue::buffer_select(flags) {
+                Some(local_buf) => Ok(provided_bytes(class, local_buf, result as u32)),
+                None => Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+            },
+        };
+        done(rt, local, out);
+    }
 
+    let class = rt
+        .pools
+        .provided_pool
+        .class_for(max_len)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
     let entry = io_uring::opcode::Read::new(
         io_uring::types::Fd(fd),
         std::ptr::null_mut(),
@@ -75,111 +83,88 @@ pub async fn read(ctx: TaskContext, fd: RawFd, max_len: usize) -> io::Result<Byt
     .buf_group(u16::from(class))
     .build()
     .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-
-    let (slot, result) = submit_and_await(ctx, entry).await?;
-
-    let local = ctx.with_runtime(|r| {
-        let slot_ref = &r.io_slab[slot as usize];
-        let local = slot_ref.bid;
-        r.free_io_slot(slot);
-        local
-    });
-    ctx.with_task(|task| task.io.remove_value(slot));
-
-    // The kernel handed `local` to the just-completed BUFFER_SELECT read
-    // above, and `result` is the number of bytes it produced, which fits in
-    // the class's slot size.
-    Ok(provided_bytes(class, local, result as u32))
+    let op = rt.register_op(shim::<G, L>, done as *const (), local, class);
+    push(rt, op, entry)
 }
 
-/// Reads exactly `len` bytes from `fd` into a freshly allocated
-/// [`BytesMut`](crate::buf::BytesMut), looping over short [`read`]s and
-/// chunking at 4096 bytes so large reads use the smaller, more plentiful
-/// provided size classes instead of draining the few 64 KiB slots. The
-/// accumulated bytes are returned as a shared [`Bytes`] of exactly `len`
-/// bytes.
+/// Writes `len` bytes from `addr` to `fd` via `IORING_OP_WRITE_FIXED`.
 ///
-/// Returns [`io::ErrorKind::UnexpectedEof`] if `fd` reaches end of file before
-/// `len` bytes were read; the partially accumulated buffer is dropped and its
-/// slot recycled.
-pub async fn read_exact(ctx: TaskContext, fd: RawFd, len: usize) -> io::Result<Bytes> {
-    let mut buf = alloc_bytes(len)?;
-    buf.clear();
-
-    while buf.len() < len {
-        let start = buf.len();
-        let chunk = (len - start).min(4096);
-        let bytes = read(ctx, fd, chunk).await?;
-        if bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "read_exact: unexpected end of file",
-            ));
-        }
-        let n = bytes.len();
-        buf.set_len((start + n) as u32);
-        buf.as_mut()[start..start + n].copy_from_slice(&bytes);
+/// `addr` must point into the runtime's registered fixed-buffer region (obtain
+/// it from a [`Bytes`](crate::buf::Bytes) created by
+/// [`alloc_bytes`](crate::alloc_bytes)), since `WRITE_FIXED` addresses that
+/// region by absolute offset. The caller must keep the buffer alive — e.g. by
+/// holding its `Bytes` inside `local` — until `done` runs; coio does not own
+/// it. A partial write is reported as the byte count; loop (re-arming `write`
+/// with the unwritten tail) to write everything.
+pub fn write<G, L>(
+    rt: &mut Runtime<G, L>,
+    fd: RawFd,
+    addr: *const u8,
+    len: usize,
+    local: L,
+    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+) -> io::Result<Op> {
+    fn shim<G, L>(
+        rt: &mut Runtime<G, L>,
+        local: L,
+        result: i32,
+        _flags: u32,
+        done: *const (),
+        _state: u8,
+    ) {
+        let out = match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result as usize),
+        };
+        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        done(rt, local, out);
     }
-
-    Ok(buf.into_bytes())
-}
-
-/// Writes the contents of `buf` to `fd` via `IORING_OP_WRITE_FIXED`. The
-/// buffer's slot is held (its borrow not released) until the kernel finishes
-/// with it; `buf` is consumed and its slot recycled when it drops.
-pub async fn write(ctx: TaskContext, fd: RawFd, buf: Bytes) -> io::Result<usize> {
-    let len = buf.len();
-    let addr = buf.as_ptr();
 
     let entry = io_uring::opcode::WriteFixed::new(
         io_uring::types::Fd(fd),
-        addr.as_ptr(),
+        addr.cast_mut().cast(),
         len as u32,
         0, // the whole slab is registered as fixed buffer index 0
     )
     .build();
-
-    let (slot, result) = submit_and_await(ctx, entry).await?;
-    release_io(ctx, slot);
-    Ok(result as usize)
+    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
+    push(rt, op, entry)
 }
 
-/// Writes all of `buf` to `fd`, looping over short [`write()`]s. Each iteration
-/// hands the kernel a `Bytes::sub` view over the unwritten tail, so a partial
-/// write only ever resubmits the bytes that remain. `buf` is consumed and its
-/// slot recycled once every byte is written.
-///
-/// Returns [`io::ErrorKind::WriteZero`] if a nonempty write reports zero bytes
-/// written, which would otherwise loop forever.
-pub async fn write_all(ctx: TaskContext, fd: RawFd, buf: Bytes) -> io::Result<()> {
-    let total = buf.len();
-    let mut off = 0;
-    while off < total {
-        let view = buf.sub(off, total).expect("write_all: sub-slice in bounds");
-        let n = write(ctx, fd, view).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write_all: wrote zero bytes",
-            ));
-        }
-        off += n;
+/// Accepts a connection on `listener_fd`, yielding the new socket's fd to
+/// `done`.
+pub fn accept<G, L>(
+    rt: &mut Runtime<G, L>,
+    listener_fd: RawFd,
+    local: L,
+    done: fn(&mut Runtime<G, L>, L, io::Result<RawFd>),
+) -> io::Result<Op> {
+    fn shim<G, L>(
+        rt: &mut Runtime<G, L>,
+        local: L,
+        result: i32,
+        _flags: u32,
+        done: *const (),
+        _state: u8,
+    ) {
+        let out = match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result),
+        };
+        let done: fn(&mut Runtime<G, L>, L, io::Result<RawFd>) =
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        done(rt, local, out);
     }
-    Ok(())
-}
 
-/// Accepts a connection on `listener_fd`, returning the new socket's fd.
-pub async fn accept(ctx: TaskContext, listener_fd: RawFd) -> io::Result<RawFd> {
     let entry = io_uring::opcode::Accept::new(
         io_uring::types::Fd(listener_fd),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
     )
     .build();
-
-    let (slot, result) = submit_and_await(ctx, entry).await?;
-    release_io(ctx, slot);
-    Ok(result)
+    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
+    push(rt, op, entry)
 }
 
 /// The maximum number of `iovec`s the kernel accepts for one message: Linux
@@ -351,7 +336,7 @@ impl Msg {
     }
 
     /// The address of the wired `msghdr`, used to build the submission entry.
-    pub(crate) fn msg_ptr(&self) -> *mut libc::msghdr {
+    pub fn msg_ptr(&self) -> *mut libc::msghdr {
         self.msg.as_ptr().as_ptr()
     }
 }
@@ -468,7 +453,7 @@ impl MsgMut {
     }
 
     /// The address of the wired `msghdr`, used to build the submission entry.
-    pub(crate) fn msg_ptr(&self) -> *mut libc::msghdr {
+    pub fn msg_ptr(&self) -> *mut libc::msghdr {
         self.msg.as_ptr().as_ptr()
     }
 }
@@ -480,122 +465,87 @@ pub(crate) const fn cmsg_space(payload: usize) -> usize {
     (len + size_of::<libc::cmsghdr>() - 1) & !(size_of::<libc::cmsghdr>() - 1)
 }
 
-/// Receives a message into `slot` via `IORING_OP_RECVMSG`. `flags` is passed
-/// to the kernel as-is, so `MSG_PEEK | MSG_TRUNC` (used by the peek phase of a
-/// two-phase datagram receive) is supported. Returns the number of bytes
-/// received; peer credentials and passed fds are read from `slot` after the
-/// future resolves. The `iovec`s' `iov_base` data buffers are the caller's to
-/// keep alive for the duration of the await.
+/// Receives a message into `slot` via `IORING_OP_RECVMSG`, yielding the
+/// number of bytes received to `done`. `flags` is passed to the kernel as-is,
+/// so `MSG_PEEK | MSG_TRUNC` (the peek phase of a two-phase datagram receive)
+/// is supported. Peer credentials and passed fds are read from `slot` (owned
+/// by `local`) once `done` runs.
 ///
-/// Exactly the `iovec`s pushed with [`MsgMut::push_iov`] are offered to the
-/// kernel, and the full control capacity [`MAX_CTRL_CAP`] is wired into
-/// `msg_controllen` just before submission; on completion the kernel clamps it
-/// to what actually arrived, so [`MsgMut::ctrl`] only exposes received bytes.
-pub async fn recvmsg(
-    ctx: TaskContext,
+/// `msg` is the wired `msghdr` pointer (from `MsgMut`); it must stay valid
+/// (i.e. the owning `MsgMut` kept alive in `local`) until `done` runs.
+///
+/// # Safety
+///
+/// `msg` must point at a valid, wired `msghdr` (from a [`MsgMut`]) that stays
+/// alive until `done` runs.
+pub unsafe fn recvmsg<G, L>(
+    rt: &mut Runtime<G, L>,
     fd: RawFd,
-    slot: &mut MsgMut,
+    msg: *mut libc::msghdr,
     flags: u32,
-) -> io::Result<usize> {
-    unsafe {
-        (*slot.msg_ptr()).msg_controllen = MAX_CTRL_CAP;
+    local: L,
+    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+) -> io::Result<Op> {
+    fn shim<G, L>(
+        rt: &mut Runtime<G, L>,
+        local: L,
+        result: i32,
+        _flags: u32,
+        done: *const (),
+        _state: u8,
+    ) {
+        let out = match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result as usize),
+        };
+        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        done(rt, local, out);
     }
-    let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), slot.msg_ptr())
+
+    unsafe {
+        (*msg).msg_controllen = MAX_CTRL_CAP;
+    }
+    let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), msg)
         .flags(flags)
         .build();
-
-    let (slot_id, result) = submit_and_await(ctx, entry).await?;
-    release_io(ctx, slot_id);
-    Ok(result as usize)
+    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
+    push(rt, op, entry)
 }
 
 /// Sends the message in `slot` via `IORING_OP_SENDMSG`, typically carrying a
-/// passed fd in an `SCM_RIGHTS` cmsg. Returns the number of bytes sent. The
-/// `iovec`s' `iov_base` data buffers are the caller's to keep alive for the
-/// duration of the await.
+/// passed fd in an `SCM_RIGHTS` cmsg, yielding the number of bytes sent to
+/// `done`. `msg` is the wired `msghdr` pointer (from `Msg`), which must stay
+/// valid (owning `Msg` kept alive in `local`) until `done` runs.
 ///
 /// What is sent is everything currently in the slot, i.e. the `iovec`s and
 /// `cmsg`s pushed with
 /// [`Msg::push_iov`]/[`Msg::push_cmsg`]/[`Msg::push_scm_rights`].
-pub async fn sendmsg(ctx: TaskContext, fd: RawFd, slot: &mut Msg) -> io::Result<usize> {
-    let entry = io_uring::opcode::SendMsg::new(io_uring::types::Fd(fd), slot.msg_ptr()).build();
-
-    let (slot_id, result) = submit_and_await(ctx, entry).await?;
-    release_io(ctx, slot_id);
-    Ok(result as usize)
-}
-
-/// Waits until the op occupying `slot` has completed, then returns its result.
-/// Used internally by the io futures; exposed so the runtime's tests can drive
-/// an in-flight op directly.
-pub(crate) async fn await_cqe(ctx: TaskContext, slot: u32) -> i32 {
-    loop {
-        let result = ctx.with_runtime(|r| {
-            let slot_ref = &r.io_slab[slot as usize];
-            if slot_ref.ready != 0 {
-                Some(slot_ref.result)
-            } else {
-                None
-            }
-        });
-        if let Some(result) = result {
-            return result;
-        }
-        yield_now_nowake().await;
+pub fn sendmsg<G, L>(
+    rt: &mut Runtime<G, L>,
+    fd: RawFd,
+    msg: *mut libc::msghdr,
+    local: L,
+    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+) -> io::Result<Op> {
+    fn shim<G, L>(
+        rt: &mut Runtime<G, L>,
+        local: L,
+        result: i32,
+        _flags: u32,
+        done: *const (),
+        _state: u8,
+    ) {
+        let out = match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result as usize),
+        };
+        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        done(rt, local, out);
     }
-}
 
-/// Yields the current task back to the runtime loop without waking it: the
-/// first poll returns `Pending` without re-enqueuing the task, the next poll
-/// returns `Ready`. Used internally by [`await_cqe`] so a task parked on an
-/// in-flight op is only re-polled by an actual completion (via
-/// [`crate::runtime::Runtime::drain_cqes`]) or an explicit wake, instead of
-/// keeping itself enqueued and starving the runtime loop's blocking wait.
-pub(crate) fn yield_now_nowake() -> YieldNoWake {
-    YieldNoWake { polled: false }
-}
-
-/// The future returned by [`yield_now_nowake`].
-pub(crate) struct YieldNoWake {
-    pub(crate) polled: bool,
-}
-
-impl Future for YieldNoWake {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if self.polled {
-            Poll::Ready(())
-        } else {
-            self.polled = true;
-            Poll::Pending
-        }
-    }
-}
-
-/// Yields the current task back to the runtime loop: the first poll wakes the
-/// task (re-enqueueing it) and returns `Pending`; the next poll returns
-/// `Ready`.
-pub fn yield_now(ctx: TaskContext) -> Yield {
-    Yield { ctx, polled: false }
-}
-
-/// The future returned by [`yield_now`].
-pub struct Yield {
-    ctx: TaskContext,
-    pub(crate) polled: bool,
-}
-
-impl Future for Yield {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if self.polled {
-            Poll::Ready(())
-        } else {
-            self.polled = true;
-            self.ctx.wake();
-            Poll::Pending
-        }
-    }
+    let entry = io_uring::opcode::SendMsg::new(io_uring::types::Fd(fd), msg).build();
+    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
+    push(rt, op, entry)
 }
