@@ -300,6 +300,11 @@ fn on_probe(rt: &mut Runtime<G, DropProbe>, _local: DropProbe, _res: std::io::Re
     rt.global().push("probe done");
 }
 
+/// Same, for the batched-drain global.
+fn on_probe_b(rt: &mut Runtime<B, DropProbe>, _local: DropProbe, _res: std::io::Result<Bytes>) {
+    rt.global().push("probe done");
+}
+
 #[test]
 fn panic_with_an_op_in_flight_drops_every_local_exactly_once() {
     DROPS.with(|d| *d.borrow_mut() = 0);
@@ -456,5 +461,45 @@ fn dispatch_from_inside_drain_keeps_draining() {
         g.lines().iter().all(|l| l.ends_with("=8")),
         "every read should return 8 bytes: {:?}",
         g.lines()
+    );
+}
+
+#[test]
+fn op_local_is_dropped_when_the_submission_queue_is_full() {
+    DROPS.with(|d| *d.borrow_mut() = 0);
+
+    // One ring entry, so the second dispatch cannot get an SQE into the
+    // submission queue and `push` must free the slot it just claimed. That
+    // slot still holds the local, so this is the path where a `ManuallyDrop`
+    // would silently leak it.
+    let params = RuntimeParams {
+        ops_capacity: 4,
+        ring_entries: 1,
+        ..params()
+    };
+
+    let mut f = tmpfile();
+    {
+        use std::io::Write;
+        f.write_all(b"data").unwrap();
+    }
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+
+    let g = block_on(params, B::default(), |rt| {
+        read(rt, fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b).unwrap();
+        // This one cannot be pushed: the SQ is full.
+        let _ = read(rt, fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b);
+    });
+
+    assert!(
+        g.lines().iter().all(|l| l == "probe done"),
+        "the first read should still complete: {:?}",
+        g.lines()
+    );
+    assert_eq!(
+        DROPS.with(|d| *d.borrow()),
+        2,
+        "both locals must be dropped: one by its completion, one when the undispatchable op's \
+         slot is freed"
     );
 }
