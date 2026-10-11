@@ -564,22 +564,32 @@ impl<G, L> Runtime<G, L> {
     }
 
     fn drain_cqes(&mut self) {
-        // Collect first: a shim may dispatch or cancel, pushing to the
-        // submission queue, which would conflict with holding the completion
-        // iterator.
-        let mut cqes = Vec::new();
-        {
-            for cqe in self.ring_mut().completion() {
-                let ud = UserData::from(cqe.user_data());
-                cqes.push((ud, cqe.result(), cqe.flags()));
-            }
-        }
-        for (ud, result, flags) in cqes {
+        // One completion at a time, with no buffering.
+        //
+        // `IoUring::completion()` returns a guard that mutably borrows the ring
+        // for its whole lifetime, and dropping it publishes the consumed `head`
+        // back to shared memory. A shim dispatched from here needs `&mut self`
+        // again (to push to the submission queue, or to cancel), so the guard
+        // must not outlive the pop. Borrowing, popping one entry and dropping
+        // per completion costs three relaxed/acquire/release accesses and
+        // nothing else — no allocation, no copy — and each entry is still
+        // consumed exactly once, since `head` is published before the next
+        // borrow. Re-reading `tail` each time also picks up completions that
+        // land mid-drain.
+        //
+        // The loop terminates because dispatch only pushes to the submission
+        // queue: nothing reaches the kernel until `drive` submits, so the set
+        // of completions arriving here is finite.
+        while let Some(cqe) = {
+            let mut cq = self.ring_mut().completion();
+            cq.next()
+        } {
+            let ud = UserData::from(cqe.user_data());
             if ud.tag & CANCEL_TAG != 0 {
                 self.complete_cancel(ud.index);
             } else {
                 let class = (ud.tag & 0x7f) as u8;
-                self.complete_op(ud.index, result, flags, class);
+                self.complete_op(ud.index, cqe.result(), cqe.flags(), class);
             }
         }
     }

@@ -4,7 +4,9 @@
 //! to observe is reached through the runtime's global state `G` or the op's
 //! local state `L`. Tests carry a small `G` with an `Rc<RefCell<_>>` log.
 
+use std::cell::Cell;
 use std::cell::RefCell;
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -333,5 +335,126 @@ fn panic_with_an_op_in_flight_drops_every_local_exactly_once() {
         DROPS.with(|d| *d.borrow()),
         1,
         "the in-flight op's local must be dropped exactly once"
+    );
+}
+
+// ── batched completions ─────────────────────────────────────────────
+
+/// Global state for the drain tests: an ordered log of what completed.
+#[derive(Clone, Default)]
+struct B(Rc<RefCell<Vec<String>>>);
+
+impl B {
+    fn push(&self, s: impl Into<String>) {
+        self.0.borrow_mut().push(s.into());
+    }
+    fn lines(&self) -> Vec<String> {
+        self.0.borrow().clone()
+    }
+}
+
+/// Identifies which read a callback belongs to.
+#[derive(Clone, Copy)]
+struct Idx(u32);
+
+fn on_idx(rt: &mut Runtime<B, Idx>, local: Idx, res: std::io::Result<Bytes>) {
+    let n = res.map(|b| b.len()).unwrap_or(usize::MAX);
+    rt.global().push(format!("read{}={n}", local.0));
+}
+
+/// Regression test for `drain_cqes` popping one entry at a time.
+///
+/// Every read here is dispatched before the runtime submits anything, so all
+/// six completions are sitting in the CQ before `drain_cqes` runs. They must be
+/// consumed in order, exactly once each. A head/tail accounting mistake in the
+/// per-entry borrow/drop cycle would double-fire a callback, skip one, or spin
+/// forever here — none of which the one-op-per-test cases would catch.
+#[test]
+fn many_completions_in_one_batch() {
+    use std::io::Write;
+    let mut f = tmpfile();
+    f.write_all(&[b'x'; 64]).unwrap();
+    let fd = f.as_raw_fd();
+
+    const READS: u32 = 6;
+    let g = block_on(params(), B::default(), |rt| {
+        for i in 0..READS {
+            read(rt, fd, 8, Idx(i), on_idx).unwrap();
+        }
+    });
+
+    // `io_uring` makes no ordering guarantee, so compare as a multiset: what
+    // matters is that each dispatch completes exactly once, not when.
+    let mut got = g.lines();
+    got.sort();
+    let mut expected: Vec<String> = (0..READS).map(|i| format!("read{i}=8")).collect();
+    expected.sort();
+    assert_eq!(got, expected, "every completion must fire exactly once");
+}
+
+/// Dispatches a new op from inside a completion callback, while the CQ still
+/// holds other completions. The drain loop must keep popping after the dispatch
+/// rather than stalling or losing the entries behind it.
+#[derive(Clone)]
+struct Chain {
+    log: Rc<RefCell<Vec<String>>>,
+    /// Index of the next read to dispatch. Starts past the two armed by `boot`,
+    /// so each completion arms exactly one new read and the total is exact.
+    next: Rc<Cell<u32>>,
+    fd: RawFd,
+    total: u32,
+}
+
+impl Chain {
+    fn push(&self, s: impl Into<String>) {
+        self.log.borrow_mut().push(s.into());
+    }
+    fn lines(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+fn on_chain(rt: &mut Runtime<Chain, Idx>, local: Idx, res: std::io::Result<Bytes>) {
+    let n = res.map(|b| b.len()).unwrap_or(usize::MAX);
+    let (fd, next, total) = {
+        let b = rt.global();
+        b.push(format!("read{}={n}", local.0));
+        let next = b.next.get();
+        b.next.set(next + 1);
+        (b.fd, next, b.total)
+    };
+    if next < total {
+        // Dispatch from inside the drain: the CQ may still hold completions for
+        // the reads `boot` armed.
+        read(rt, fd, 8, Idx(next), on_chain).unwrap();
+    }
+}
+
+#[test]
+fn dispatch_from_inside_drain_keeps_draining() {
+    use std::io::Write;
+    let mut f = tmpfile();
+    f.write_all(&[b'x'; 64]).unwrap();
+    let fd = f.as_raw_fd();
+
+    const ROUNDS: u32 = 5;
+    let chain = Chain {
+        log: Rc::new(RefCell::new(Vec::new())),
+        next: Rc::new(Cell::new(2)), // boot arms reads 0 and 1
+        fd,
+        total: ROUNDS,
+    };
+    let g = block_on(params(), chain.clone(), |rt| {
+        // Two reads are in flight at the outset, so the first drain sees more
+        // than one completion while also starting a third.
+        read(rt, fd, 8, Idx(0), on_chain).unwrap();
+        read(rt, fd, 8, Idx(1), on_chain).unwrap();
+    });
+
+    assert_eq!(g.lines().len(), ROUNDS as usize, "got {:?}", g.lines());
+    assert!(
+        g.lines().iter().all(|l| l.ends_with("=8")),
+        "every read should return 8 bytes: {:?}",
+        g.lines()
     );
 }
