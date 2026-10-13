@@ -89,13 +89,23 @@ pub fn read<G, L>(
 
 /// Writes `len` bytes from `addr` to `fd` via `IORING_OP_WRITE_FIXED`.
 ///
-/// `addr` must point into the runtime's registered fixed-buffer region (obtain
-/// it from a [`Bytes`](crate::buf::Bytes) created by
-/// [`alloc_bytes`](crate::alloc_bytes)), since `WRITE_FIXED` addresses that
-/// region by absolute offset. The caller must keep the buffer alive — e.g. by
-/// holding its `Bytes` inside `local` — until `done` runs; coio does not own
-/// it. A partial write is reported as the byte count; loop (re-arming `write`
-/// with the unwritten tail) to write everything.
+/// `addr` must point into the runtime's buffer slab, since `WRITE_FIXED`
+/// addresses the registered slab by absolute offset. The whole slab is
+/// registered as fixed buffer index 0 (see `build_pools`), so the address may
+/// come from either pool:
+///
+/// * a [`Bytes`](crate::buf::Bytes) from [`alloc_bytes`](crate::alloc_bytes),
+///   or
+/// * a [`Bytes`](crate::buf::Bytes) returned by [`read`](crate::read), i.e.
+///   straight out of a provided buffer — so a read can be relayed to another fd
+///   with no copy into the fixed region.
+///
+/// The caller must keep the buffer alive — e.g. by holding its `Bytes` inside
+/// `local` — until `done` runs; coio does not own it. Holding it also keeps a
+/// provided slot out of the pool for the op's duration, so the kernel cannot
+/// hand the same slot to a later read. A partial write is reported as the byte
+/// count; loop (re-arming `write` with the unwritten tail) to write
+/// everything.
 pub fn write<G, L>(
     rt: &mut Runtime<G, L>,
     fd: RawFd,

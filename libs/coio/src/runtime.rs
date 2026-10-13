@@ -1025,19 +1025,32 @@ fn build_pools(
         .collect();
     let fixed_pool = FixedPool::new(fixed_classes, fixed_slabs);
 
-    // Only the fixed region is registered as fixed buffer index 0: writes
-    // address their slots by absolute offset within that region, while the
-    // provided region's slots are handed to the kernel one op at a time via
-    // `IORING_OP_PROVIDE_BUFFERS`. Registering the whole slab would pin the
-    // provided region's pages against the process's locked-memory limit for
-    // no benefit (each registered page counts toward `RLIMIT_MEMLOCK`), which
-    // caps how many daemons can run at once.
+    // The whole slab — provided region and fixed region alike — is registered
+    // as fixed buffer index 0, so `write_fixed` can address a slot from either
+    // region by absolute address. That is what lets data read into a provided
+    // buffer be written straight back out to another fd without first copying
+    // it into the fixed region.
+    //
+    // The cost is locked memory. `IORING_REGISTER_BUFFERS` locks the pages it
+    // covers 1:1 against the *user's* `locked_vm` for `RLIMIT_MEMLOCK` — a
+    // per-UID budget shared with every other process of that user, and not
+    // observable as `VmLck` in /proc/self/status because io_uring charges the
+    // user counter, not the mm's. A provided buffer is only *described* to the
+    // kernel by its registered pbuf ring, so its pages are not otherwise
+    // locked, and this registration is what locks them.
+    //
+    // Registering only the fixed region halves the charge but makes provided
+    // buffers unaddressable by `write_fixed`. That is why the default size
+    // classes are halved (see `DEFAULT_SIZE_CLASSES`): a runtime then charges
+    // about as much as it used to, and the whole slab fits where the fixed
+    // region used to. `default_params_runtime_fits_in_memlock` in the test
+    // suite fails with the kernel's `ENOMEM` if a host cannot afford it.
     let iovec = libc::iovec {
-        iov_base: unsafe { base.as_ptr().add(fixed_start as usize) }.cast(),
-        iov_len: (total - fixed_start) as usize,
+        iov_base: base.as_ptr().cast(),
+        iov_len: total as usize,
     };
     unsafe { ring.submitter().register_buffers(&[iovec]) }
-        .expect("failed to register the fixed buffer region");
+        .expect("failed to register the buffer slab as fixed buffer index 0");
 
     Pools {
         slab: base,

@@ -22,6 +22,7 @@ use coio::runtime::Op;
 use coio::runtime::Runtime;
 use coio::runtime::RuntimeParams;
 use coio::runtime::block_on;
+use coio::runtime::block_on_default;
 use coio::sendmsg;
 use coio::write;
 
@@ -502,4 +503,118 @@ fn op_local_is_dropped_when_the_submission_queue_is_full() {
         "both locals must be dropped: one by its completion, one when the undispatchable op's \
          slot is freed"
     );
+}
+
+// ── memlock headroom ────────────────────────────────────────────────
+//
+// `IORING_REGISTER_BUFFERS` charges the registered pages 1:1 against the
+// *user's* `locked_vm` for `RLIMIT_MEMLOCK` — not the mm's, so `VmLck` in
+// /proc/self/status always reads 0 and is useless for this. The observable is
+// the rlimit: registering more than the shared per-UID budget allows fails with
+// `ENOMEM`.
+//
+// The default size classes put ~2 MiB in the provided region and ~2 MiB in the
+// fixed region. This test builds a runtime with the defaults, which registers
+// the fixed region, and asserts it succeeds. Widening that registration over
+// the provided region doubles the charge, so this is the test that would catch
+// a host that cannot afford it.
+
+/// Builds and tears down a runtime with the default (largest) pools.
+///
+/// If the host cannot afford to lock the registered region, `build_pools`
+/// panics with the kernel's `ENOMEM` and this fails — which is exactly the
+/// signal we want if the registration is ever widened.
+#[test]
+fn default_params_runtime_fits_in_memlock() {
+    let reached_boot: bool =
+        block_on_default(false, |rt: &mut Runtime<bool, ()>| *rt.global_mut() = true);
+    assert!(
+        reached_boot,
+        "a default runtime should build its pools and reach boot"
+    );
+}
+
+/// A buffer that read pulled out of the *provided* pool, written straight back
+/// out with `write_fixed` — never copied into the fixed region.
+///
+/// The whole slab is registered as fixed buffer index 0, so a provided buffer's
+/// address is a valid `write_fixed` target. The local carries the `Bytes` from
+/// the read's completion into the write, so the provided slot cannot be
+/// recycled while the write op is still in flight.
+#[derive(Default)]
+struct Proxy {
+    log: Rc<RefCell<Vec<String>>>,
+    dst: Rc<Cell<RawFd>>,
+}
+
+impl Proxy {
+    fn lines(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+/// The read hands its buffer to the write; the write holds it alive.
+enum Relay {
+    Read,
+    /// Never read — held only so the provided slot cannot be recycled while
+    /// the write op is in flight.
+    Write(#[allow(dead_code)] Bytes),
+}
+
+fn on_relay_read(rt: &mut Runtime<Proxy, Relay>, _local: Relay, res: std::io::Result<Bytes>) {
+    let bytes = match res {
+        Ok(b) => b,
+        Err(e) => {
+            rt.global().log.borrow_mut().push(format!("read err {e}"));
+            return;
+        }
+    };
+    let addr = bytes.as_ptr().as_ptr() as *const u8;
+    let len = bytes.len();
+    let dst = rt.global().dst.get();
+    let _ = write(rt, dst, addr, len, Relay::Write(bytes), on_relay_write);
+}
+
+fn on_relay_write(rt: &mut Runtime<Proxy, Relay>, local: Relay, res: std::io::Result<usize>) {
+    let line = res
+        .map(|n| format!("wrote {n}"))
+        .unwrap_or_else(|e| format!("err {e}"));
+    rt.global().log.borrow_mut().push(line);
+    // Dropping the local here returns the provided slot to the pool.
+    drop(local);
+}
+
+#[test]
+fn provided_buffer_can_be_written_back_without_copying() {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+
+    let mut src = tmpfile();
+    src.write_all(b"round trip").unwrap();
+    let src_fd = std::os::fd::AsRawFd::as_raw_fd(&src);
+    // Bound, or the File drops at the end of the statement and closes the fd.
+    let dst = tmpfile();
+    let dst_fd = std::os::fd::AsRawFd::as_raw_fd(&dst);
+
+    let proxy = Proxy {
+        log: Rc::new(RefCell::new(Vec::new())),
+        dst: Rc::new(Cell::new(dst_fd)),
+    };
+    let g = block_on(params(), proxy, |rt| {
+        read(rt, src_fd, 16, Relay::Read, on_relay_read).unwrap();
+    });
+
+    assert_eq!(
+        g.lines(),
+        vec!["wrote 10"],
+        "the provided buffer should be written back verbatim"
+    );
+
+    let mut out = unsafe { std::fs::File::from_raw_fd(libc::dup(dst_fd)) };
+    out.seek(SeekFrom::Start(0)).unwrap();
+    let mut s = String::new();
+    out.read_to_string(&mut s).unwrap();
+    assert_eq!(s, "round trip", "contents must round-trip unchanged");
 }

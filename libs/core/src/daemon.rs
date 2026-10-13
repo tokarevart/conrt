@@ -244,6 +244,27 @@ enum OpLocal {
         buf: Bytes,
         off: usize,
     },
+    /// A `0x10` data frame is going out in two writes: the 3-byte header, then
+    /// the payload straight out of the read's provided buffer. The whole slab
+    /// is registered as fixed buffer index 0, so `write_fixed` addresses a
+    /// provided buffer and the payload never has to be copied into the fixed
+    /// pool — only the 3-byte header is.
+    SessionDataHeader {
+        session_id: u64,
+        stream_fd: RawFd,
+        header: Bytes,
+        /// The read's provided buffer, written once the header is on the wire.
+        payload: Bytes,
+        off: usize,
+    },
+    /// The payload half of a `0x10` data frame, written directly from the
+    /// provided slot the read filled.
+    SessionDataPayload {
+        session_id: u64,
+        stream_fd: RawFd,
+        payload: Bytes,
+        off: usize,
+    },
     /// A session's output source (pty master or follow pipe) is being drained.
     SessionOutputRead { session_id: u64 },
     /// Client stdin bytes are being written to the container.
@@ -2960,39 +2981,42 @@ fn on_session_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
         finish_session_output(rt, session_id);
         return;
     };
-    // `read` returns a provided-pool buffer, which `write` cannot address, so
-    // the data frame is assembled into a fresh pooled buffer first.
-    let len = 3 + bytes.len();
-    let mut buf = pool_alloc(len);
-    buf.set_len(len as u32);
-    buf[0] = 0x10;
-    buf[1..3].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-    buf[3..].copy_from_slice(&bytes);
-    let addr = buf.as_ptr().as_ptr();
+    // The frame header is not contiguous with the payload, so the two halves go
+    // out as separate writes. The payload needs no copy: `write_fixed` can
+    // address the provided region, so it is written straight from the slot the
+    // read filled, which also keeps that slot out of the pool until the frame
+    // is delivered.
+    let mut header = pool_alloc(3);
+    header.set_len(3);
+    header[0] = 0x10;
+    header[1..3].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+    let addr = header.as_ptr().as_ptr();
     let op = write(
         rt,
         stream_fd,
         addr,
-        len,
-        OpLocal::SessionFrame {
+        3,
+        OpLocal::SessionDataHeader {
             session_id,
             stream_fd,
-            buf: buf.into_bytes(),
+            header: header.into_bytes(),
+            payload: bytes,
             off: 0,
         },
-        on_session_output_frame,
+        on_session_data_header,
     );
     if op.is_err() {
         finish_session_output(rt, session_id);
     }
 }
 
-/// The data frame is on the wire; continue draining.
-fn on_session_output_frame(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
-    let OpLocal::SessionFrame {
+/// The 3-byte header is on the wire; write the payload from the provided slot.
+fn on_session_data_header(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::SessionDataHeader {
         session_id,
         stream_fd,
-        buf,
+        header,
+        payload,
         off,
     } = local
     else {
@@ -3001,24 +3025,82 @@ fn on_session_output_frame(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) 
     match res {
         Ok(n) => {
             let off = off + n;
-            if off >= buf.len() {
-                arm_session_output(rt, session_id);
-            } else {
-                let len = buf.len();
-                let addr = buf.as_ptr().as_ptr();
+            if off < header.len() {
+                // Short write: finish the header, then move on to the payload.
+                let len = header.len();
+                let addr = header.as_ptr().as_ptr();
                 let addr = unsafe { addr.add(off) };
                 let _ = write(
                     rt,
                     stream_fd,
                     addr,
                     len - off,
-                    OpLocal::SessionFrame {
+                    OpLocal::SessionDataHeader {
                         session_id,
                         stream_fd,
-                        buf,
+                        header,
+                        payload,
                         off,
                     },
-                    on_session_output_frame,
+                    on_session_data_header,
+                );
+            } else {
+                let len = payload.len();
+                let addr = payload.as_ptr().as_ptr();
+                let _ = write(
+                    rt,
+                    stream_fd,
+                    addr,
+                    len,
+                    OpLocal::SessionDataPayload {
+                        session_id,
+                        stream_fd,
+                        payload,
+                        off: 0,
+                    },
+                    on_session_data_payload,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, %e, "session frame header write failed");
+            finish_session_output(rt, session_id);
+        }
+    }
+}
+
+/// The frame is on the wire; continue draining.
+fn on_session_data_payload(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::SessionDataPayload {
+        session_id,
+        stream_fd,
+        payload,
+        off,
+    } = local
+    else {
+        return;
+    };
+    match res {
+        Ok(n) => {
+            let off = off + n;
+            if off >= payload.len() {
+                arm_session_output(rt, session_id);
+            } else {
+                let len = payload.len();
+                let addr = payload.as_ptr().as_ptr();
+                let addr = unsafe { addr.add(off) };
+                let _ = write(
+                    rt,
+                    stream_fd,
+                    addr,
+                    len - off,
+                    OpLocal::SessionDataPayload {
+                        session_id,
+                        stream_fd,
+                        payload,
+                        off,
+                    },
+                    on_session_data_payload,
                 );
             }
         }

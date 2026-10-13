@@ -18,30 +18,42 @@ pub struct SizeClass {
 }
 
 /// The default class table, used by [`crate::runtime::RuntimeParams::default`].
+///
+/// Both directions draw from this one table, and the whole slab is registered
+/// as fixed buffer index 0 so `write_fixed` can address either region (see
+/// `build_pools`). That means the slab's total size is charged 1:1 against the
+/// *user's* `locked_vm` for `RLIMIT_MEMLOCK`, so it is deliberately modest:
+/// exactly 1 MiB per region, 2 MiB for a runtime.
+///
+/// The counts are halved from the previous table, which halves the ceiling on
+/// concurrent in-flight reads (a read with no free provided buffer fails with
+/// `ENOBUFS`) to 2377. The 64 KiB class holds a single slot: only a log line
+/// longer than `WRITE_CHUNK_PAYLOAD` or a client-declared session frame needs
+/// one, and that is rare enough to serialise on.
 pub const DEFAULT_SIZE_CLASSES: [SizeClass; 6] = [
     SizeClass {
         size: 64,
-        count: 2048,
+        count: 1024,
     },
     SizeClass {
         size: 256,
-        count: 2048,
+        count: 1024,
     },
     SizeClass {
         size: 1024,
-        count: 512,
+        count: 256,
     },
     SizeClass {
         size: 4096,
-        count: 128,
+        count: 64,
     },
     SizeClass {
         size: 16384,
-        count: 16,
+        count: 8,
     },
     SizeClass {
         size: 65536,
-        count: 2,
+        count: 1,
     },
 ];
 
