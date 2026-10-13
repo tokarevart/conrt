@@ -1,0 +1,9 @@
+[package]
+name = "coio-uring"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coio-core = { path = "../coio-core" }
+io-uring = "0.7"
+libc = "0.2"

@@ -3,9 +3,16 @@ name = "coio"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["uring"]
+# io_uring. Linux only, and the default there: it is the backend with the
+# pooled provided-buffer fast paths (`read_provided`, `write_fixed`) that let a
+# read be relayed straight out of its buffer with no copy.
+uring = ["dep:coio-uring"]
+
 [dependencies]
-io-uring = "0.7"
-libc = "0.2"
+coio-core = { path = "../coio-core" }
+coio-uring = { path = "../coio-uring", optional = true }
 
 [dev-dependencies]
 libc = "0.2"

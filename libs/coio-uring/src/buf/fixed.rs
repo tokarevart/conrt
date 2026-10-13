@@ -11,6 +11,8 @@
 
 use std::ptr::NonNull;
 
+use coio_core::active_gen;
+
 use crate::buf::Bytes;
 use crate::buf::BytesMut;
 use crate::buf::Ref;
@@ -20,7 +22,6 @@ use crate::buf::SliceMut;
 use crate::buf::pool::Slab;
 use crate::buf::tracker::BorrowTracker;
 use crate::classes::pack_bid;
-use crate::runtime::active_gen;
 
 pub struct FixedSlab {
     size: u32,

@@ -17,7 +17,7 @@ pub struct SizeClass {
     pub count: u32,
 }
 
-/// The default class table, used by [`crate::runtime::RuntimeParams::default`].
+/// The default class table, used by [`crate::uring::UringConfig::default`].
 ///
 /// Both directions draw from this one table, and the whole slab is registered
 /// as fixed buffer index 0 so `write_fixed` can address either region (see

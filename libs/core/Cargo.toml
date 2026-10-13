@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 conrt-cstring = { path = "../cstring" }
 conrt-sys = { path = "../sys" }
-coio = { path = "../coio" }
+# Linux-only, and io_uring is the only backend so far; stated rather than
+# inherited from `coio`'s defaults.
+coio = { path = "../coio", default-features = false, features = ["uring"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

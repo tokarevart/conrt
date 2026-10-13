@@ -2,15 +2,15 @@
 //! and the views over the slots.
 //!
 //! A *slab* is one size class's run of equal-sized slots carved out of the
-//! runtime's shared buffer slab: [`fixed::FixedSlab`] for the registered
-//! write buffers (`IORING_REGISTER_BUFFERS`) and [`provided::ProvidedSlab`]
+//! runtime's shared buffer slab: `FixedSlab` for the registered
+//! write buffers (`IORING_REGISTER_BUFFERS`) and `ProvidedSlab`
 //! for the provided-buffer rings (`IORING_REGISTER_PBUF_RING`). A *pool* is a
 //! collection of slabs across the size classes of one direction, stored by
-//! [`pool::Pool`]: [`FixedPool`] and [`ProvidedPool`] are the runtime's two
+//! `Pool`: `FixedPool` and `ProvidedPool` are the runtime's two
 //! pools. Pool operations are class-indexed and forward to the slab of the
 //! chosen class.
 //!
-//! Slab slots are borrow-tracked by the shared [`tracker::BorrowTracker`]: a
+//! Slab slots are borrow-tracked by the shared `BorrowTracker`: a
 //! slot is shared (count `+1`, `+2`, …) while [`Ref`]/[`Slice`] views borrow
 //! it and exclusive (count `−1`, `−2`, …) while [`RefMut`]/[`SliceMut`] views
 //! borrow it. Exclusive views only ever arise by splitting a sole holder, so
@@ -39,15 +39,16 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 
+use coio_core::active_gen_matches;
 pub(crate) use fixed::FixedSlab;
 pub(crate) use provided::ProvidedSlab;
 
-use crate::runtime;
-use crate::runtime::clone_view;
-use crate::runtime::downgrade_view;
-use crate::runtime::drop_view;
-use crate::runtime::resolve_ptr;
-use crate::runtime::upgrade_view;
+use crate::pools::clone_view;
+use crate::pools::downgrade_view;
+use crate::pools::drop_view;
+use crate::pools::resolve_ptr;
+use crate::pools::upgrade_view;
+use crate::pools::with_pools;
 
 /// A shared view of a slot of the runtime's pooled, pinned memory that stays
 /// stable until this value is dropped.
@@ -336,7 +337,8 @@ impl<T> Drop for Slice<T> {
 }
 
 /// A `[u8]` slice view: pooled read buffers returned by
-/// [`crate::io::read`] and pooled data handed to a send.
+/// [`read_provided`](crate::io::read_provided) and pooled data handed to a
+/// send.
 pub type Bytes = Slice<u8>;
 
 impl Bytes {
@@ -544,9 +546,9 @@ impl BytesMut {
 
     /// Downgrades this exclusive write buffer into a shared, read-only
     /// [`Bytes`] covering the same bytes, so it can be handed to
-    /// [`crate::io::write`] while still holding the slot. The borrow is
-    /// transferred: no count changes. Panics unless this view is the only
-    /// exclusive holder of its slot.
+    /// [`write_fixed`](crate::io::write_fixed) while still holding the slot.
+    /// The borrow is transferred: no count changes. Panics unless this view
+    /// is the only exclusive holder of its slot.
     pub fn into_bytes(self) -> Bytes {
         let len = self.len;
         let base = unsafe { core::ptr::read(&self.base) };
@@ -584,8 +586,6 @@ impl AsMut<[u8]> for BytesMut {
 }
 
 fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
-    use crate::runtime::active_gen_matches;
-    use crate::runtime::with_pools;
     assert!(
         active_gen_matches(generation),
         "capacity() called outside the runtime that owns this buffer"
@@ -594,13 +594,11 @@ fn with_runtime_capacity(bid: u32, generation: NonZeroU32) -> u32 {
 }
 
 fn split_exclusive(bid: u32, generation: NonZeroU32) {
-    if !runtime::active_gen_matches(generation) {
+    if !active_gen_matches(generation) {
         return;
     }
 
-    runtime::with_pools(|r| {
-        r.with_slab(bid, |slab, local| slab.tracker_mut().split_exclusive(local))
-    })
+    with_pools(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().split_exclusive(local)))
 }
 
 /// Allocates a slot of pooled op-argument memory for `T` from the runtime's
@@ -623,7 +621,7 @@ pub fn alloc<T>() -> Option<Ref<MaybeUninit<T>>> {
         core::mem::size_of::<T>() > 0,
         "alloc: zero-sized types cannot be pooled"
     );
-    runtime::with_pools(|r| {
+    with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
         r.fixed_pool.acquire_ref::<MaybeUninit<T>>(class)
     })
@@ -645,7 +643,7 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
         core::mem::size_of::<T>() > 0,
         "alloc_mut: zero-sized types cannot be pooled"
     );
-    runtime::with_pools(|r| {
+    with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
         r.fixed_pool.acquire_mut::<MaybeUninit<T>>(class)
     })
@@ -657,7 +655,8 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
 /// fails with `EFBIG`. The buffer's [`BytesMut::capacity`] is the chosen
 /// class's slot size; the caller fills it via [`BytesMut::as_mut`] and records
 /// the length with [`BytesMut::set_len`] before passing it to
-/// [`crate::io::write`]. The slot is recycled when the buffer is dropped.
+/// [`write_fixed`](crate::io::write_fixed). The slot is recycled when the
+/// buffer is dropped.
 ///
 /// # Errors
 ///
@@ -668,7 +667,7 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
 ///
 /// Calling this outside an active runtime panics.
 pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
-    runtime::with_pools(|r| -> io::Result<BytesMut> {
+    with_pools(|r| -> io::Result<BytesMut> {
         let class = r
             .fixed_pool
             .class_for(size)
@@ -681,7 +680,8 @@ pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
 
 /// Adopts a provided buffer the kernel just selected for a completed
 /// `IOSQE_BUFFER_SELECT` op into a shared [`Bytes`] view, so a task can build
-/// its own buffer-selecting ops on top of [`crate::io::read`]. `class` is the
+/// its own buffer-selecting ops on top of
+/// [`read_provided`](crate::io::read_provided). `class` is the
 /// provided size-class index, `local` the buffer id the kernel reported via
 /// `cqueue::buffer_select`, and `len` the number of bytes the op produced.
 ///
@@ -701,5 +701,5 @@ pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
 /// Everything else is checked: `class` out of range panics, and using the
 /// returned view outside the runtime that owns it panics on access.
 pub fn provided_bytes(class: u8, local: u16, len: u32) -> Bytes {
-    runtime::with_pools(|r| r.provided_pool.select(class, local, len))
+    with_pools(|r| r.provided_pool.select(class, local, len))
 }

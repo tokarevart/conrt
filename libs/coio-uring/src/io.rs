@@ -4,36 +4,82 @@
 //! per-op local state `L` into the op. When the op completes, the runtime
 //! hands that `L` back to a monomorphized shim together with the raw CQE; the
 //! shim decodes the result and invokes the caller's `done` callback.
+//!
+//! These are the `io_uring` operations, so they pin the backend to [`Uring`]
+//! rather than going through [`Backend`](coio_core::Backend): the SQE each
+//! one builds is `Uring`'s own `Request` type. Operations that are not
+//! `io_uring`-specific live behind the backend trait instead, so a second
+//! backend can offer its own.
 
 use core::mem::MaybeUninit;
 use std::io;
 use std::os::fd::RawFd;
 
+use coio_core::AcceptDone;
+use coio_core::AcceptOp;
+use coio_core::ByteDone;
+use coio_core::IoBufMut;
+use coio_core::IoBufRef;
+use coio_core::Op;
+use coio_core::OpOutcome;
+use coio_core::OpShimArgs;
+use coio_core::ReadOp;
+use coio_core::Runtime;
+use coio_core::WriteOp;
+use coio_core::recover;
+
 use crate::buf::Bytes;
 use crate::buf::RefMut;
 use crate::buf::alloc_mut;
 use crate::buf::provided_bytes;
-use crate::runtime::Op;
-use crate::runtime::Runtime;
+use crate::uring::Uring;
+use crate::uring::UringExt;
 
-/// Pushes a prepared SQE, returning the op handle on success. On failure the
-/// op slot is released.
-fn push<G, L>(rt: &mut Runtime<G, L>, op: Op, entry: io_uring::squeue::Entry) -> io::Result<Op> {
-    let entry = entry.user_data(Runtime::<G, L>::op_user_data(op.slot, op.class));
-    let mut sq = rt.ring_mut().submission();
-    let pushed = unsafe { sq.push(&entry) };
-    drop(sq);
-    match pushed {
-        Ok(()) => Ok(op),
-        Err(_) => {
-            rt.free_op_slot(op.slot);
-            Err(io::Error::from_raw_os_error(libc::EAGAIN))
-        }
-    }
-}
+/// The runtime these operations drive. `Runtime<G, L>` already defaults to
+/// this backend; the alias is here so the signatures below say so explicitly.
+type Rt<G, L> = Runtime<G, L, Uring>;
 
 fn errno(result: i32) -> Option<io::Error> {
     (result < 0).then(|| io::Error::from_raw_os_error(-result))
+}
+
+/// Reported to a callback whose operation was cancelled.
+///
+/// `Interrupted` says "resume or clean up", which is the right reading for a
+/// cancellation the caller asked for, and is distinguishable from the errno a
+/// genuine failure would carry.
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
+}
+
+/// Maps a completion to the byte count its callback reports.
+fn transferred(outcome: OpOutcome) -> io::Result<u32> {
+    match outcome {
+        OpOutcome::Completed { result, .. } => match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result as u32),
+        },
+        OpOutcome::Cancelled => Err(cancelled()),
+    }
+}
+
+/// Asserts a shim was handed the number of buffers its op kind submits.
+fn expect_bufs(bufs: &[coio_core::IoBufErased], n: usize) {
+    assert_eq!(
+        bufs.len(),
+        n,
+        "shim expects {n} caller buffer(s) but the op was given {}",
+        bufs.len(),
+    );
+}
+
+/// Whether the runtime is tearing an op down without completing it.
+///
+/// `done` is null on that path: the caller-supplied buffers have been rebuilt
+/// and must be dropped, but the operation produced no result and no user code
+/// may run. Every shim checks this before invoking its callback.
+fn is_teardown(done: *const ()) -> bool {
+    done.is_null()
 }
 
 /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
@@ -43,35 +89,52 @@ fn errno(result: i32) -> Option<io::Error> {
 ///
 /// `done` receives the caller's `local` back along with the selected [`Bytes`]
 /// (borrowed from the pool; recycled when the last view drops).
-pub fn read<G, L>(
-    rt: &mut Runtime<G, L>,
+///
+/// For a read into caller-supplied memory, see
+/// [`Runtime::read`](coio_core::Runtime::read).
+pub fn read_provided<G, L>(
+    rt: &mut Rt<G, L>,
     fd: RawFd,
     max_len: usize,
     local: L,
-    done: fn(&mut Runtime<G, L>, L, io::Result<Bytes>),
+    done: fn(&mut Rt<G, L>, L, io::Result<Bytes>),
 ) -> io::Result<Op> {
-    fn shim<G, L>(
-        rt: &mut Runtime<G, L>,
-        local: L,
-        result: i32,
-        flags: u32,
-        done: *const (),
-        class: u8,
-    ) {
-        let done: fn(&mut Runtime<G, L>, L, io::Result<Bytes>) =
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        let out = match errno(result) {
-            Some(e) => Err(e),
-            None => match io_uring::cqueue::buffer_select(flags) {
-                Some(local_buf) => Ok(provided_bytes(class, local_buf, result as u32)),
-                None => Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+        let OpShimArgs {
+            local,
+            bufs,
+            outcome,
+            done,
+            class,
+        } = args;
+        // The kernel chose the buffer, so there is no caller buffer to rebuild.
+        expect_bufs(bufs, 0);
+
+        let res = match outcome {
+            OpOutcome::Completed { result, flags } => match errno(result) {
+                Some(e) => Err(e),
+                None => match io_uring::cqueue::buffer_select(flags) {
+                    Some(local_buf) => Ok(provided_bytes(class, local_buf, result as u32)),
+                    None => Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+                },
             },
+            OpOutcome::Cancelled => Err(cancelled()),
         };
-        done(rt, local, out);
+
+        if is_teardown(done) {
+            drop(local);
+            return;
+        }
+        // SAFETY: `read_provided` registered `done` with this exact type.
+        let done: fn(&mut Rt<G, L>, L, io::Result<Bytes>) =
+            // SAFETY: the op this shim belongs to registered `done` with
+            // exactly this type.
+            unsafe { core::mem::transmute::<*const (), _>(done) };
+        done(rt, local, res);
     }
 
     let class = rt
-        .pools
+        .pools()
         .provided_pool
         .class_for(max_len)
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
@@ -83,8 +146,7 @@ pub fn read<G, L>(
     .buf_group(u16::from(class))
     .build()
     .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-    let op = rt.register_op(shim::<G, L>, done as *const (), local, class);
-    push(rt, op, entry)
+    rt.register_op(shim::<G, L>, done as *const (), local, class, &[], entry)
 }
 
 /// Writes `len` bytes from `addr` to `fd` via `IORING_OP_WRITE_FIXED`.
@@ -96,9 +158,10 @@ pub fn read<G, L>(
 ///
 /// * a [`Bytes`](crate::buf::Bytes) from [`alloc_bytes`](crate::alloc_bytes),
 ///   or
-/// * a [`Bytes`](crate::buf::Bytes) returned by [`read`](crate::read), i.e.
-///   straight out of a provided buffer — so a read can be relayed to another fd
-///   with no copy into the fixed region.
+/// * a [`Bytes`](crate::buf::Bytes) returned by
+///   [`read_provided`](crate::io::read_provided), i.e. straight out of a
+///   provided buffer — so a read can be relayed to another fd with no copy into
+///   the fixed region.
 ///
 /// The caller must keep the buffer alive — e.g. by holding its `Bytes` inside
 /// `local` — until `done` runs; coio does not own it. Holding it also keeps a
@@ -106,75 +169,40 @@ pub fn read<G, L>(
 /// hand the same slot to a later read. A partial write is reported as the byte
 /// count; loop (re-arming `write` with the unwritten tail) to write
 /// everything.
-pub fn write<G, L>(
-    rt: &mut Runtime<G, L>,
+pub fn write_fixed<G, L>(
+    rt: &mut Rt<G, L>,
     fd: RawFd,
     addr: *const u8,
     len: usize,
     local: L,
-    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
 ) -> io::Result<Op> {
-    fn shim<G, L>(
-        rt: &mut Runtime<G, L>,
-        local: L,
-        result: i32,
-        _flags: u32,
-        done: *const (),
-        _state: u8,
-    ) {
-        let out = match errno(result) {
-            Some(e) => Err(e),
-            None => Ok(result as usize),
-        };
-        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+        let OpShimArgs {
+            local,
+            bufs,
+            outcome,
+            done,
+            ..
+        } = args;
+        expect_bufs(bufs, 0);
+        let res = transferred(outcome).map(|n| n as usize);
+
+        if is_teardown(done) {
+            drop(local);
+            return;
+        }
+        // SAFETY: `write_fixed` registered `done` with this exact type.
+        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+            // SAFETY: the op this shim belongs to registered `done` with
+            // exactly this type.
             unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, out);
+        done(rt, local, res);
     }
 
-    let entry = io_uring::opcode::WriteFixed::new(
-        io_uring::types::Fd(fd),
-        addr.cast_mut().cast(),
-        len as u32,
-        0, // the whole slab is registered as fixed buffer index 0
-    )
-    .build();
-    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
-    push(rt, op, entry)
-}
-
-/// Accepts a connection on `listener_fd`, yielding the new socket's fd to
-/// `done`.
-pub fn accept<G, L>(
-    rt: &mut Runtime<G, L>,
-    listener_fd: RawFd,
-    local: L,
-    done: fn(&mut Runtime<G, L>, L, io::Result<RawFd>),
-) -> io::Result<Op> {
-    fn shim<G, L>(
-        rt: &mut Runtime<G, L>,
-        local: L,
-        result: i32,
-        _flags: u32,
-        done: *const (),
-        _state: u8,
-    ) {
-        let out = match errno(result) {
-            Some(e) => Err(e),
-            None => Ok(result),
-        };
-        let done: fn(&mut Runtime<G, L>, L, io::Result<RawFd>) =
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, out);
-    }
-
-    let entry = io_uring::opcode::Accept::new(
-        io_uring::types::Fd(listener_fd),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    )
-    .build();
-    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
-    push(rt, op, entry)
+    let entry =
+        io_uring::opcode::WriteFixed::new(io_uring::types::Fd(fd), addr, len as u32, 0).build();
+    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
 }
 
 /// The maximum number of `iovec`s the kernel accepts for one message: Linux
@@ -489,28 +517,36 @@ pub(crate) const fn cmsg_space(payload: usize) -> usize {
 /// `msg` must point at a valid, wired `msghdr` (from a [`MsgMut`]) that stays
 /// alive until `done` runs.
 pub unsafe fn recvmsg<G, L>(
-    rt: &mut Runtime<G, L>,
+    rt: &mut Rt<G, L>,
     fd: RawFd,
     msg: *mut libc::msghdr,
     flags: u32,
     local: L,
-    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
 ) -> io::Result<Op> {
-    fn shim<G, L>(
-        rt: &mut Runtime<G, L>,
-        local: L,
-        result: i32,
-        _flags: u32,
-        done: *const (),
-        _state: u8,
-    ) {
-        let out = match errno(result) {
-            Some(e) => Err(e),
-            None => Ok(result as usize),
-        };
-        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+        let OpShimArgs {
+            local,
+            bufs,
+            outcome,
+            done,
+            ..
+        } = args;
+        // The message arguments live in the caller's local, not in a caller
+        // buffer, so there is nothing here to rebuild.
+        expect_bufs(bufs, 0);
+        let res = transferred(outcome).map(|n| n as usize);
+
+        if is_teardown(done) {
+            drop(local);
+            return;
+        }
+        // SAFETY: this operation registered `done` with this exact type.
+        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+            // SAFETY: the op this shim belongs to registered `done` with
+            // exactly this type.
             unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, out);
+        done(rt, local, res);
     }
 
     unsafe {
@@ -519,8 +555,7 @@ pub unsafe fn recvmsg<G, L>(
     let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), msg)
         .flags(flags)
         .build();
-    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
-    push(rt, op, entry)
+    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
 }
 
 /// Sends the message in `slot` via `IORING_OP_SENDMSG`, typically carrying a
@@ -532,30 +567,183 @@ pub unsafe fn recvmsg<G, L>(
 /// `cmsg`s pushed with
 /// [`Msg::push_iov`]/[`Msg::push_cmsg`]/[`Msg::push_scm_rights`].
 pub fn sendmsg<G, L>(
-    rt: &mut Runtime<G, L>,
+    rt: &mut Rt<G, L>,
     fd: RawFd,
     msg: *mut libc::msghdr,
     local: L,
-    done: fn(&mut Runtime<G, L>, L, io::Result<usize>),
+    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
 ) -> io::Result<Op> {
-    fn shim<G, L>(
-        rt: &mut Runtime<G, L>,
-        local: L,
-        result: i32,
-        _flags: u32,
-        done: *const (),
-        _state: u8,
-    ) {
-        let out = match errno(result) {
-            Some(e) => Err(e),
-            None => Ok(result as usize),
-        };
-        let done: fn(&mut Runtime<G, L>, L, io::Result<usize>) =
+    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+        let OpShimArgs {
+            local,
+            bufs,
+            outcome,
+            done,
+            ..
+        } = args;
+        // The message arguments live in the caller's local, not in a caller
+        // buffer, so there is nothing here to rebuild.
+        expect_bufs(bufs, 0);
+        let res = transferred(outcome).map(|n| n as usize);
+
+        if is_teardown(done) {
+            drop(local);
+            return;
+        }
+        // SAFETY: this operation registered `done` with this exact type.
+        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+            // SAFETY: the op this shim belongs to registered `done` with
+            // exactly this type.
             unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, out);
+        done(rt, local, res);
     }
 
     let entry = io_uring::opcode::SendMsg::new(io_uring::types::Fd(fd), msg).build();
-    let op = rt.register_op(shim::<G, L>, done as *const (), local, 0);
-    push(rt, op, entry)
+    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
+}
+
+// ── The portable operations ──────────────────────────────────────────
+//
+// `read`, `write` and `accept` are the cross-backend ones: any backend can
+// provide them, so they are declared in `coio-core` as `ReadOp`/`WriteOp`/
+// `AcceptOp` and reach callers as inherent methods on `Runtime`. The bodies
+// below are the same as they were as free functions; only the enclosing
+// signature is now a trait impl.
+
+impl<G, L> ReadOp<G, L> for Uring {
+    fn read<Buf: IoBufMut>(
+        rt: &mut Runtime<G, L, Self>,
+        fd: RawFd,
+        mut buf: Buf,
+        local: L,
+        done: fn(&mut Runtime<G, L, Self>, L, Buf, io::Result<usize>),
+    ) -> io::Result<Op> {
+        fn shim<Buf: IoBufMut, G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
+            let OpShimArgs {
+                local,
+                bufs,
+                outcome,
+                done,
+                ..
+            } = args;
+            expect_bufs(bufs, 1);
+
+            let res = transferred(outcome);
+            // SAFETY: `read` erased this buffer's writable region on the way in,
+            // and the kernel has written into exactly that region since.
+            let buf: Buf = unsafe { recover(bufs[0], res.as_ref().map_or(0, |n| *n)) };
+
+            if is_teardown(done) {
+                drop((buf, local));
+                return;
+            }
+            // SAFETY: `read` registered `done` with this exact type.
+            let done: ByteDone<G, L, Uring, Buf> =
+                unsafe { core::mem::transmute::<*const (), _>(done) };
+            done(rt, local, buf, res.map(|n| n as usize));
+        }
+
+        let (addr, len) = buf.writable();
+        let entry = io_uring::opcode::Read::new(io_uring::types::Fd(fd), addr, len).build();
+        let erased = [buf.into_erased()];
+        rt.register_op(
+            shim::<Buf, G, L>,
+            done as *const (),
+            local,
+            0,
+            &erased,
+            entry,
+        )
+    }
+}
+
+impl<G, L> WriteOp<G, L> for Uring {
+    fn write<Buf: IoBufRef>(
+        rt: &mut Runtime<G, L, Self>,
+        fd: RawFd,
+        buf: Buf,
+        local: L,
+        done: fn(&mut Runtime<G, L, Self>, L, Buf, io::Result<usize>),
+    ) -> io::Result<Op> {
+        fn shim<Buf: IoBufRef, G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
+            let OpShimArgs {
+                local,
+                bufs,
+                outcome,
+                done,
+                ..
+            } = args;
+            expect_bufs(bufs, 1);
+
+            let res = transferred(outcome);
+            // SAFETY: `write` erased this buffer on the way in, so the runtime
+            // has held it untouched since; the op only ever read from it.
+            let buf: Buf = unsafe { recover(bufs[0], res.as_ref().map_or(0, |n| *n)) };
+
+            if is_teardown(done) {
+                drop((buf, local));
+                return;
+            }
+            // SAFETY: `write` registered `done` with this exact type.
+            let done: ByteDone<G, L, Uring, Buf> =
+                unsafe { core::mem::transmute::<*const (), _>(done) };
+            done(rt, local, buf, res.map(|n| n as usize));
+        }
+
+        let (addr, len) = buf.readable();
+        let entry = io_uring::opcode::Write::new(io_uring::types::Fd(fd), addr, len).build();
+        let erased = [buf.into_erased()];
+        rt.register_op(
+            shim::<Buf, G, L>,
+            done as *const (),
+            local,
+            0,
+            &erased,
+            entry,
+        )
+    }
+}
+
+impl<G, L> AcceptOp<G, L> for Uring {
+    fn accept(
+        rt: &mut Runtime<G, L, Self>,
+        listener_fd: RawFd,
+        local: L,
+        done: fn(&mut Runtime<G, L, Self>, L, io::Result<RawFd>),
+    ) -> io::Result<Op> {
+        fn shim<G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
+            let OpShimArgs {
+                local,
+                bufs,
+                outcome,
+                done,
+                ..
+            } = args;
+            expect_bufs(bufs, 0);
+            let res = match outcome {
+                OpOutcome::Completed { result, .. } => match errno(result) {
+                    Some(e) => Err(e),
+                    None => Ok(result),
+                },
+                OpOutcome::Cancelled => Err(cancelled()),
+            };
+
+            if is_teardown(done) {
+                drop(local);
+                return;
+            }
+            // SAFETY: `accept` registered `done` with this exact type.
+            let done: AcceptDone<G, L, Uring> =
+                unsafe { core::mem::transmute::<*const (), _>(done) };
+            done(rt, local, res);
+        }
+
+        let entry = io_uring::opcode::Accept::new(
+            io_uring::types::Fd(listener_fd),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .build();
+        rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
+    }
 }

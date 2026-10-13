@@ -10,7 +10,8 @@
 //! the buffer back into the slab.
 //!
 //! Borrow tracking: the kernel consumes a buffer when it selects one, and the
-//! slab hands it out as a view (the `Bytes` returned by [`crate::io::read`]).
+//! slab hands it out as a view (the `Bytes` returned by
+//! [`read_provided`](crate::io::read_provided)).
 //! The shared [`BorrowTracker`] records the hand-off (`0 → +1`); the count is
 //! positive while shared views hold the buffer and negative while exclusive
 //! views do. Each drop of a view releases one borrower, and the buffer returns
@@ -24,6 +25,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 
+use coio_core::active_gen;
 use io_uring::IoUring;
 
 use crate::buf::Bytes;
@@ -35,7 +37,6 @@ use crate::buf::SliceMut;
 use crate::buf::pool::Slab;
 use crate::buf::tracker::BorrowTracker;
 use crate::classes::pack_bid;
-use crate::runtime::active_gen;
 
 const PAGE_SIZE: usize = 4096;
 
