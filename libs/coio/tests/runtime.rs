@@ -23,14 +23,11 @@ use coio::Msg;
 use coio::RuntimeParams;
 use coio::SizeClass;
 use coio::alloc_bytes;
-use coio::read_provided;
 use coio::runtime::Op;
 use coio::runtime::Runtime;
 use coio::runtime::block_on;
 use coio::runtime::block_on_default;
-use coio::sendmsg;
 use coio::uring::UringExt;
-use coio::write_fixed;
 
 /// The global state every test carries: a shared log the callbacks append to.
 #[derive(Clone, Default)]
@@ -119,7 +116,7 @@ fn read_from_tmpfile() {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
 
     let g = block_on(&params(), G::default(), |rt| {
-        read_provided(rt, fd, 64, (), on_read).unwrap();
+        rt.read_provided(fd, 64, (), on_read).unwrap();
     });
     assert_eq!(g.lines(), vec!["read 10"]);
 }
@@ -131,7 +128,7 @@ fn read_exceeding_largest_class_fails_efbig() {
     // The largest provided class here is 16 bytes.
     let mut err = None;
     block_on(&params(), G::default(), |rt| {
-        err = read_provided(rt, fd, 1 << 20, (), on_read).err();
+        err = rt.read_provided(fd, 1 << 20, (), on_read).err();
     });
     assert_eq!(err.and_then(|e| e.raw_os_error()), Some(libc::EFBIG));
 }
@@ -159,7 +156,8 @@ fn write_to_tmpfile() {
         buf.set_len(5);
         let addr = buf.as_ptr().as_ptr() as *const u8;
         let len = buf.len();
-        write_fixed(rt, fd, addr, len, WBuf(buf.into_bytes()), on_write).unwrap();
+        rt.write_fixed(fd, addr, len, WBuf(buf.into_bytes()), on_write)
+            .unwrap();
     });
     assert_eq!(g.lines(), vec!["wrote 5"]);
 
@@ -239,7 +237,7 @@ fn cancel_after_completion_never_runs_the_cancel_callback() {
     let hh = h.clone();
     let gg = g.clone();
     let _ = block_on(&params(), (g, h), move |rt| {
-        let op = read_provided(rt, a, 16, (), on_read_then_cancel).unwrap();
+        let op = rt.read_provided(a, 16, (), on_read_then_cancel).unwrap();
         *hh.0.borrow_mut() = Some(op);
     });
     assert_eq!(
@@ -272,7 +270,7 @@ fn sendmsg_roundtrip_to_a_socket() {
         };
         msg.push_iov(iov);
         let ptr = msg.msg_ptr();
-        sendmsg(rt, a, ptr, SMsg(msg), on_send).unwrap();
+        rt.sendmsg(a, ptr, SMsg(msg), on_send).unwrap();
     });
     assert_eq!(g.lines(), vec!["sent 4"]);
 
@@ -327,7 +325,7 @@ fn panic_with_an_op_in_flight_drops_every_local_exactly_once() {
     let result = std::panic::catch_unwind(|| {
         let _ = block_on(&params(), G::default(), |rt| {
             let local = DropProbe(alloc_bytes(64).unwrap());
-            read_provided(rt, rfd, 64, local, on_probe).unwrap();
+            rt.read_provided(rfd, 64, local, on_probe).unwrap();
             // Hand the SQE to the kernel so the read is genuinely in flight —
             // queued in the kernel's poll wait — rather than sitting in our SQ.
             rt.submit().unwrap();
@@ -392,7 +390,7 @@ fn many_completions_in_one_batch() {
     const READS: u32 = 6;
     let g = block_on(&params(), B::default(), |rt| {
         for i in 0..READS {
-            read_provided(rt, fd, 8, Idx(i), on_idx).unwrap();
+            rt.read_provided(fd, 8, Idx(i), on_idx).unwrap();
         }
     });
 
@@ -439,7 +437,7 @@ fn on_chain(rt: &mut Runtime<Chain, Idx>, local: Idx, res: std::io::Result<Bytes
     if next < total {
         // Dispatch from inside the drain: the CQ may still hold completions for
         // the reads `boot` armed.
-        read_provided(rt, fd, 8, Idx(next), on_chain).unwrap();
+        rt.read_provided(fd, 8, Idx(next), on_chain).unwrap();
     }
 }
 
@@ -460,8 +458,8 @@ fn dispatch_from_inside_drain_keeps_draining() {
     let g = block_on(&params(), chain.clone(), |rt| {
         // Two reads are in flight at the outset, so the first drain sees more
         // than one completion while also starting a third.
-        read_provided(rt, fd, 8, Idx(0), on_chain).unwrap();
-        read_provided(rt, fd, 8, Idx(1), on_chain).unwrap();
+        rt.read_provided(fd, 8, Idx(0), on_chain).unwrap();
+        rt.read_provided(fd, 8, Idx(1), on_chain).unwrap();
     });
 
     assert_eq!(g.lines().len(), ROUNDS as usize, "got {:?}", g.lines());
@@ -493,9 +491,10 @@ fn op_local_is_dropped_when_the_submission_queue_is_full() {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
 
     let g = block_on(&params, B::default(), |rt| {
-        read_provided(rt, fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b).unwrap();
+        rt.read_provided(fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b)
+            .unwrap();
         // This one cannot be pushed: the SQ is full.
-        let _ = read_provided(rt, fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b);
+        let _ = rt.read_provided(fd, 8, DropProbe(alloc_bytes(64).unwrap()), on_probe_b);
     });
 
     assert!(
@@ -578,7 +577,7 @@ fn on_relay_read(rt: &mut Runtime<Proxy, Relay>, _local: Relay, res: std::io::Re
     let addr = bytes.as_ptr().as_ptr() as *const u8;
     let len = bytes.len();
     let dst = rt.global().dst.get();
-    let _ = write_fixed(rt, dst, addr, len, Relay::Write(bytes), on_relay_write);
+    let _ = rt.write_fixed(dst, addr, len, Relay::Write(bytes), on_relay_write);
 }
 
 fn on_relay_write(rt: &mut Runtime<Proxy, Relay>, local: Relay, res: std::io::Result<usize>) {
@@ -609,7 +608,8 @@ fn provided_buffer_can_be_written_back_without_copying() {
         dst: Rc::new(Cell::new(dst_fd)),
     };
     let g = block_on(&params(), proxy, |rt| {
-        read_provided(rt, src_fd, 16, Relay::Read, on_relay_read).unwrap();
+        rt.read_provided(src_fd, 16, Relay::Read, on_relay_read)
+            .unwrap();
     });
 
     assert_eq!(

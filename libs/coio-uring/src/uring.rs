@@ -7,12 +7,15 @@
 //! operations in [`crate::io`].
 
 use std::io;
+use std::os::fd::RawFd;
 
 use coio_core::Backend;
 use coio_core::Completion;
+use coio_core::Op;
 use coio_core::Runtime;
 use coio_core::enter_active_gen;
 
+use crate::buf::Bytes;
 use crate::classes::DEFAULT_SIZE_CLASSES;
 use crate::classes::SizeClass;
 use crate::pools::DropGuard;
@@ -117,7 +120,7 @@ fn cancel_user_data(cancel_slot: u32) -> u64 {
 /// entire lifetime of the runtime except after teardown.
 pub struct Uring {
     ring: Option<io_uring::IoUring>,
-    pools: Pools,
+    pub(crate) pools: Pools,
 }
 
 impl Uring {
@@ -235,9 +238,11 @@ pub type UringRuntime<G, L> = Runtime<G, L, Uring>;
 /// The io_uring-specific surface of a [`Runtime`].
 ///
 /// A foreign type takes no inherent impls, so the operations this crate adds to
-/// core's runtime have to live in a trait. `UringExt` is in scope wherever the
-/// io_uring operations are.
-pub trait UringExt {
+/// core's runtime have to live in a trait. The portable three are inherent
+/// methods instead, because core declares those and every backend implements
+/// them; these four are io_uring's alone, so there is no slot in core for them
+/// to be inherent in. `UringExt` is in scope wherever they are used.
+pub trait UringExt<G, L> {
     /// The buffer pools backing every read's provided-buffer ring and every
     /// fixed write.
     fn pools(&self) -> &Pools;
@@ -245,16 +250,49 @@ pub trait UringExt {
     /// Submits everything queued for the kernel, returning how many requests
     /// were submitted.
     fn submit(&mut self) -> io::Result<usize>;
-}
 
-impl<G, L> UringExt for Runtime<G, L, Uring> {
-    fn pools(&self) -> &Pools {
-        &self.backend().pools
-    }
+    /// Reads into a buffer the kernel picks from the provided-buffer rings.
+    fn read_provided(
+        &mut self,
+        fd: RawFd,
+        max_len: usize,
+        local: L,
+        done: fn(&mut Runtime<G, L, Uring>, L, io::Result<Bytes>),
+    ) -> io::Result<Op>;
 
-    fn submit(&mut self) -> io::Result<usize> {
-        self.backend_mut().ring_mut().submit()
-    }
+    /// Writes from the registered slab by address, so a pooled buffer can be
+    /// sent without copying it into the fixed region first.
+    fn write_fixed(
+        &mut self,
+        fd: RawFd,
+        addr: *const u8,
+        len: usize,
+        local: L,
+        done: fn(&mut Runtime<G, L, Uring>, L, io::Result<usize>),
+    ) -> io::Result<Op>;
+
+    /// Receives a message into `msg`, which must stay valid until `done` runs.
+    ///
+    /// # Safety
+    ///
+    /// `msg` must point at a wired `msghdr` that outlives the op.
+    unsafe fn recvmsg(
+        &mut self,
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        flags: u32,
+        local: L,
+        done: fn(&mut Runtime<G, L, Uring>, L, io::Result<usize>),
+    ) -> io::Result<Op>;
+
+    /// Sends the message in `msg`, which must stay valid until `done` runs.
+    fn sendmsg(
+        &mut self,
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        local: L,
+        done: fn(&mut Runtime<G, L, Uring>, L, io::Result<usize>),
+    ) -> io::Result<Op>;
 }
 
 /// Publishes this runtime's pools as the active ones, which is how a buffer

@@ -11,7 +11,7 @@
 //!
 //! Borrow tracking: the kernel consumes a buffer when it selects one, and the
 //! slab hands it out as a view (the `Bytes` returned by
-//! [`read_provided`](crate::io::read_provided)).
+//! [`read_provided`](crate::uring::UringExt::read_provided)(crate::uring::UringExt::read_provided)).
 //! The shared [`BorrowTracker`] records the hand-off (`0 → +1`); the count is
 //! positive while shared views hold the buffer and negative while exclusive
 //! views do. Each drop of a view releases one borrower, and the buffer returns

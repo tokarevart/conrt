@@ -12,13 +12,10 @@ use coio::Bytes;
 use coio::BytesMut;
 use coio::Msg;
 use coio::MsgMut;
+use coio::UringExt;
 use coio::alloc_bytes;
-use coio::read_provided;
-use coio::recvmsg;
 use coio::runtime::Runtime;
 use coio::runtime::block_on_default;
-use coio::sendmsg;
-use coio::write_fixed;
 use conrt_cstring::CString;
 use conrt_sys as sys;
 use libc::pid_t;
@@ -685,7 +682,7 @@ fn arm_sigchld(rt: &mut Rt) {
             return;
         }
     };
-    let _ = read_provided(rt, sigchld_fd, 128, OpLocal::Sigchld { buf }, on_sigchld);
+    let _ = rt.read_provided(sigchld_fd, 128, OpLocal::Sigchld { buf }, on_sigchld);
 }
 
 fn on_sigchld(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
@@ -1211,8 +1208,7 @@ fn arm_datagram(rt: &mut Rt) {
     // SAFETY: `recv` lives in the op local below, so the `msghdr` it owns
     // outlives the op.
     let _ = unsafe {
-        recvmsg(
-            rt,
+        rt.recvmsg(
             datagram_fd,
             ptr,
             0,
@@ -1479,8 +1475,7 @@ fn handle_follow(
         msg.msg_namelen = sender_len;
     }
     let ptr = slot.msg_ptr();
-    let _ = sendmsg(
-        rt,
+    let _ = rt.sendmsg(
         rt.global().datagram_fd,
         ptr,
         OpLocal::FollowSend {
@@ -1834,8 +1829,7 @@ fn arm_follow_write(rt: &mut Rt, pid: pid_t, pipe_id: u64, fd: RawFd, chunks: Ve
     };
     let addr = chunk.as_ptr().as_ptr();
     let len = chunk.len();
-    let _ = write_fixed(
-        rt,
+    let _ = rt.write_fixed(
         fd,
         addr,
         len,
@@ -1945,8 +1939,7 @@ fn arm_container_output(rt: &mut Rt, pid: pid_t) {
         finish_drain(rt, pid);
         return;
     };
-    let _ = read_provided(
-        rt,
+    let _ = rt.read_provided(
         fd,
         4096,
         OpLocal::ContainerOutput {
@@ -1978,8 +1971,7 @@ fn on_container_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
     if !lines.is_empty() {
         write_lines(rt, pid, lines);
     }
-    let _ = read_provided(
-        rt,
+    let _ = rt.read_provided(
         rt.global().outputs.get(&pid).map(|o| o.fd).unwrap_or(-1),
         4096,
         OpLocal::ContainerOutput { pid, line_buf },
@@ -2010,8 +2002,7 @@ fn arm_container_pty_output(rt: &mut Rt, pid: pid_t) {
         finish_drain(rt, pid);
         return;
     };
-    let _ = read_provided(
-        rt,
+    let _ = rt.read_provided(
         ptm_fd,
         4096,
         OpLocal::ContainerPtyOutput {
@@ -2049,8 +2040,7 @@ fn on_container_pty_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) 
         .get(&pid)
         .map(|i| i.ptm_fd)
         .unwrap_or(-1);
-    let _ = read_provided(
-        rt,
+    let _ = rt.read_provided(
         fd,
         4096,
         OpLocal::ContainerPtyOutput { pid, line_buf },
@@ -2192,8 +2182,7 @@ fn arm_session_frame(
     buf[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     buf[3..].copy_from_slice(&payload);
     let addr = buf.as_ptr().as_ptr();
-    let _ = write_fixed(
-        rt,
+    let _ = rt.write_fixed(
         stream_fd,
         addr,
         len,
@@ -2230,8 +2219,7 @@ fn on_session_frame(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
                 let addr = buf.as_ptr().as_ptr();
                 let len = buf.len();
                 let addr = unsafe { addr.add(off) };
-                let _ = write_fixed(
-                    rt,
+                let _ = rt.write_fixed(
                     stream_fd,
                     addr,
                     len - off,
@@ -2303,8 +2291,7 @@ fn arm_session_read(rt: &mut Rt, session_id: u64) {
     // A fixed-size scratch buffer would need slab-backed memory; the header is
     // only 3 bytes, so accumulate into the local and let `read` fill a pooled
     // buffer each time.
-    let op = read_provided(
-        rt,
+    let op = rt.read_provided(
         stream_fd,
         3,
         OpLocal::SessionHeader {
@@ -2347,8 +2334,7 @@ fn on_session_header(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
             .get(&session_id)
             .map(|s| s.stream_fd)
             .unwrap_or(-1);
-        let op = read_provided(
-            rt,
+        let op = rt.read_provided(
             stream_fd,
             3,
             OpLocal::SessionHeader { session_id, acc },
@@ -2369,8 +2355,7 @@ fn on_session_header(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
         .map(|s| s.stream_fd)
         .unwrap_or(-1);
     store_session_op(rt, session_id, SessionOp::Read, None);
-    let op = read_provided(
-        rt,
+    let op = rt.read_provided(
         stream_fd,
         frame_len.max(1),
         OpLocal::SessionPayload {
@@ -2417,8 +2402,7 @@ fn on_session_payload(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
             .get(&session_id)
             .map(|s| s.stream_fd)
             .unwrap_or(-1);
-        let op = read_provided(
-            rt,
+        let op = rt.read_provided(
             stream_fd,
             (need - acc.len()).max(1),
             OpLocal::SessionPayload {
@@ -2556,8 +2540,7 @@ fn dispatch_frame(rt: &mut Rt, session_id: u64, frame_type: u8, payload: Bytes) 
 fn arm_session_stdin(rt: &mut Rt, session_id: u64, fd: RawFd, buf: Bytes) {
     let addr = buf.as_ptr().as_ptr();
     let len = buf.len();
-    let _ = write_fixed(
-        rt,
+    let _ = rt.write_fixed(
         fd,
         addr,
         len,
@@ -2586,8 +2569,7 @@ fn on_session_stdin(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
                 let len = buf.len();
                 let addr = buf.as_ptr().as_ptr();
                 let addr = unsafe { addr.add(off) };
-                let _ = write_fixed(
-                    rt,
+                let _ = rt.write_fixed(
                     rt.global()
                         .attach_sessions
                         .get(&session_id)
@@ -2953,8 +2935,7 @@ fn arm_session_output(rt: &mut Rt, session_id: u64) {
         finish_session_output(rt, session_id);
         return;
     };
-    let op = read_provided(
-        rt,
+    let op = rt.read_provided(
         fd,
         4096,
         OpLocal::SessionOutputRead { session_id },
@@ -2996,8 +2977,7 @@ fn on_session_output(rt: &mut Rt, local: OpLocal, res: io::Result<Bytes>) {
     header[0] = 0x10;
     header[1..3].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
     let addr = header.as_ptr().as_ptr();
-    let op = write_fixed(
-        rt,
+    let op = rt.write_fixed(
         stream_fd,
         addr,
         3,
@@ -3035,8 +3015,7 @@ fn on_session_data_header(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
                 let len = header.len();
                 let addr = header.as_ptr().as_ptr();
                 let addr = unsafe { addr.add(off) };
-                let _ = write_fixed(
-                    rt,
+                let _ = rt.write_fixed(
                     stream_fd,
                     addr,
                     len - off,
@@ -3052,8 +3031,7 @@ fn on_session_data_header(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
             } else {
                 let len = payload.len();
                 let addr = payload.as_ptr().as_ptr();
-                let _ = write_fixed(
-                    rt,
+                let _ = rt.write_fixed(
                     stream_fd,
                     addr,
                     len,
@@ -3094,8 +3072,7 @@ fn on_session_data_payload(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) 
                 let len = payload.len();
                 let addr = payload.as_ptr().as_ptr();
                 let addr = unsafe { addr.add(off) };
-                let _ = write_fixed(
-                    rt,
+                let _ = rt.write_fixed(
                     stream_fd,
                     addr,
                     len - off,

@@ -1,0 +1,9 @@
+[package]
+name = "coio-mio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coio-core = { version = "0.1.0", path = "../coio-core" }
+libc = "0.2.190"
+mio = { version = "1.2.4", features = ["os-poll", "os-ext"] }

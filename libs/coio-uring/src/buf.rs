@@ -337,7 +337,7 @@ impl<T> Drop for Slice<T> {
 }
 
 /// A `[u8]` slice view: pooled read buffers returned by
-/// [`read_provided`](crate::io::read_provided) and pooled data handed to a
+/// [`read_provided`](crate::uring::UringExt::read_provided)(crate::uring::UringExt::read_provided) and pooled data handed to a
 /// send.
 pub type Bytes = Slice<u8>;
 
@@ -546,9 +546,9 @@ impl BytesMut {
 
     /// Downgrades this exclusive write buffer into a shared, read-only
     /// [`Bytes`] covering the same bytes, so it can be handed to
-    /// [`write_fixed`](crate::io::write_fixed) while still holding the slot.
-    /// The borrow is transferred: no count changes. Panics unless this view
-    /// is the only exclusive holder of its slot.
+    /// [`write_fixed`](crate::uring::UringExt::write_fixed) while still holding
+    /// the slot. The borrow is transferred: no count changes. Panics unless
+    /// this view is the only exclusive holder of its slot.
     pub fn into_bytes(self) -> Bytes {
         let len = self.len;
         let base = unsafe { core::ptr::read(&self.base) };
@@ -655,8 +655,8 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
 /// fails with `EFBIG`. The buffer's [`BytesMut::capacity`] is the chosen
 /// class's slot size; the caller fills it via [`BytesMut::as_mut`] and records
 /// the length with [`BytesMut::set_len`] before passing it to
-/// [`write_fixed`](crate::io::write_fixed). The slot is recycled when the
-/// buffer is dropped.
+/// [`write_fixed`](crate::uring::UringExt::write_fixed). The slot is recycled
+/// when the buffer is dropped.
 ///
 /// # Errors
 ///
@@ -681,7 +681,7 @@ pub fn alloc_bytes(size: usize) -> io::Result<BytesMut> {
 /// Adopts a provided buffer the kernel just selected for a completed
 /// `IOSQE_BUFFER_SELECT` op into a shared [`Bytes`] view, so a task can build
 /// its own buffer-selecting ops on top of
-/// [`read_provided`](crate::io::read_provided). `class` is the
+/// [`read_provided`](crate::uring::UringExt::read_provided)(crate::uring::UringExt::read_provided). `class` is the
 /// provided size-class index, `local` the buffer id the kernel reported via
 /// `cqueue::buffer_select`, and `len` the number of bytes the op produced.
 ///

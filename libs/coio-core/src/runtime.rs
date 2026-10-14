@@ -77,29 +77,27 @@ pub(crate) fn next_op_id() -> NonZeroU64 {
 
 // ── Slot state encoding ─────────────────────────────────────────────
 //
-// A slab slot is in exactly one of four states, all encoded in a single `u64`
+// A slab slot is in exactly one of three states, all encoded in a single `u64`
 // `id` so no `Option` discriminant is needed and `Vec<IoSlot>` stays safe to
 // index:
 //
 //   id == 0                       free — on the intrusive free stack, `body`
 //                                 holds the link to the next free slot
 //   id == n                       live — `local` is initialized and owned here
-//   id == n | LOCAL_TAKEN         live, but `local` has been moved out by
-//                                 `complete_op` and must never be read or
-//                                 dropped again
 //   id == n | CANCEL_PENDING      live, with a cancellation submitted whose
 //                                 completion has not been seen yet
+//
+// There is no "local taken" state: a slot's local is moved out only in
+// `complete_op`, which frees the slot in the same breath, so nothing can
+// observe the gap.
 //
 // The never-reset per-thread `NEXT_OP_ID` counter makes `n` unique for the
 // whole lifetime of the thread, so an `Op` handle can never name a slot that a
 // later op has taken over, nor an op of a later runtime. Because real ids start
 // at 1, a free slot (id 0) never satisfies an `Op`'s id check.
 //
-// Both flags ride along in the same word rather than costing fields. The id
-// space shrinks to 62 bits, which the never-reset counter will not reach.
-
-/// This op's `local` has been moved out of the slot.
-const LOCAL_TAKEN: u64 = 1 << 63;
+// The flag rides along in the same word rather than costing a field. The id
+// space shrinks to 63 bits, which the never-reset counter will not reach.
 
 /// A cancellation of this op has been submitted. The op's own completion is
 /// what decides the outcome, so this only records that the cancel's completion
@@ -109,7 +107,7 @@ const CANCEL_PENDING: u64 = 1 << 62;
 /// Highest id the counter may hand out; both flag bits must stay free.
 const MAX_OP_ID: u64 = CANCEL_PENDING;
 
-const ID_FLAGS: u64 = LOCAL_TAKEN | CANCEL_PENDING;
+const ID_FLAGS: u64 = CANCEL_PENDING;
 
 /// The op id carried in `id`, with the state bits stripped. Zero for a free
 /// slot, which therefore never matches a real [`Op`].
@@ -120,11 +118,6 @@ fn id_bits(id: u64) -> u64 {
 /// Whether the slot is on the free stack (and so holds a [`FreeLink`]).
 fn is_free(id: u64) -> bool {
     id == 0
-}
-
-/// Whether this op's `local` has already been moved out of the slot.
-fn is_taken(id: u64) -> bool {
-    id & LOCAL_TAKEN != 0
 }
 
 /// Whether a cancellation of this op is still in flight.
@@ -326,7 +319,7 @@ union SlotBody<G, L, B: Backend> {
 /// `local` is the caller's per-op state, moved back into the shim on completion
 /// (first-wins with a winning cancel). It is [`MaybeUninit`] rather than
 /// `Option` so the slot stays a plain `Sized` value with no discriminant: it is
-/// initialized whenever `!is_free(id) && !is_taken(id)` and must not be touched
+/// initialized whenever `!is_free(id)` and must not be touched
 /// otherwise.
 ///
 /// The `Vec<IoSlot>` invariant is that every slot is in exactly one of the
@@ -391,17 +384,11 @@ impl<G, L, B: Backend> IoSlot<G, L, B> {
     }
 
     /// Moves the local out, leaving the slot inert.
-    ///
-    /// Only valid while `!is_taken(id)`.
     fn take_local(&mut self) -> L {
-        assert!(
-            !is_free(self.id) && !is_taken(self.id),
-            "slot does not own a local"
-        );
-        // SAFETY: `!is_free && !is_taken` guarantees the slot owns an
-        // initialized `local`; `assume_init_read` moves it to the caller and
-        // leaves the field uninitialized. The caller is responsible for either
-        // marking `LOCAL_TAKEN` or freeing the slot before anyone can observe
+        assert!(!is_free(self.id), "slot does not own a local");
+        // SAFETY: `!is_free` guarantees the slot owns an initialized `local`;
+        // `assume_init_read` moves it to the caller and leaves the field
+        // uninitialized. The caller frees the slot before anyone can observe
         // the gap — nothing runs between those two steps.
         unsafe { self.local.assume_init_read() }
     }
@@ -685,19 +672,15 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
         self.inflight_ops -= 1;
         let head = self.free_slots_head;
         let slot = &mut self.io_slab[index as usize];
-        if !is_taken(slot.id) {
-            // SAFETY: a live, untaken slot owns an initialized `local`, and
-            // this is the single place that reclaims a slot whose op was never
-            // dispatched to completion.
-            unsafe { slot.local.assume_init_drop() };
-        }
+        // SAFETY: a live slot owns an initialized `local`, and this is the
+        // single place that reclaims a slot whose op was never dispatched.
+        unsafe { slot.local.assume_init_drop() };
         slot.push_free(head);
         self.free_slots_head = index;
     }
 
     /// Like [`Self::free_op_slot`], but the local has already been moved out
-    /// by the completion or a winning cancel, so only `id` and the free link
-    /// are written.
+    /// by the completion, so only `id` and the free link are written.
     fn free_op_slot_taken(&mut self, index: u32) {
         self.inflight_ops -= 1;
         let head = self.free_slots_head;
@@ -828,7 +811,7 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
             // single comparison rejects both free and recycled slots. A slot
             // already taken by its own completion, or one already cancelled,
             // is rejected too — there is nothing left to cancel.
-            Some(id) if id_bits(id) == op.id.get() && !is_taken(id) && !is_cancel_pending(id),
+            Some(id) if id_bits(id) == op.id.get() && !is_cancel_pending(id),
         );
         if !valid {
             return;
@@ -882,24 +865,15 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
             // Slot already recycled; a stale completion can never name a live op.
             return;
         }
-        if is_taken(slot.id) {
-            // `complete_op` already moved the local out and ran the callback, so
-            // it must not be taken again.
-            self.free_op_slot_taken(index);
-            return;
-        }
-
         let cancel_pending = is_cancel_pending(slot.id);
         let cancelled = cancel_pending && completion.cancelled;
 
         // Read the dispatch state out of the live union arm, then move the
-        // local and the buffers. Both are guarded by the `is_free`/`is_taken`
-        // checks above.
+        // local and the buffers. Both are guarded by the `is_free` check above.
         let (shim, done) = {
             let body = &self.io_slab[index as usize].body;
             // SAFETY: `!is_free` guarantees the `live` arm is the live one,
-            // written by `claim` and untouched since (a taken local does not
-            // affect `body`).
+            // written by `claim` and untouched since.
             let live = unsafe { &body.live };
             // SAFETY: `Live` is `Copy` data (two function pointers).
             (live.shim, live.done)
@@ -979,7 +953,7 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
     fn find_cancel_of(&self, index: u32) -> Option<u32> {
         let target_id = {
             let slot = self.io_slab.get(index as usize)?;
-            if is_free(slot.id) || is_taken(slot.id) {
+            if is_free(slot.id) {
                 return None;
             }
             slot.id & !CANCEL_PENDING
@@ -1058,11 +1032,16 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
     /// independent, so each is checked against its own slab.
     fn take_completion(&mut self, c: Completion) {
         if c.cancel {
-            let idx = c.slot as usize;
-            Self::assert_names_live(
+            // Range-checked, but deliberately *not* free-checked. A cancel slot
+            // is legitimately consumed before its own completion arrives: the
+            // op's completion can win the race, dispatch the cancel's callback
+            // and free the slot, leaving this completion with nothing to do.
+            // That is the common ordering, not a misbehaving backend, and
+            // `complete_cancel` already handles a free slot by dropping it.
+            assert!(
+                (c.slot as usize) < self.cancel_slab.len(),
+                "backend returned out-of-range cancel slot {}",
                 c.slot,
-                self.cancel_slab.len(),
-                is_free(self.cancel_slab[idx].id),
             );
             self.complete_cancel(c.slot, c.result);
         } else {
@@ -1147,9 +1126,9 @@ impl<G, L, B: Backend> Drop for Runtime<G, L, B> {
         //    completed. Free slots hold a `FreeLink`, not a live payload, so their
         //    uninitialized `local` must not be touched.
         for slot in self.io_slab.iter_mut() {
-            if !is_free(slot.id) && !is_taken(slot.id) {
-                // SAFETY: a live, untaken op slot still owns its initialized
-                // local, and no other path will drop it now.
+            if !is_free(slot.id) {
+                // SAFETY: a live op slot still owns its initialized local, and no
+                // other path will drop it now.
                 unsafe { slot.local.assume_init_drop() };
             }
         }
@@ -1260,7 +1239,6 @@ mod slot_layout_tests {
             0,
         );
         assert!(!is_free(a.id));
-        assert!(!is_taken(a.id));
 
         let local = a.take_local();
         assert_eq!(local.0, 1);

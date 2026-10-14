@@ -35,9 +35,11 @@
 //! # }
 //! ```
 //!
-//! Operations only one backend can provide stay behind that backend's feature,
-//! re-exported both at the root and under the backend's own module:
-//! [`read_provided`], [`write_fixed`], [`Msg`], and so on.
+//! Operations only one backend can provide stay behind that backend's feature.
+//! They are methods on that backend's extension trait, because a foreign type
+//! takes no inherent impls and core has no slot for a non-portable operation:
+//! [`uring::UringExt::read_provided`], [`uring::UringExt::write_fixed`], and so
+//! on, alongside its buffer types like [`Msg`].
 
 /// The backend-generic runtime surface, plus this crate's default backend's
 /// entry points.
@@ -62,6 +64,14 @@ pub use coio_core::IoBufRef;
 pub use coio_core::Op;
 pub use coio_core::ReadOp;
 pub use coio_core::WriteOp;
+#[cfg(feature = "mio")]
+pub use coio_mio as mio;
+#[cfg(feature = "mio")]
+pub use coio_mio::Mio;
+#[cfg(feature = "mio")]
+pub use coio_mio::MioConfig;
+#[cfg(feature = "mio")]
+pub use coio_mio::MioRuntime;
 /// Every backend, under its own module, whatever the platform default is.
 ///
 /// This is the escape hatch for a build with more than one backend enabled,
@@ -89,15 +99,26 @@ mod default_backend {
     pub use coio_uring::block_on;
     pub use coio_uring::block_on_default;
 }
-// A second backend adds a `mio` feature and a second arm here. It is absent
-// rather than declared-and-empty on purpose: an empty feature would look
-// selectable and silently do nothing, which is worse than its absence.
-#[cfg(not(all(feature = "uring", target_os = "linux")))]
+#[cfg(all(feature = "mio", not(all(feature = "uring", target_os = "linux"))))]
+mod default_backend {
+    pub use coio_mio::MioRuntime as Runtime;
+    pub use coio_mio::block_on;
+    pub use coio_mio::block_on_default;
+}
+
+#[cfg(not(any(all(feature = "uring", target_os = "linux"), feature = "mio")))]
 compile_error!(
-    "`coio` has no backend for this target: `uring` is Linux-only and is the only one yet. For no \
-     backend at all, depend on `coio-core` directly."
+    "`coio` has no backend for this target: `uring` is Linux-only, so enable `uring` there or \
+     `mio` anywhere. For no backend at all, depend on `coio-core` directly."
 );
 
+/// The default backend's whole surface, flat at the root.
+///
+/// A readiness backend has no pooled provided buffers, so this is much smaller
+/// than io_uring's: its buffer types and provided-buffer operations simply do
+/// not exist on a backend that has no slab.
+#[cfg(all(feature = "mio", not(all(feature = "uring", target_os = "linux"))))]
+pub use coio_mio::*;
 /// The default backend's whole surface, flat at the root.
 ///
 /// A glob rather than a restated list: these are exactly the items the default

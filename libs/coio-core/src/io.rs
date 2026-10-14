@@ -21,9 +21,12 @@ use std::io;
 use std::os::fd::RawFd;
 
 use crate::backend::Backend;
+use crate::buf::IoBuf;
 use crate::buf::IoBufMut;
 use crate::buf::IoBufRef;
 use crate::runtime::Op;
+use crate::runtime::OpOutcome;
+use crate::runtime::OpShimArgs;
 use crate::runtime::Runtime;
 
 /// The callback a portable operation reports through when it moves bytes.
@@ -123,4 +126,123 @@ impl<G, L, B: AcceptOp<G, L>> Runtime<G, L, B> {
     ) -> io::Result<Op> {
         B::accept(self, listener_fd, local, done)
     }
+}
+
+// ── Completion helpers ───────────────────────────────────────────────
+//
+// The tail of every completion shim is the same: turn the outcome into what the
+// caller's callback reports, rebuild the caller's buffer if there was one, and
+// either invoke the callback or — when the runtime is tearing the op down
+// without completing it — drop everything silently. Only the shim knows the
+// concrete buffer and callback types, so the shim still transmutates those two
+// things; everything after that is here, so a backend gets the teardown path
+// exactly right by construction rather than by copying it.
+
+/// The error for a negative backend result, if it is one.
+pub fn errno(result: i32) -> Option<io::Error> {
+    (result < 0).then(|| io::Error::from_raw_os_error(-result))
+}
+
+/// What a cancelled operation reports to its callback.
+///
+/// `Interrupted` says "resume or clean up", which is the right reading for a
+/// cancellation the caller asked for, and is distinguishable from the errno a
+/// genuine failure carries.
+pub fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
+}
+
+/// The byte count a byte-moving operation reports, or the failure.
+pub fn transferred(outcome: OpOutcome) -> io::Result<u32> {
+    match outcome {
+        OpOutcome::Completed { result, .. } => match errno(result) {
+            Some(e) => Err(e),
+            None => Ok(result as u32),
+        },
+        OpOutcome::Cancelled => Err(cancelled()),
+    }
+}
+
+/// Whether the runtime is tearing an op down without completing it.
+///
+/// A null `done` is that sentinel: the caller-supplied buffers have been
+/// rebuilt and must be dropped, but the operation produced no result and no
+/// user code may run.
+pub fn is_teardown(done: *const ()) -> bool {
+    done.is_null()
+}
+
+/// Hands a completed operation's buffer to `done`, or drops everything if the
+/// runtime is tearing the op down.
+///
+/// # Safety
+///
+/// `done` must have come from an op whose `done` parameter has exactly the type
+/// of the third argument, which is what pairs each op's signature with its
+/// shim. `args.bufs` must be the single buffer that op erased on the way in.
+pub unsafe fn finish_buf_op<Buf: IoBuf, G, L, B: Backend>(
+    rt: &mut Runtime<G, L, B>,
+    args: OpShimArgs<'_, L>,
+    done: ByteDone<G, L, B, Buf>,
+) {
+    assert_eq!(
+        args.bufs.len(),
+        1,
+        "shim expects 1 caller buffer but the op was given {}",
+        args.bufs.len(),
+    );
+    let OpShimArgs {
+        local,
+        bufs,
+        outcome,
+        ..
+    } = args;
+    let res = transferred(outcome);
+    // SAFETY: forwarded from this function's contract — the buffer was erased
+    // by this op on the way in and only the operation has touched it since.
+    let buf: Buf = unsafe { Buf::from_erased(bufs[0], res.as_ref().map_or(0, |n| *n)) };
+
+    if is_teardown(args.done) {
+        drop((buf, local));
+        return;
+    }
+    done(rt, local, buf, res.map(|n| n as usize));
+}
+
+/// Hands a completed operation's result to `done`, or drops the local if the
+/// runtime is tearing the op down.
+///
+/// `map` turns a successful backend result into the value the callback reports,
+/// which differs by operation — a byte count for a transfer, the fd itself for
+/// an accept.
+///
+/// # Safety
+///
+/// `done` must have come from an op whose `done` parameter has exactly the type
+/// of the third argument. `args.bufs` must be empty, which is the case for
+/// every operation that supplies no caller buffer.
+pub fn finish_plain_op<T, F, G, L, B: Backend>(
+    rt: &mut Runtime<G, L, B>,
+    args: OpShimArgs<'_, L>,
+    done: fn(&mut Runtime<G, L, B>, L, io::Result<T>),
+    map: F,
+) where
+    F: FnOnce(i32) -> T,
+{
+    assert!(
+        args.bufs.is_empty(),
+        "this operation supplies no caller buffer, but was given {}",
+        args.bufs.len(),
+    );
+    let OpShimArgs { local, outcome, .. } = args;
+    let res = match outcome {
+        OpOutcome::Completed { result, .. } => errno(result).map_or_else(|| Ok(map(result)), Err),
+        OpOutcome::Cancelled => Err(cancelled()),
+    };
+
+    if is_teardown(args.done) {
+        drop(local);
+        return;
+    }
+    done(rt, local, res);
 }

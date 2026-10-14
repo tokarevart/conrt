@@ -9,10 +9,14 @@ default = ["uring"]
 # pooled provided-buffer fast paths (`read_provided`, `write_fixed`) that let a
 # read be relayed straight out of its buffer with no copy.
 uring = ["dep:coio-uring"]
+# Readiness, for any target io_uring does not cover. No provided buffers: a
+# caller there owns its memory, which is the whole point of this backend.
+mio = ["dep:coio-mio"]
 
 [dependencies]
 coio-core = { path = "../coio-core" }
 coio-uring = { path = "../coio-uring", optional = true }
+coio-mio = { path = "../coio-mio", optional = true }
 
 [dev-dependencies]
 libc = "0.2"

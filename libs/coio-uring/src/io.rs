@@ -26,184 +26,23 @@ use coio_core::OpShimArgs;
 use coio_core::ReadOp;
 use coio_core::Runtime;
 use coio_core::WriteOp;
-use coio_core::recover;
+use coio_core::cancelled;
+use coio_core::errno;
+use coio_core::finish_buf_op;
+use coio_core::finish_plain_op;
+use coio_core::is_teardown;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
 use crate::buf::alloc_mut;
 use crate::buf::provided_bytes;
+use crate::pools::Pools;
 use crate::uring::Uring;
 use crate::uring::UringExt;
 
 /// The runtime these operations drive. `Runtime<G, L>` already defaults to
 /// this backend; the alias is here so the signatures below say so explicitly.
 type Rt<G, L> = Runtime<G, L, Uring>;
-
-fn errno(result: i32) -> Option<io::Error> {
-    (result < 0).then(|| io::Error::from_raw_os_error(-result))
-}
-
-/// Reported to a callback whose operation was cancelled.
-///
-/// `Interrupted` says "resume or clean up", which is the right reading for a
-/// cancellation the caller asked for, and is distinguishable from the errno a
-/// genuine failure would carry.
-fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
-}
-
-/// Maps a completion to the byte count its callback reports.
-fn transferred(outcome: OpOutcome) -> io::Result<u32> {
-    match outcome {
-        OpOutcome::Completed { result, .. } => match errno(result) {
-            Some(e) => Err(e),
-            None => Ok(result as u32),
-        },
-        OpOutcome::Cancelled => Err(cancelled()),
-    }
-}
-
-/// Asserts a shim was handed the number of buffers its op kind submits.
-fn expect_bufs(bufs: &[coio_core::IoBufErased], n: usize) {
-    assert_eq!(
-        bufs.len(),
-        n,
-        "shim expects {n} caller buffer(s) but the op was given {}",
-        bufs.len(),
-    );
-}
-
-/// Whether the runtime is tearing an op down without completing it.
-///
-/// `done` is null on that path: the caller-supplied buffers have been rebuilt
-/// and must be dropped, but the operation produced no result and no user code
-/// may run. Every shim checks this before invoking its callback.
-fn is_teardown(done: *const ()) -> bool {
-    done.is_null()
-}
-
-/// Reads up to `max_len` bytes from `fd` into a buffer selected from the
-/// runtime's provided buffer pools. The buffer is drawn from the smallest
-/// size class whose slot size is at least `max_len`; `max_len` larger than
-/// the largest class's slot size fails with `EFBIG`.
-///
-/// `done` receives the caller's `local` back along with the selected [`Bytes`]
-/// (borrowed from the pool; recycled when the last view drops).
-///
-/// For a read into caller-supplied memory, see
-/// [`Runtime::read`](coio_core::Runtime::read).
-pub fn read_provided<G, L>(
-    rt: &mut Rt<G, L>,
-    fd: RawFd,
-    max_len: usize,
-    local: L,
-    done: fn(&mut Rt<G, L>, L, io::Result<Bytes>),
-) -> io::Result<Op> {
-    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
-        let OpShimArgs {
-            local,
-            bufs,
-            outcome,
-            done,
-            class,
-        } = args;
-        // The kernel chose the buffer, so there is no caller buffer to rebuild.
-        expect_bufs(bufs, 0);
-
-        let res = match outcome {
-            OpOutcome::Completed { result, flags } => match errno(result) {
-                Some(e) => Err(e),
-                None => match io_uring::cqueue::buffer_select(flags) {
-                    Some(local_buf) => Ok(provided_bytes(class, local_buf, result as u32)),
-                    None => Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
-                },
-            },
-            OpOutcome::Cancelled => Err(cancelled()),
-        };
-
-        if is_teardown(done) {
-            drop(local);
-            return;
-        }
-        // SAFETY: `read_provided` registered `done` with this exact type.
-        let done: fn(&mut Rt<G, L>, L, io::Result<Bytes>) =
-            // SAFETY: the op this shim belongs to registered `done` with
-            // exactly this type.
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, res);
-    }
-
-    let class = rt
-        .pools()
-        .provided_pool
-        .class_for(max_len)
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
-    let entry = io_uring::opcode::Read::new(
-        io_uring::types::Fd(fd),
-        std::ptr::null_mut(),
-        max_len as u32,
-    )
-    .buf_group(u16::from(class))
-    .build()
-    .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-    rt.register_op(shim::<G, L>, done as *const (), local, class, &[], entry)
-}
-
-/// Writes `len` bytes from `addr` to `fd` via `IORING_OP_WRITE_FIXED`.
-///
-/// `addr` must point into the runtime's buffer slab, since `WRITE_FIXED`
-/// addresses the registered slab by absolute offset. The whole slab is
-/// registered as fixed buffer index 0 (see `build_pools`), so the address may
-/// come from either pool:
-///
-/// * a [`Bytes`](crate::buf::Bytes) from [`alloc_bytes`](crate::alloc_bytes),
-///   or
-/// * a [`Bytes`](crate::buf::Bytes) returned by
-///   [`read_provided`](crate::io::read_provided), i.e. straight out of a
-///   provided buffer — so a read can be relayed to another fd with no copy into
-///   the fixed region.
-///
-/// The caller must keep the buffer alive — e.g. by holding its `Bytes` inside
-/// `local` — until `done` runs; coio does not own it. Holding it also keeps a
-/// provided slot out of the pool for the op's duration, so the kernel cannot
-/// hand the same slot to a later read. A partial write is reported as the byte
-/// count; loop (re-arming `write` with the unwritten tail) to write
-/// everything.
-pub fn write_fixed<G, L>(
-    rt: &mut Rt<G, L>,
-    fd: RawFd,
-    addr: *const u8,
-    len: usize,
-    local: L,
-    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
-) -> io::Result<Op> {
-    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
-        let OpShimArgs {
-            local,
-            bufs,
-            outcome,
-            done,
-            ..
-        } = args;
-        expect_bufs(bufs, 0);
-        let res = transferred(outcome).map(|n| n as usize);
-
-        if is_teardown(done) {
-            drop(local);
-            return;
-        }
-        // SAFETY: `write_fixed` registered `done` with this exact type.
-        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
-            // SAFETY: the op this shim belongs to registered `done` with
-            // exactly this type.
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, res);
-    }
-
-    let entry =
-        io_uring::opcode::WriteFixed::new(io_uring::types::Fd(fd), addr, len as u32, 0).build();
-    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
-}
 
 /// The maximum number of `iovec`s the kernel accepts for one message: Linux
 /// `UIO_MAXIOV`/`IOV_MAX` (`linux/include/uapi/linux/uio.h`). A larger
@@ -221,14 +60,15 @@ const SCM_MAX_FD: usize = 253;
 pub const MAX_CTRL_CAP: usize = cmsg_space(SCM_MAX_FD * size_of::<libc::c_int>());
 
 /// A reusable set of pooled, pinned argument objects for one
-/// [`sendmsg`] op.
+/// [`sendmsg`](crate::uring::UringExt::sendmsg) op.
 ///
 /// [`Msg::new`] allocates a `msghdr` plus an array of
 /// [`MAX_IOV_CAP`] `iovec`s and a [`MAX_CTRL_CAP`]-byte control buffer from
 /// the runtime's fixed buffer pool, zeroes the `msghdr`, and wires its
 /// `msg_iov`/`msg_control` pointers to the pooled memory. The arguments
 /// therefore never move while the views are alive, so a slot can be reused
-/// across ops. Pass it borrowed to [`sendmsg`], which only needs its address
+/// across ops. Pass it borrowed to
+/// [`sendmsg`](crate::uring::UringExt::sendmsg), which only needs its address
 /// to build the submission.
 ///
 /// The arrays behave like static-sized vecs: the capacity is fixed
@@ -380,18 +220,20 @@ impl Msg {
 }
 
 /// A reusable set of pooled, pinned argument objects for one
-/// [`recvmsg`] op: the mutable counterpart of [`Msg`].
+/// [`recvmsg`](crate::uring::UringExt::recvmsg) op: the mutable counterpart of
+/// [`Msg`].
 ///
 /// [`MsgMut::new`] allocates the same fixed-size `msghdr`/`iovec`/control
 /// arguments as [`Msg`] and wires them up. The caller offers receive buffers
-/// by pushing `iovec`s with [`MsgMut::push_iov`]; [`recvmsg`] then hands the
-/// kernel the full control capacity [`MAX_CTRL_CAP`] and the pushed `iovec`s,
-/// and on completion the kernel clamps `msg_controllen` to what actually
-/// arrived and sets `msg_namelen`/`msg_flags`. Received data, flags and
-/// control bytes are read back through [`MsgMut::msg`], [`MsgMut::iov`] and
-/// [`MsgMut::ctrl`] after the future resolves; [`MsgMut::take_iov`] copies the
-/// received `iovec` metadata out so the slot can be released while the caller
-/// keeps the list of data buffers.
+/// by pushing `iovec`s with [`MsgMut::push_iov`];
+/// [`recvmsg`](crate::uring::UringExt::recvmsg) then hands the kernel the full
+/// control capacity [`MAX_CTRL_CAP`] and the pushed `iovec`s, and on completion
+/// the kernel clamps `msg_controllen` to what actually arrived and sets
+/// `msg_namelen`/`msg_flags`. Received data, flags and control bytes are read
+/// back through [`MsgMut::msg`], [`MsgMut::iov`] and [`MsgMut::ctrl`] after the
+/// future resolves; [`MsgMut::take_iov`] copies the received `iovec` metadata
+/// out so the slot can be released while the caller keeps the list of data
+/// buffers.
 pub struct MsgMut {
     msg: RefMut<libc::msghdr>,
     iov: RefMut<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>,
@@ -503,105 +345,6 @@ pub(crate) const fn cmsg_space(payload: usize) -> usize {
     (len + size_of::<libc::cmsghdr>() - 1) & !(size_of::<libc::cmsghdr>() - 1)
 }
 
-/// Receives a message into `slot` via `IORING_OP_RECVMSG`, yielding the
-/// number of bytes received to `done`. `flags` is passed to the kernel as-is,
-/// so `MSG_PEEK | MSG_TRUNC` (the peek phase of a two-phase datagram receive)
-/// is supported. Peer credentials and passed fds are read from `slot` (owned
-/// by `local`) once `done` runs.
-///
-/// `msg` is the wired `msghdr` pointer (from `MsgMut`); it must stay valid
-/// (i.e. the owning `MsgMut` kept alive in `local`) until `done` runs.
-///
-/// # Safety
-///
-/// `msg` must point at a valid, wired `msghdr` (from a [`MsgMut`]) that stays
-/// alive until `done` runs.
-pub unsafe fn recvmsg<G, L>(
-    rt: &mut Rt<G, L>,
-    fd: RawFd,
-    msg: *mut libc::msghdr,
-    flags: u32,
-    local: L,
-    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
-) -> io::Result<Op> {
-    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
-        let OpShimArgs {
-            local,
-            bufs,
-            outcome,
-            done,
-            ..
-        } = args;
-        // The message arguments live in the caller's local, not in a caller
-        // buffer, so there is nothing here to rebuild.
-        expect_bufs(bufs, 0);
-        let res = transferred(outcome).map(|n| n as usize);
-
-        if is_teardown(done) {
-            drop(local);
-            return;
-        }
-        // SAFETY: this operation registered `done` with this exact type.
-        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
-            // SAFETY: the op this shim belongs to registered `done` with
-            // exactly this type.
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, res);
-    }
-
-    unsafe {
-        (*msg).msg_controllen = MAX_CTRL_CAP;
-    }
-    let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), msg)
-        .flags(flags)
-        .build();
-    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
-}
-
-/// Sends the message in `slot` via `IORING_OP_SENDMSG`, typically carrying a
-/// passed fd in an `SCM_RIGHTS` cmsg, yielding the number of bytes sent to
-/// `done`. `msg` is the wired `msghdr` pointer (from `Msg`), which must stay
-/// valid (owning `Msg` kept alive in `local`) until `done` runs.
-///
-/// What is sent is everything currently in the slot, i.e. the `iovec`s and
-/// `cmsg`s pushed with
-/// [`Msg::push_iov`]/[`Msg::push_cmsg`]/[`Msg::push_scm_rights`].
-pub fn sendmsg<G, L>(
-    rt: &mut Rt<G, L>,
-    fd: RawFd,
-    msg: *mut libc::msghdr,
-    local: L,
-    done: fn(&mut Rt<G, L>, L, io::Result<usize>),
-) -> io::Result<Op> {
-    fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
-        let OpShimArgs {
-            local,
-            bufs,
-            outcome,
-            done,
-            ..
-        } = args;
-        // The message arguments live in the caller's local, not in a caller
-        // buffer, so there is nothing here to rebuild.
-        expect_bufs(bufs, 0);
-        let res = transferred(outcome).map(|n| n as usize);
-
-        if is_teardown(done) {
-            drop(local);
-            return;
-        }
-        // SAFETY: this operation registered `done` with this exact type.
-        let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
-            // SAFETY: the op this shim belongs to registered `done` with
-            // exactly this type.
-            unsafe { core::mem::transmute::<*const (), _>(done) };
-        done(rt, local, res);
-    }
-
-    let entry = io_uring::opcode::SendMsg::new(io_uring::types::Fd(fd), msg).build();
-    rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
-}
-
 // ── The portable operations ──────────────────────────────────────────
 //
 // `read`, `write` and `accept` are the cross-backend ones: any backend can
@@ -619,28 +362,10 @@ impl<G, L> ReadOp<G, L> for Uring {
         done: fn(&mut Runtime<G, L, Self>, L, Buf, io::Result<usize>),
     ) -> io::Result<Op> {
         fn shim<Buf: IoBufMut, G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
-            let OpShimArgs {
-                local,
-                bufs,
-                outcome,
-                done,
-                ..
-            } = args;
-            expect_bufs(bufs, 1);
-
-            let res = transferred(outcome);
-            // SAFETY: `read` erased this buffer's writable region on the way in,
-            // and the kernel has written into exactly that region since.
-            let buf: Buf = unsafe { recover(bufs[0], res.as_ref().map_or(0, |n| *n)) };
-
-            if is_teardown(done) {
-                drop((buf, local));
-                return;
-            }
             // SAFETY: `read` registered `done` with this exact type.
-            let done: ByteDone<G, L, Uring, Buf> =
-                unsafe { core::mem::transmute::<*const (), _>(done) };
-            done(rt, local, buf, res.map(|n| n as usize));
+            let done: ByteDone<G, L, Uring, Buf> = unsafe { core::mem::transmute(args.done) };
+            // SAFETY: forwarded from the op's own signature.
+            unsafe { finish_buf_op::<Buf, G, L, Uring>(rt, args, done) };
         }
 
         let (addr, len) = buf.writable();
@@ -666,28 +391,10 @@ impl<G, L> WriteOp<G, L> for Uring {
         done: fn(&mut Runtime<G, L, Self>, L, Buf, io::Result<usize>),
     ) -> io::Result<Op> {
         fn shim<Buf: IoBufRef, G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
-            let OpShimArgs {
-                local,
-                bufs,
-                outcome,
-                done,
-                ..
-            } = args;
-            expect_bufs(bufs, 1);
-
-            let res = transferred(outcome);
-            // SAFETY: `write` erased this buffer on the way in, so the runtime
-            // has held it untouched since; the op only ever read from it.
-            let buf: Buf = unsafe { recover(bufs[0], res.as_ref().map_or(0, |n| *n)) };
-
-            if is_teardown(done) {
-                drop((buf, local));
-                return;
-            }
             // SAFETY: `write` registered `done` with this exact type.
-            let done: ByteDone<G, L, Uring, Buf> =
-                unsafe { core::mem::transmute::<*const (), _>(done) };
-            done(rt, local, buf, res.map(|n| n as usize));
+            let done: ByteDone<G, L, Uring, Buf> = unsafe { core::mem::transmute(args.done) };
+            // SAFETY: forwarded from the op's own signature.
+            unsafe { finish_buf_op::<Buf, G, L, Uring>(rt, args, done) };
         }
 
         let (addr, len) = buf.readable();
@@ -712,30 +419,8 @@ impl<G, L> AcceptOp<G, L> for Uring {
         done: fn(&mut Runtime<G, L, Self>, L, io::Result<RawFd>),
     ) -> io::Result<Op> {
         fn shim<G, L>(rt: &mut Runtime<G, L, Uring>, args: OpShimArgs<'_, L>) {
-            let OpShimArgs {
-                local,
-                bufs,
-                outcome,
-                done,
-                ..
-            } = args;
-            expect_bufs(bufs, 0);
-            let res = match outcome {
-                OpOutcome::Completed { result, .. } => match errno(result) {
-                    Some(e) => Err(e),
-                    None => Ok(result),
-                },
-                OpOutcome::Cancelled => Err(cancelled()),
-            };
-
-            if is_teardown(done) {
-                drop(local);
-                return;
-            }
-            // SAFETY: `accept` registered `done` with this exact type.
-            let done: AcceptDone<G, L, Uring> =
-                unsafe { core::mem::transmute::<*const (), _>(done) };
-            done(rt, local, res);
+            let done: AcceptDone<G, L, Uring> = unsafe { core::mem::transmute(args.done) };
+            finish_plain_op(rt, args, done, |fd| fd);
         }
 
         let entry = io_uring::opcode::Accept::new(
@@ -745,5 +430,187 @@ impl<G, L> AcceptOp<G, L> for Uring {
         )
         .build();
         rt.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
+    }
+}
+
+// ── The io_uring operations ──────────────────────────────────────────
+//
+// These reach core's runtime through `UringExt` rather than being inherent
+// methods: a foreign type takes no inherent impls, and unlike `read`/`write`/
+// `accept` they are not portable, so core has no business declaring a slot for
+// them. They are methods all the same, so nothing here is a free function.
+
+impl<G, L> UringExt<G, L> for Runtime<G, L, Uring> {
+    fn pools(&self) -> &Pools {
+        &self.backend().pools
+    }
+
+    fn submit(&mut self) -> io::Result<usize> {
+        self.backend_mut().ring_mut().submit()
+    }
+
+    /// Reads up to `max_len` bytes from `fd` into a buffer selected from the
+    /// runtime's provided buffer pools. The buffer is drawn from the smallest
+    /// size class whose slot size is at least `max_len`; `max_len` larger than
+    /// the largest class's slot size fails with `EFBIG`.
+    ///
+    /// `done` receives the caller's `local` back along with the selected
+    /// [`Bytes`] (borrowed from the pool; recycled when the last view
+    /// drops).
+    ///
+    /// For a read into caller-supplied memory, see
+    /// [`Runtime::read`](coio_core::Runtime::read).
+    fn read_provided(
+        &mut self,
+        fd: RawFd,
+        max_len: usize,
+        local: L,
+        done: fn(&mut Rt<G, L>, L, io::Result<Bytes>),
+    ) -> io::Result<Op> {
+        fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+            // The kernel chose the buffer, so there is no caller buffer to rebuild
+            // — but the id of the buffer it chose rides in the CQE flags, which is
+            // why this decode cannot go through the shared tail.
+            let OpShimArgs {
+                local,
+                outcome,
+                class,
+                ..
+            } = args;
+            let res = match outcome {
+                OpOutcome::Completed { result, flags } => match errno(result) {
+                    Some(e) => Err(e),
+                    None => match io_uring::cqueue::buffer_select(flags) {
+                        Some(local_buf) => Ok(provided_bytes(class, local_buf, result as u32)),
+                        None => Err(io::Error::from_raw_os_error(libc::ENOBUFS)),
+                    },
+                },
+                OpOutcome::Cancelled => Err(cancelled()),
+            };
+            if is_teardown(args.done) {
+                drop(local);
+                return;
+            }
+            // SAFETY: `read_provided` registered `done` with this exact type.
+            let done: fn(&mut Rt<G, L>, L, io::Result<Bytes>) =
+                unsafe { core::mem::transmute(args.done) };
+            done(rt, local, res);
+        }
+
+        let class = self
+            .pools()
+            .provided_pool
+            .class_for(max_len)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        let entry = io_uring::opcode::Read::new(
+            io_uring::types::Fd(fd),
+            std::ptr::null_mut(),
+            max_len as u32,
+        )
+        .buf_group(u16::from(class))
+        .build()
+        .flags(io_uring::squeue::Flags::BUFFER_SELECT);
+        self.register_op(shim::<G, L>, done as *const (), local, class, &[], entry)
+    }
+
+    /// Writes `len` bytes from `addr` to `fd` via `IORING_OP_WRITE_FIXED`.
+    ///
+    /// `addr` must point into the runtime's buffer slab, since `WRITE_FIXED`
+    /// addresses the registered slab by absolute offset. The whole slab is
+    /// registered as fixed buffer index 0 (see `build_pools`), so the address
+    /// may come from either pool:
+    ///
+    /// * a [`Bytes`](crate::buf::Bytes) from
+    ///   [`alloc_bytes`](crate::alloc_bytes), or
+    /// * a [`Bytes`](crate::buf::Bytes) returned by
+    ///   [`read_provided`](crate::uring::UringExt::read_provided)(crate::uring::UringExt::read_provided),
+    ///   i.e. straight out of a provided buffer — so a read can be relayed to
+    ///   another fd with no copy into the fixed region.
+    ///
+    /// The caller must keep the buffer alive — e.g. by holding its `Bytes`
+    /// inside `local` — until `done` runs; coio does not own it. Holding it
+    /// also keeps a provided slot out of the pool for the op's duration, so
+    /// the kernel cannot hand the same slot to a later read. A partial
+    /// write is reported as the byte count; loop (re-arming `write` with
+    /// the unwritten tail) to write everything.
+    fn write_fixed(
+        &mut self,
+        fd: RawFd,
+        addr: *const u8,
+        len: usize,
+        local: L,
+        done: fn(&mut Rt<G, L>, L, io::Result<usize>),
+    ) -> io::Result<Op> {
+        fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+            let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+                unsafe { core::mem::transmute(args.done) };
+            finish_plain_op(rt, args, done, |n| n as usize);
+        }
+
+        let entry =
+            io_uring::opcode::WriteFixed::new(io_uring::types::Fd(fd), addr, len as u32, 0).build();
+        self.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
+    }
+
+    /// Receives a message into `slot` via `IORING_OP_RECVMSG`, yielding the
+    /// number of bytes received to `done`. `flags` is passed to the kernel
+    /// as-is, so `MSG_PEEK | MSG_TRUNC` (the peek phase of a two-phase
+    /// datagram receive) is supported. Peer credentials and passed fds are
+    /// read from `slot` (owned by `local`) once `done` runs.
+    ///
+    /// `msg` is the wired `msghdr` pointer (from `MsgMut`); it must stay valid
+    /// (i.e. the owning `MsgMut` kept alive in `local`) until `done` runs.
+    ///
+    /// # Safety
+    ///
+    /// `msg` must point at a valid, wired `msghdr` (from a [`MsgMut`]) that
+    /// stays alive until `done` runs.
+    unsafe fn recvmsg(
+        &mut self,
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        flags: u32,
+        local: L,
+        done: fn(&mut Rt<G, L>, L, io::Result<usize>),
+    ) -> io::Result<Op> {
+        fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+            let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+                unsafe { core::mem::transmute(args.done) };
+            finish_plain_op(rt, args, done, |n| n as usize);
+        }
+
+        unsafe {
+            (*msg).msg_controllen = MAX_CTRL_CAP;
+        }
+        let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), msg)
+            .flags(flags)
+            .build();
+        self.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
+    }
+
+    /// Sends the message in `slot` via `IORING_OP_SENDMSG`, typically carrying
+    /// a passed fd in an `SCM_RIGHTS` cmsg, yielding the number of bytes
+    /// sent to `done`. `msg` is the wired `msghdr` pointer (from `Msg`),
+    /// which must stay valid (owning `Msg` kept alive in `local`) until
+    /// `done` runs.
+    ///
+    /// What is sent is everything currently in the slot, i.e. the `iovec`s and
+    /// `cmsg`s pushed with
+    /// [`Msg::push_iov`]/[`Msg::push_cmsg`]/[`Msg::push_scm_rights`].
+    fn sendmsg(
+        &mut self,
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        local: L,
+        done: fn(&mut Rt<G, L>, L, io::Result<usize>),
+    ) -> io::Result<Op> {
+        fn shim<G, L>(rt: &mut Rt<G, L>, args: OpShimArgs<'_, L>) {
+            let done: fn(&mut Rt<G, L>, L, io::Result<usize>) =
+                unsafe { core::mem::transmute(args.done) };
+            finish_plain_op(rt, args, done, |n| n as usize);
+        }
+
+        let entry = io_uring::opcode::SendMsg::new(io_uring::types::Fd(fd), msg).build();
+        self.register_op(shim::<G, L>, done as *const (), local, 0, &[], entry)
     }
 }
