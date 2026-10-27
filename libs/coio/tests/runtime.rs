@@ -12,6 +12,8 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::mem::align_of;
+use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
@@ -20,9 +22,13 @@ use std::rc::Rc;
 use coio::Bytes;
 use coio::BytesMut;
 use coio::Msg;
+use coio::MsgMut;
 use coio::RuntimeParams;
 use coio::SizeClass;
 use coio::alloc_bytes;
+use coio::alloc_mut;
+use coio::alloc_slice_mut;
+use coio::cmsg_space;
 use coio::runtime::Op;
 use coio::runtime::Runtime;
 use coio::runtime::block_on;
@@ -72,19 +78,17 @@ fn params() -> RuntimeParams {
             size: 256,
             count: 4,
         }],
-        // 256 for small buffers, 4096 for `BytesMut`, and 16384 so `Msg::new`
-        // (msghdr + iov array + control buffer) can be allocated.
+        // 64 for `Msg` arguments (msghdr, one iovec and the control buffer
+        // all fit), 256 for small buffers and 4096 for `BytesMut`. There is
+        // deliberately no 16 KiB class: a message must not need one.
         size_classes: vec![
+            SizeClass { size: 64, count: 8 },
             SizeClass {
                 size: 256,
                 count: 4,
             },
             SizeClass {
                 size: 4096,
-                count: 2,
-            },
-            SizeClass {
-                size: 16384,
                 count: 2,
             },
         ],
@@ -263,7 +267,7 @@ fn on_send(rt: &mut Runtime<G, SMsg>, _local: SMsg, res: std::io::Result<usize>)
 fn sendmsg_roundtrip_to_a_socket() {
     let (a, b) = socketpair(false);
     let g = block_on(&params(), G::default(), |rt| {
-        let mut msg = Msg::new().unwrap();
+        let mut msg = Msg::with_capacity(1, 0).unwrap();
         let iov = libc::iovec {
             iov_base: b"ping".as_ptr() as *mut libc::c_void,
             iov_len: 4,
@@ -280,6 +284,192 @@ fn sendmsg_roundtrip_to_a_socket() {
     assert_eq!(n, 4);
     assert_eq!(&buf[..4], b"ping");
     unsafe {
+        libc::close(a);
+        libc::close(b);
+    }
+}
+
+/// Carries the receive slot and its data buffer so both outlive the op.
+struct RMsg {
+    /// Kept alive only so the kernel's `msghdr` and `iovec` outlive the op.
+    #[allow(dead_code)]
+    slot: MsgMut,
+    #[allow(dead_code)]
+    buf: Vec<u8>,
+}
+
+fn on_recv(rt: &mut Runtime<G, RMsg>, local: RMsg, res: std::io::Result<usize>) {
+    match res {
+        Ok(n) => rt.global().push(format!("recv {n} {:?}", &local.buf[..n])),
+        Err(e) => rt.global().push(format!("recv err {e}")),
+    }
+}
+
+#[test]
+fn msg_capacity_bounds_pushes() {
+    let g = block_on(&params(), G::default(), |_rt: &mut Runtime<G, ()>| {
+        let mut msg = Msg::with_capacity(1, 0).unwrap();
+        assert_eq!(msg.iov_capacity(), 1);
+        assert_eq!(msg.ctrl_capacity(), 0);
+
+        let iov = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        assert!(msg.push_iov(iov));
+        assert!(!msg.push_iov(iov), "a second iovec must not fit");
+        assert!(!msg.push_scm_rights(&[0]), "no control capacity declared");
+
+        // Declaring no iovec allocates no iovec array; the control buffer is
+        // sized for exactly one fd.
+        let mut control = Msg::with_capacity(0, cmsg_space(size_of::<libc::c_int>())).unwrap();
+        assert_eq!(control.iov_capacity(), 0);
+        assert!(control.ctrl_capacity() >= cmsg_space(size_of::<libc::c_int>()));
+        assert!(control.push_scm_rights(&[0]));
+        assert!(!control.push_iov(iov), "no iovec capacity declared");
+    });
+    assert!(g.lines().is_empty());
+}
+
+#[test]
+fn pooled_message_arguments_are_aligned() {
+    let _ = block_on(&params(), G::default(), |_rt: &mut Runtime<G, ()>| {
+        let word = alloc_mut::<u64>().unwrap();
+        assert_eq!(
+            word.as_ptr().as_ptr() as usize % align_of::<u64>(),
+            0,
+            "a typed slot must be aligned for its element"
+        );
+        drop(word);
+
+        let hdr = alloc_mut::<libc::msghdr>().unwrap();
+        assert_eq!(
+            hdr.as_ptr().as_ptr() as usize % align_of::<libc::msghdr>(),
+            0
+        );
+        drop(hdr);
+
+        let iovs = alloc_slice_mut::<libc::iovec>(3).unwrap();
+        assert_eq!(
+            iovs.as_ptr().as_ptr() as usize % align_of::<libc::iovec>(),
+            0
+        );
+        drop(iovs);
+
+        let mut msg = MsgMut::with_capacity(2, cmsg_space(size_of::<libc::c_int>())).unwrap();
+        assert_eq!(
+            msg.msg_ptr() as usize % align_of::<libc::msghdr>(),
+            0,
+            "the wired msghdr must be aligned"
+        );
+        let null = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        assert!(msg.push_iov(null));
+        assert!(msg.push_iov(null));
+        for i in 0..2 {
+            let iov = msg.iov(i).unwrap() as *mut libc::iovec as usize;
+            assert_eq!(iov % align_of::<libc::iovec>(), 0);
+        }
+
+        let ctrl = msg.ctrl().unwrap().as_mut_ptr() as usize;
+        assert_eq!(
+            ctrl % align_of::<libc::cmsghdr>(),
+            0,
+            "the control buffer must be aligned for a cmsghdr"
+        );
+
+        let mut control = Msg::with_capacity(0, cmsg_space(size_of::<libc::c_int>())).unwrap();
+        assert!(control.push_scm_rights(&[0]));
+        let ctrl = control.ctrl().unwrap().as_mut_ptr() as usize;
+        assert_eq!(
+            ctrl % align_of::<libc::cmsghdr>(),
+            0,
+            "a pushed cmsg must stay on a cmsghdr boundary"
+        );
+        assert_eq!(
+            control.msg().msg_controllen % align_of::<libc::cmsghdr>(),
+            0
+        );
+    });
+}
+
+#[test]
+fn recvmsg_roundtrip_into_the_declared_iovec() {
+    let (a, b) = socketpair(false);
+    assert_eq!(unsafe { libc::send(b, b"pong".as_ptr().cast(), 4, 0) }, 4);
+    let g = block_on(&params(), G::default(), |rt| {
+        let mut slot = MsgMut::with_capacity(1, 0).unwrap();
+        let mut buf = vec![0u8; 4];
+        assert!(slot.push_iov(libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        }));
+        let ptr = slot.msg_ptr();
+        // SAFETY: `slot` lives in the op local below, so the `msghdr` it owns
+        // outlives the op.
+        unsafe {
+            rt.recvmsg(a, ptr, 0, 0, RMsg { slot, buf }, on_recv)
+                .unwrap();
+        }
+    });
+    assert_eq!(g.lines(), vec![format!("recv 4 {:?}", b"pong")]);
+    unsafe {
+        libc::close(a);
+        libc::close(b);
+    }
+}
+
+#[test]
+fn sendmsg_passes_an_fd_without_an_iovec() {
+    let (a, b) = socketpair(false);
+    let mut pipe = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let (rd, wr) = (pipe[0], pipe[1]);
+
+    let g = block_on(&params(), G::default(), |rt| {
+        // No iovec, one SCM_RIGHTS cmsg: exactly the daemon's fd-pass reply.
+        // `msg_iov` is null here, so this also proves the kernel accepts a
+        // cmsg-only send with no iovec array.
+        let mut msg = Msg::with_capacity(0, cmsg_space(size_of::<libc::c_int>())).unwrap();
+        assert!(msg.push_scm_rights(&[rd]));
+        let ptr = msg.msg_ptr();
+        rt.sendmsg(a, ptr, SMsg(msg), on_send).unwrap();
+    });
+    assert_eq!(g.lines(), vec!["sent 0"]);
+
+    let mut data = [0u8; 8];
+    let mut ctrl = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.as_mut_ptr().cast();
+    msg.msg_controllen = ctrl.len();
+    let n = unsafe { libc::recvmsg(b, &mut msg, 0) };
+    assert!(n >= 0, "recvmsg: {}", std::io::Error::last_os_error());
+
+    let mut received = -1;
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                received = *(libc::CMSG_DATA(cmsg) as *const libc::c_int);
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    assert!(received >= 0, "no fd was received");
+    assert_eq!(unsafe { libc::fcntl(received, libc::F_GETFD) }, 0);
+
+    unsafe {
+        libc::close(received);
+        libc::close(rd);
+        libc::close(wr);
         libc::close(a);
         libc::close(b);
     }

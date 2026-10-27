@@ -35,10 +35,11 @@ use crate::pools::set_current_pools;
 pub struct UringConfig {
     /// Submission and completion queue depth handed to the ring.
     pub ring_entries: u32,
-    /// Provided-buffer size classes for reads. Each `count` must be a power of
-    /// two no larger than 32768.
+    /// Provided-buffer size classes for reads. Each `size` must be a power of
+    /// two, and each `count` a power of two no larger than 32768.
     pub provided_size_classes: Vec<SizeClass>,
-    /// Fixed-buffer size classes for writes and op-argument allocations.
+    /// Fixed-buffer size classes for writes and op-argument allocations. Each
+    /// `size` must be a power of two.
     pub size_classes: Vec<SizeClass>,
 }
 
@@ -280,6 +281,7 @@ pub trait UringExt<G, L> {
         &mut self,
         fd: RawFd,
         msg: *mut libc::msghdr,
+        ctrl_cap: usize,
         flags: u32,
         local: L,
         done: fn(&mut Runtime<G, L, Uring>, L, io::Result<usize>),

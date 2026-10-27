@@ -34,7 +34,9 @@ use coio_core::is_teardown;
 
 use crate::buf::Bytes;
 use crate::buf::RefMut;
+use crate::buf::SliceMut;
 use crate::buf::alloc_mut;
+use crate::buf::alloc_slice_mut;
 use crate::buf::provided_bytes;
 use crate::pools::Pools;
 use crate::uring::Uring;
@@ -62,24 +64,23 @@ pub const MAX_CTRL_CAP: usize = cmsg_space(SCM_MAX_FD * size_of::<libc::c_int>()
 /// A reusable set of pooled, pinned argument objects for one
 /// [`sendmsg`](crate::uring::UringExt::sendmsg) op.
 ///
-/// [`Msg::new`] allocates a `msghdr` plus an array of
-/// [`MAX_IOV_CAP`] `iovec`s and a [`MAX_CTRL_CAP`]-byte control buffer from
-/// the runtime's fixed buffer pool, zeroes the `msghdr`, and wires its
-/// `msg_iov`/`msg_control` pointers to the pooled memory. The arguments
-/// therefore never move while the views are alive, so a slot can be reused
-/// across ops. Pass it borrowed to
-/// [`sendmsg`](crate::uring::UringExt::sendmsg), which only needs its address
-/// to build the submission.
+/// [`Msg::with_capacity`] allocates a `msghdr` plus an `iovec` array and a
+/// control buffer sized to the caller's declared capacities, from the
+/// runtime's fixed buffer pool, zeroes the `msghdr`, and wires its
+/// `msg_iov`/`msg_control` pointers to the pooled memory. Nothing is sized to
+/// the kernel maximum up front: a message that carries one `iovec` and one
+/// fd-sized cmsg allocates only enough for those. The arguments therefore
+/// never move while the views are alive, so a slot can be reused across ops.
 ///
-/// The arrays behave like static-sized vecs: the capacity is fixed
-/// ([`MAX_IOV_CAP`]/[`MAX_CTRL_CAP`]), the current length lives in the
-/// `msghdr` (`msg_iovlen` and `msg_controllen`), and entries are appended with
-/// [`Msg::push_iov`], [`Msg::push_cmsg`] and [`Msg::push_scm_rights`]. The
-/// lengths therefore always reflect exactly what was pushed, so a send never
-/// hands the kernel uninitialized entries. To start a fresh message, call
+/// The arrays behave like vecs whose capacity was chosen at construction: the
+/// current length lives in the `msghdr` (`msg_iovlen` and `msg_controllen`),
+/// and entries are appended with [`Msg::push_iov`], [`Msg::push_cmsg`] and
+/// [`Msg::push_scm_rights`], failing past the declared capacity. The lengths
+/// therefore always reflect exactly what was pushed, so a send never hands the
+/// kernel uninitialized entries. To start a fresh message, call
 /// [`Msg::clear`], which resets both lengths to zero.
 ///
-/// `Msg::new` returns `None` when the pool cannot serve a requested
+/// `with_capacity` returns `None` when the pool cannot serve a requested
 /// allocation (a size class is exhausted). The pool pins the *arguments*; the
 /// data buffers the `iovec`s point at are still the caller's to fill and keep
 /// alive for the duration of the op. The receive counterpart is
@@ -87,56 +88,94 @@ pub const MAX_CTRL_CAP: usize = cmsg_space(SCM_MAX_FD * size_of::<libc::c_int>()
 /// [`MsgMut::msg`], [`MsgMut::iov`] and [`MsgMut::ctrl`].
 pub struct Msg {
     msg: RefMut<libc::msghdr>,
-    iov: RefMut<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>,
-    ctrl: RefMut<[u8; MAX_CTRL_CAP]>,
+    iov: Option<SliceMut<MaybeUninit<libc::iovec>>>,
+    ctrl: Option<SliceMut<u8>>,
 }
 
-const _: () = assert!(size_of::<Msg>() == 36);
+const _: () = assert!(size_of::<Msg>() == 44);
 
 impl Msg {
-    /// Allocates the slot's pooled arguments from the runtime's fixed buffer
-    /// pool and wires the zeroed `msghdr` to them. Returns `None` when the
-    /// pool cannot serve a requested allocation (a size class is exhausted).
-    /// The lengths start at zero: data is declared by pushing with
-    /// [`Msg::push_iov`], [`Msg::push_cmsg`] and [`Msg::push_scm_rights`].
-    pub fn new() -> Option<Self> {
+    /// Allocates a `msghdr` plus pooled `iovec` and control arrays sized for
+    /// exactly what the message will carry: `iovs` entries and `ctrl_bytes`
+    /// of control data. Returns `None` when a requested allocation cannot be
+    /// served, either because the pool size class is exhausted or because no
+    /// class fits.
+    ///
+    /// `iovs` and `ctrl_bytes` are capacities: the kernel limit
+    /// [`MAX_IOV_CAP`]/[`MAX_CTRL_CAP`] is asserted, not allocated. An
+    /// argument of zero allocates nothing for that array, so a message that
+    /// carries only an `SCM_RIGHTS` cmsg costs no `iovec` memory. Data is
+    /// declared with [`Msg::push_iov`], [`Msg::push_cmsg`] and
+    /// [`Msg::push_scm_rights`]; pushing past a declared capacity fails.
+    pub fn with_capacity(iovs: usize, ctrl_bytes: usize) -> Option<Self> {
+        assert!(
+            iovs <= MAX_IOV_CAP,
+            "message iovec capacity {iovs} exceeds MAX_IOV_CAP {MAX_IOV_CAP}"
+        );
+        assert!(
+            ctrl_bytes <= MAX_CTRL_CAP,
+            "message control capacity {ctrl_bytes} exceeds MAX_CTRL_CAP {MAX_CTRL_CAP}"
+        );
+
         let msg: RefMut<libc::msghdr> = unsafe { alloc_mut::<libc::msghdr>()?.cast() };
-        let iov = unsafe {
-            alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
-                .cast::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()
+        let iov = if iovs == 0 {
+            None
+        } else {
+            Some(alloc_slice_mut::<MaybeUninit<libc::iovec>>(iovs)?)
         };
-        let ctrl = unsafe { alloc_mut::<[u8; MAX_CTRL_CAP]>()?.cast::<[u8; MAX_CTRL_CAP]>() };
+        let ctrl = if ctrl_bytes == 0 {
+            None
+        } else {
+            Some(alloc_slice_mut::<u8>(ctrl_bytes)?)
+        };
 
         unsafe {
-            let msg = msg.as_ptr().as_mut();
-            *msg = core::mem::zeroed();
-            msg.msg_iov = iov.as_ptr().as_ptr().cast();
-            msg.msg_control = ctrl.as_ptr().as_ptr().cast();
+            let m = msg.as_ptr().as_mut();
+            *m = core::mem::zeroed();
+            m.msg_iov = iov
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |s| s.as_ptr().as_ptr().cast());
+            m.msg_control = ctrl
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |s| s.as_ptr().as_ptr().cast());
         }
 
         Some(Self { msg, iov, ctrl })
     }
 
+    /// The number of `iovec`s this message can hold.
+    pub fn iov_capacity(&self) -> usize {
+        self.iov.as_ref().map_or(0, |s| s.len())
+    }
+
+    /// The number of control bytes this message can hold.
+    pub fn ctrl_capacity(&self) -> usize {
+        self.ctrl.as_ref().map_or(0, |s| s.len())
+    }
+
     /// Appends one `iovec` to the message, updating `msg_iovlen`. Returns
-    /// `false` when the vec is full; the iovec is then not pushed.
+    /// `false` when the declared iovec capacity is reached; the iovec is then
+    /// not pushed.
     pub fn push_iov(&mut self, iov: libc::iovec) -> bool {
+        let len = unsafe { (*self.msg_ptr()).msg_iovlen };
+        if len >= self.iov_capacity() {
+            return false;
+        }
+        let Some(slot) = self.iov.as_ref() else {
+            return false;
+        };
         unsafe {
-            let msg_ptr = self.msg_ptr();
-            let len = (*msg_ptr).msg_iovlen;
-            if len >= MAX_IOV_CAP {
-                return false;
-            }
-            let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
+            let base = slot.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             base.add(len).write(MaybeUninit::new(iov));
-            (*msg_ptr).msg_iovlen = len + 1;
+            (*self.msg_ptr()).msg_iovlen = len + 1;
         }
         true
     }
 
     /// Appends one control message (`level`/`kind` with `payload`) to the
     /// message, adding its `CMSG_SPACE` to `msg_controllen`. Returns `false`
-    /// when the buffer cannot fit the header plus the payload; nothing is
-    /// then pushed.
+    /// when the declared control capacity cannot fit the header plus the
+    /// payload; nothing is then pushed.
     ///
     /// The append base is the current `msg_controllen`, so after a receive it
     /// is the received length: the new message is sent after the received
@@ -144,14 +183,32 @@ impl Msg {
     /// fresh message instead.
     pub fn push_cmsg(&mut self, level: libc::c_int, kind: libc::c_int, payload: &[u8]) -> bool {
         let space = cmsg_space(payload.len());
+        let used = unsafe { (*self.msg_ptr()).msg_controllen };
+        if used + space > self.ctrl_capacity() {
+            return false;
+        }
+        let Some(slot) = self.ctrl.as_ref() else {
+            return false;
+        };
         unsafe {
-            let msg_ptr = self.msg_ptr();
-            let used = (*msg_ptr).msg_controllen;
-            if used + space > MAX_CTRL_CAP {
-                return false;
-            }
-            let base = self.ctrl.as_ptr().cast::<u8>();
-            let hdr = base.add(used).as_ptr() as *mut libc::cmsghdr;
+            let base = slot.as_ptr().as_ptr();
+            // The control buffer is typed as bytes, but it is written through
+            // `cmsghdr`. Its slot is aligned to at least the size class (capped
+            // at a page), and a control message only fits in a class large
+            // enough to cover `CMSG_SPACE`, so that is at least the header
+            // alignment. `cmsg_space` rounds every entry to the header
+            // alignment, so `used` keeps the same boundary.
+            assert_eq!(
+                base as usize % align_of::<libc::cmsghdr>(),
+                0,
+                "the pooled control buffer is not aligned for a cmsghdr"
+            );
+            assert_eq!(
+                used % align_of::<libc::cmsghdr>(),
+                0,
+                "a cmsg must start on a cmsghdr boundary"
+            );
+            let hdr = base.add(used) as *mut libc::cmsghdr;
             (*hdr).cmsg_len = size_of::<libc::cmsghdr>() + payload.len();
             (*hdr).cmsg_level = level;
             (*hdr).cmsg_type = kind;
@@ -160,7 +217,7 @@ impl Msg {
                 hdr.add(1).cast::<u8>(),
                 payload.len(),
             );
-            (*msg_ptr).msg_controllen = used + space;
+            (*self.msg_ptr()).msg_controllen = used + space;
         }
         true
     }
@@ -183,7 +240,7 @@ impl Msg {
     }
 
     /// The wrapped `msghdr`, initialized and wired to the pooled iov/control
-    /// memory by [`Msg::new`].
+    /// memory by [`Msg::with_capacity`].
     pub fn msg(&mut self) -> &mut libc::msghdr {
         unsafe { self.msg.as_ptr().as_mut() }
     }
@@ -192,25 +249,26 @@ impl Msg {
     /// current `msg_iovlen`, so entries beyond what was pushed are never
     /// exposed. Returns `None` when `i` is out of range.
     pub fn iov(&mut self, i: usize) -> Option<&mut libc::iovec> {
-        if i >= self.msg().msg_iovlen {
+        if i >= unsafe { (*self.msg_ptr()).msg_iovlen } {
             return None;
         }
+        let slot = self.iov.as_ref()?;
         unsafe {
-            let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
+            let base = slot.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             Some(base.add(i).as_mut().assume_init_mut())
         }
     }
 
-    /// The control bytes: the space the pushed `cmsg`s occupy. Bounded by
-    /// [`MAX_CTRL_CAP`].
+    /// The control bytes: the space the pushed `cmsg`s occupy. Bounded by the
+    /// declared control capacity, and `None` when the message declared none.
     pub fn ctrl(&mut self) -> Option<&mut [u8]> {
-        let len = self.msg().msg_controllen.min(MAX_CTRL_CAP);
-        unsafe {
-            Some(core::slice::from_raw_parts_mut(
-                self.ctrl.as_ptr().as_ptr().cast::<u8>(),
-                len,
-            ))
+        let cap = self.ctrl_capacity();
+        if cap == 0 {
+            return None;
         }
+        let len = unsafe { (*self.msg_ptr()).msg_controllen }.min(cap);
+        let slot = self.ctrl.as_ref()?;
+        unsafe { Some(core::slice::from_raw_parts_mut(slot.as_ptr().as_ptr(), len)) }
     }
 
     /// The address of the wired `msghdr`, used to build the submission entry.
@@ -223,67 +281,102 @@ impl Msg {
 /// [`recvmsg`](crate::uring::UringExt::recvmsg) op: the mutable counterpart of
 /// [`Msg`].
 ///
-/// [`MsgMut::new`] allocates the same fixed-size `msghdr`/`iovec`/control
-/// arguments as [`Msg`] and wires them up. The caller offers receive buffers
-/// by pushing `iovec`s with [`MsgMut::push_iov`];
-/// [`recvmsg`](crate::uring::UringExt::recvmsg) then hands the kernel the full
-/// control capacity [`MAX_CTRL_CAP`] and the pushed `iovec`s, and on completion
-/// the kernel clamps `msg_controllen` to what actually arrived and sets
-/// `msg_namelen`/`msg_flags`. Received data, flags and control bytes are read
-/// back through [`MsgMut::msg`], [`MsgMut::iov`] and [`MsgMut::ctrl`] after the
-/// future resolves; [`MsgMut::take_iov`] copies the received `iovec` metadata
-/// out so the slot can be released while the caller keeps the list of data
-/// buffers.
+/// [`MsgMut::with_capacity`] allocates a `msghdr` plus `iovec` and control
+/// arrays sized to the declared capacities, exactly as [`Msg`] does. The
+/// caller offers receive buffers by pushing `iovec`s with
+/// [`MsgMut::push_iov`]; [`recvmsg`](crate::uring::UringExt::recvmsg) hands the
+/// kernel the declared control capacity and the pushed `iovec`s, and on
+/// completion the kernel clamps `msg_controllen` to what actually arrived and
+/// sets `msg_namelen`/`msg_flags`. Received data, flags and control bytes are
+/// read back through [`MsgMut::msg`], [`MsgMut::iov`] and [`MsgMut::ctrl`]
+/// after the future resolves; [`MsgMut::take_iov`] copies the received `iovec`
+/// metadata out so the slot can be released while the caller keeps the list of
+/// data buffers.
 pub struct MsgMut {
     msg: RefMut<libc::msghdr>,
-    iov: RefMut<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>,
-    ctrl: RefMut<[u8; MAX_CTRL_CAP]>,
+    iov: Option<SliceMut<MaybeUninit<libc::iovec>>>,
+    ctrl: Option<SliceMut<u8>>,
 }
 
-const _: () = assert!(size_of::<MsgMut>() == 36);
+const _: () = assert!(size_of::<MsgMut>() == 44);
 
 impl MsgMut {
-    /// Allocates the slot's pooled arguments from the runtime's fixed buffer
-    /// pool and wires the zeroed `msghdr` to them. Returns `None` when the
-    /// pool cannot serve a requested allocation (a size class is exhausted).
-    /// The lengths start at zero: receive buffers are declared with
+    /// Allocates a `msghdr` plus pooled `iovec` and control arrays sized for
+    /// `iovs` receive buffers and `ctrl_bytes` of control data. Returns `None`
+    /// when a requested allocation cannot be served.
+    ///
+    /// `iovs` and `ctrl_bytes` are capacities: [`MAX_IOV_CAP`]/[`MAX_CTRL_CAP`]
+    /// are asserted, not allocated. A zero argument allocates nothing for that
+    /// array: a receive that wants no ancillary data declares `0` control
+    /// bytes and pays for no control buffer. Receive buffers are declared with
     /// [`MsgMut::push_iov`].
-    pub fn new() -> Option<Self> {
+    pub fn with_capacity(iovs: usize, ctrl_bytes: usize) -> Option<Self> {
+        assert!(
+            iovs <= MAX_IOV_CAP,
+            "message iovec capacity {iovs} exceeds MAX_IOV_CAP {MAX_IOV_CAP}"
+        );
+        assert!(
+            ctrl_bytes <= MAX_CTRL_CAP,
+            "message control capacity {ctrl_bytes} exceeds MAX_CTRL_CAP {MAX_CTRL_CAP}"
+        );
+
         let msg: RefMut<libc::msghdr> = unsafe { alloc_mut::<libc::msghdr>()?.cast() };
-        let iov = unsafe {
-            alloc_mut::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()?
-                .cast::<[MaybeUninit<libc::iovec>; MAX_IOV_CAP]>()
+        let iov = if iovs == 0 {
+            None
+        } else {
+            Some(alloc_slice_mut::<MaybeUninit<libc::iovec>>(iovs)?)
         };
-        let ctrl = unsafe { alloc_mut::<[u8; MAX_CTRL_CAP]>()?.cast::<[u8; MAX_CTRL_CAP]>() };
+        let ctrl = if ctrl_bytes == 0 {
+            None
+        } else {
+            Some(alloc_slice_mut::<u8>(ctrl_bytes)?)
+        };
 
         unsafe {
-            let msg = msg.as_ptr().as_mut();
-            *msg = core::mem::zeroed();
-            msg.msg_iov = iov.as_ptr().as_ptr().cast();
-            msg.msg_control = ctrl.as_ptr().as_ptr().cast();
+            let m = msg.as_ptr().as_mut();
+            *m = core::mem::zeroed();
+            m.msg_iov = iov
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |s| s.as_ptr().as_ptr().cast());
+            m.msg_control = ctrl
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |s| s.as_ptr().as_ptr().cast());
         }
 
         Some(Self { msg, iov, ctrl })
     }
 
+    /// The number of `iovec`s this message can hold.
+    pub fn iov_capacity(&self) -> usize {
+        self.iov.as_ref().map_or(0, |s| s.len())
+    }
+
+    /// The number of control bytes this message can hold.
+    pub fn ctrl_capacity(&self) -> usize {
+        self.ctrl.as_ref().map_or(0, |s| s.len())
+    }
+
     /// Appends one `iovec` offering a receive buffer, updating `msg_iovlen`.
-    /// Returns `false` when the vec is full; the iovec is then not pushed.
+    /// Returns `false` when the declared iovec capacity is reached; the iovec
+    /// is then not pushed.
     pub fn push_iov(&mut self, iov: libc::iovec) -> bool {
+        let len = unsafe { (*self.msg_ptr()).msg_iovlen };
+        if len >= self.iov_capacity() {
+            return false;
+        }
+        let Some(slot) = self.iov.as_ref() else {
+            return false;
+        };
         unsafe {
-            let msg_ptr = self.msg_ptr();
-            let len = (*msg_ptr).msg_iovlen;
-            if len >= MAX_IOV_CAP {
-                return false;
-            }
-            let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
+            let base = slot.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             base.add(len).write(MaybeUninit::new(iov));
-            (*msg_ptr).msg_iovlen = len + 1;
+            (*self.msg_ptr()).msg_iovlen = len + 1;
         }
         true
     }
 
     /// The wrapped `msghdr`, initialized and wired to the pooled iov/control
-    /// memory by [`MsgMut::new`]. The kernel updates it on a receive:
+    /// memory by [`MsgMut::with_capacity`]. The kernel updates it on a receive:
     /// `msg_flags`, `msg_namelen` and `msg_controllen` are meaningful after
     /// the op resolves.
     pub fn msg(&mut self) -> &mut libc::msghdr {
@@ -294,40 +387,44 @@ impl MsgMut {
     /// Bounded by the current `msg_iovlen`. Returns `None` when `i` is out of
     /// range.
     pub fn iov(&mut self, i: usize) -> Option<&mut libc::iovec> {
-        if i >= self.msg().msg_iovlen {
+        if i >= unsafe { (*self.msg_ptr()).msg_iovlen } {
             return None;
         }
+        let slot = self.iov.as_ref()?;
         unsafe {
-            let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
+            let base = slot.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             Some(base.add(i).as_mut().assume_init_mut())
         }
     }
 
     /// The control bytes: after a receive, exactly what the kernel reported
-    /// (`msg_controllen`). Bounded by [`MAX_CTRL_CAP`].
+    /// (`msg_controllen`). Bounded by the declared control capacity, and
+    /// `None` when the message declared none.
     pub fn ctrl(&mut self) -> Option<&mut [u8]> {
-        let len = self.msg().msg_controllen.min(MAX_CTRL_CAP);
-        unsafe {
-            Some(core::slice::from_raw_parts_mut(
-                self.ctrl.as_ptr().as_ptr().cast::<u8>(),
-                len,
-            ))
+        let cap = self.ctrl_capacity();
+        if cap == 0 {
+            return None;
         }
+        let len = unsafe { (*self.msg_ptr()).msg_controllen }.min(cap);
+        let slot = self.ctrl.as_ref()?;
+        unsafe { Some(core::slice::from_raw_parts_mut(slot.as_ptr().as_ptr(), len)) }
     }
 
     /// Copies the received `iovec`s out of the pooled array and resets
     /// `msg_iovlen` to zero, so the slot's pooled arguments can be released
     /// while the caller keeps the list of data buffers the kernel filled.
     pub fn take_iov(&mut self) -> Vec<libc::iovec> {
+        let len = unsafe { (*self.msg_ptr()).msg_iovlen };
+        let Some(slot) = self.iov.as_ref() else {
+            return Vec::new();
+        };
         unsafe {
-            let msg = self.msg.as_ptr().as_mut();
-            let len = msg.msg_iovlen;
             let mut out = Vec::with_capacity(len);
-            let base = self.iov.as_ptr().cast::<MaybeUninit<libc::iovec>>();
+            let base = slot.as_ptr().cast::<MaybeUninit<libc::iovec>>();
             for i in 0..len {
                 out.push(base.add(i).read().assume_init());
             }
-            msg.msg_iovlen = 0;
+            (*self.msg_ptr()).msg_iovlen = 0;
             out
         }
     }
@@ -340,9 +437,10 @@ impl MsgMut {
 
 /// `CMSG_SPACE(n)`: the `msg_controllen` value that covers a `cmsg` carrying
 /// `n` payload bytes — the `cmsg` plus trailing alignment to the next `cmsg`.
-pub(crate) const fn cmsg_space(payload: usize) -> usize {
+pub const fn cmsg_space(payload: usize) -> usize {
+    let align = align_of::<libc::cmsghdr>();
     let len = size_of::<libc::cmsghdr>() + payload;
-    (len + size_of::<libc::cmsghdr>() - 1) & !(size_of::<libc::cmsghdr>() - 1)
+    (len + align - 1) & !(align - 1)
 }
 
 // ── The portable operations ──────────────────────────────────────────
@@ -558,17 +656,27 @@ impl<G, L> UringExt<G, L> for Runtime<G, L, Uring> {
     /// datagram receive) is supported. Peer credentials and passed fds are
     /// read from `slot` (owned by `local`) once `done` runs.
     ///
-    /// `msg` is the wired `msghdr` pointer (from `MsgMut`); it must stay valid
-    /// (i.e. the owning `MsgMut` kept alive in `local`) until `done` runs.
+    /// `msg` is the wired `msghdr` pointer (from [`MsgMut::msg_ptr`]), and
+    /// `ctrl_cap` is that message's [`MsgMut::ctrl_capacity`]. The kernel is
+    /// offered exactly `ctrl_cap` control bytes, so a message that declared
+    /// none receives none instead of being handed the kernel maximum. `msg`
+    /// must stay valid (the owning `MsgMut` kept in `local`) until `done`
+    /// runs.
+    ///
+    /// A pointer rather than `&mut MsgMut` because the caller moves that
+    /// `MsgMut` into `local` in the same call; borrowing it and moving it
+    /// cannot both happen.
     ///
     /// # Safety
     ///
     /// `msg` must point at a valid, wired `msghdr` (from a [`MsgMut`]) that
-    /// stays alive until `done` runs.
+    /// stays alive until `done` runs, and `ctrl_cap` must not exceed that
+    /// message's control capacity.
     unsafe fn recvmsg(
         &mut self,
         fd: RawFd,
         msg: *mut libc::msghdr,
+        ctrl_cap: usize,
         flags: u32,
         local: L,
         done: fn(&mut Rt<G, L>, L, io::Result<usize>),
@@ -580,7 +688,8 @@ impl<G, L> UringExt<G, L> for Runtime<G, L, Uring> {
         }
 
         unsafe {
-            (*msg).msg_controllen = MAX_CTRL_CAP;
+            (*msg).msg_controllen = ctrl_cap;
+            (*msg).msg_flags = 0;
         }
         let entry = io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), msg)
             .flags(flags)
@@ -590,9 +699,9 @@ impl<G, L> UringExt<G, L> for Runtime<G, L, Uring> {
 
     /// Sends the message in `slot` via `IORING_OP_SENDMSG`, typically carrying
     /// a passed fd in an `SCM_RIGHTS` cmsg, yielding the number of bytes
-    /// sent to `done`. `msg` is the wired `msghdr` pointer (from `Msg`),
-    /// which must stay valid (owning `Msg` kept alive in `local`) until
-    /// `done` runs.
+    /// sent to `done`. `msg` is the wired `msghdr` pointer (from
+    /// [`Msg::msg_ptr`]), which must stay valid (the owning `Msg` kept in
+    /// `local`) until `done` runs.
     ///
     /// What is sent is everything currently in the slot, i.e. the `iovec`s and
     /// `cmsg`s pushed with

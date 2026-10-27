@@ -11,7 +11,9 @@
 /// A run of equal-sized buffer slots.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SizeClass {
-    /// Slot size in bytes.
+    /// Slot size in bytes. Must be a power of two: the class stride equals the
+    /// slot size, so a non-power-of-two size would keep later slots from
+    /// inheriting the alignment the class base is padded to.
     pub size: u32,
     /// Number of slots in the class.
     pub count: u32,
@@ -125,10 +127,11 @@ pub(crate) struct SizeClassLayout {
 /// per-class base offsets and cumulative totals. The returned order is the
 /// class-index order used by the packed `bid` and by `buf_group`.
 ///
-/// Each class starts on an offset aligned to its slot size capped at one page,
-/// so slots of size `S` land on `min(S, BUFFER_MAX_ALIGN)`-aligned addresses
-/// once the slab base is aligned to the largest class's alignment. The gap
-/// between consecutive classes is left unused.
+/// Every class `size` must be a power of two, and each class starts on an
+/// offset aligned to its slot size capped at one page, so every slot of size
+/// `S` lands on a `min(S, BUFFER_MAX_ALIGN)`-aligned address once the slab base
+/// is aligned to the largest class's alignment. The gap between consecutive
+/// classes is left unused.
 ///
 /// With `power_of_two_counts`, every `count` must be a power of two no larger
 /// than `32768`, matching the kernel's provided-buffer-ring limit.
@@ -159,6 +162,14 @@ pub(crate) fn layout_classes(
     let mut base: u64 = 0;
     for class in &sorted {
         assert!(class.size > 0, "buffer size class size must be nonzero");
+        // Power-of-two sizes are what make the alignment guarantee hold for
+        // *every* slot, not just slot 0: the class stride equals the slot size,
+        // so a non-power-of-two size would let later slots drift off the
+        // alignment the class base was padded to.
+        assert!(
+            class.size.is_power_of_two(),
+            "buffer size class sizes must be powers of two"
+        );
         assert!(class.count > 0, "buffer size class count must be nonzero");
         assert!(
             u64::from(class.count) <= u64::from(BID_LOCAL_MASK),
@@ -274,34 +285,46 @@ mod tests {
     }
 
     #[test]
-    fn layout_classes_aligns_each_class_to_its_size() {
-        // Non-multiple sizes: back-to-back layout would misalign the classes.
+    fn layout_classes_aligns_every_slot_in_a_class() {
+        // Odd counts make the next class start unaligned unless the layout
+        // pads to the class's own size.
         let classes = [
-            SizeClass { size: 3, count: 2 },
-            SizeClass { size: 5, count: 2 },
-            SizeClass { size: 4, count: 1 },
+            SizeClass { size: 4, count: 3 },
+            SizeClass { size: 16, count: 3 },
+            SizeClass { size: 64, count: 3 },
         ];
         let layouts = layout_classes(&classes, false);
         for layout in &layouts {
-            assert_eq!(
-                layout.base_offset % layout.size,
-                0,
-                "class {:?} must start on an offset aligned to its size",
-                layout
-            );
+            let align = u64::from(layout.size.min(BUFFER_MAX_ALIGN));
+            for local in 0..layout.count {
+                let offset =
+                    u64::from(layout.base_offset) + u64::from(local) * u64::from(layout.size);
+                assert_eq!(
+                    offset % align,
+                    0,
+                    "slot {local} of class {:?} must keep the class alignment",
+                    layout
+                );
+            }
         }
         // No class overlaps the previous one's slots.
         for pair in layouts.windows(2) {
             assert!(u64::from(pair[1].base_offset) >= pair[0].total);
         }
-        // 3x2 = 6, then 6 aligned up to 4 is 8; 8 + 4x1 = 12, aligned to 5
-        // gives 15; 15 + 5x2 = 25.
+        // 4x3 = 12, aligned to 16 is 16; 16 + 16x3 = 64; 64 + 64x3 = 256.
         assert_eq!(layouts[0].base_offset, 0);
-        assert_eq!(layouts[0].total, 6);
-        assert_eq!(layouts[1].base_offset, 8);
-        assert_eq!(layouts[1].total, 12);
-        assert_eq!(layouts[2].base_offset, 15);
-        assert_eq!(layouts[2].total, 25);
+        assert_eq!(layouts[0].total, 12);
+        assert_eq!(layouts[1].base_offset, 16);
+        assert_eq!(layouts[1].total, 64);
+        assert_eq!(layouts[2].base_offset, 64);
+        assert_eq!(layouts[2].total, 256);
+    }
+
+    #[test]
+    fn layout_classes_rejects_non_power_of_two_sizes() {
+        // Such a class would hand out slots that drift off its base alignment.
+        let classes = [SizeClass { size: 48, count: 1 }];
+        assert!(std::panic::catch_unwind(|| layout_classes(&classes, false)).is_err());
     }
 
     #[test]

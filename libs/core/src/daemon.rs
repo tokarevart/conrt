@@ -14,6 +14,7 @@ use coio::Msg;
 use coio::MsgMut;
 use coio::UringExt;
 use coio::alloc_bytes;
+use coio::cmsg_space;
 use coio::runtime::Runtime;
 use coio::runtime::block_on_default;
 use conrt_cstring::CString;
@@ -186,6 +187,11 @@ enum OpLocal {
         buf: Vec<u8>,
         sender: Box<libc::sockaddr_un>,
     },
+    /// The non-consuming peek that measures the next datagram, so the
+    /// consuming receive allocates exactly that many bytes instead of the
+    /// 64 KiB maximum every time. Owns the `msghdr` the consuming receive
+    /// then reuses.
+    DatagramPeek { recv: MsgMut },
     /// An SCM_RIGHTS fd-pass reply is being sent to a `Logs { follow }`
     /// client. Owns the message, the destination address the kernel reads on
     /// completion, and the pipe read end to close afterwards.
@@ -1183,18 +1189,59 @@ fn run_init_loop(death_pipe_read: RawFd, command: Vec<CString>) -> ! {
 
 // ── Async request handlers ──────────────────────────────────────────────────
 
-/// Arms one datagram receive. The completion callback handles the request and
-/// immediately re-arms, so the control socket always has a receive in flight.
+/// Arms one datagram receive.
+///
+/// The datagram's size is measured first with a non-consuming
+/// `MSG_PEEK | MSG_TRUNC` receive, so the buffer the consuming receive fills is
+/// allocated to exactly that size. The previous code allocated 64 KiB for every
+/// request, most of which was never touched. The peek also costs nothing extra
+/// on the wire: the control socket has one reader, so the peeked datagram is
+/// still the head when the consuming receive runs.
 fn arm_datagram(rt: &mut Rt) {
     let datagram_fd = rt.global().datagram_fd;
-    let Some(mut recv) = MsgMut::new() else {
+    // One iovec is declared here and reused by the consuming receive below.
+    let Some(recv) = MsgMut::with_capacity(1, 0) else {
         return;
     };
-    let buf = vec![0u8; 65536];
-    recv.push_iov(libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
+    let ptr = recv.msg_ptr();
+    // SAFETY: `recv` lives in the op local below, so the `msghdr` it owns
+    // outlives the op. No control bytes are requested.
+    let _ = unsafe {
+        rt.recvmsg(
+            datagram_fd,
+            ptr,
+            0,
+            (libc::MSG_PEEK | libc::MSG_TRUNC) as u32,
+            OpLocal::DatagramPeek { recv },
+            on_datagram_peek,
+        )
+    };
+}
+
+fn on_datagram_peek(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
+    let OpLocal::DatagramPeek { mut recv } = local else {
+        return;
+    };
+    let n = match res {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(%e, "datagram peek failed");
+            arm_datagram(rt);
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; n];
+    // One iovec was declared with `with_capacity`, so this cannot fail; if the
+    // message were ever mis-sized, re-arm rather than drop the request.
+    if !recv.push_iov(libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
-    });
+    }) {
+        tracing::error!("datagram receive iovec did not fit");
+        arm_datagram(rt);
+        return;
+    }
     // Allocate the sender buffer first so `msg_name` can point at it. The box's
     // contents never move when the box itself is moved into the op local, so
     // the pointer stays valid for the kernel to fill.
@@ -1206,16 +1253,23 @@ fn arm_datagram(rt: &mut Rt) {
     }
     let ptr = recv.msg_ptr();
     // SAFETY: `recv` lives in the op local below, so the `msghdr` it owns
-    // outlives the op.
-    let _ = unsafe {
+    // outlives the op. No control bytes are requested.
+    let submitted = unsafe {
         rt.recvmsg(
-            datagram_fd,
+            rt.global().datagram_fd,
             ptr,
+            0,
             0,
             OpLocal::Datagram { recv, buf, sender },
             on_datagram,
         )
     };
+    if submitted.is_err() {
+        // The datagram is still queued, so retry from the peek rather than
+        // leaving the control socket with no receive armed.
+        tracing::error!("failed to submit datagram receive; re-arming");
+        arm_datagram(rt);
+    }
 }
 
 fn on_datagram(rt: &mut Rt, local: OpLocal, res: io::Result<usize>) {
@@ -1455,7 +1509,10 @@ fn handle_follow(
     }
 
     // Pass the read end to the client with SCM_RIGHTS.
-    let Some(mut slot) = Msg::new() else {
+    // One SCM_RIGHTS fd is 4 payload bytes; size the control buffer for
+    // exactly that, and allocate no iovec (this send carries only control).
+    let Some(mut slot) = Msg::with_capacity(0, cmsg_space(std::mem::size_of::<libc::c_int>()))
+    else {
         return;
     };
     if !slot.push_scm_rights(&[pipe_fds.read]) {

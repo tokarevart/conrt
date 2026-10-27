@@ -23,6 +23,7 @@ use crate::buf::SliceMut;
 use crate::buf::fixed::FixedSlab;
 use crate::buf::provided::ProvidedSlab;
 use crate::buf::tracker::BorrowTracker;
+use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::SizeClass;
 use crate::classes::class_for;
 
@@ -82,6 +83,17 @@ impl<S: Slab> Pool<S> {
             slabs.len(),
             "the class table and the slab list must have the same length"
         );
+        // The allocation checks use the class table while the slabs own the
+        // memory, so a mismatch would make one of them reason about a slot size
+        // the other does not have. Check it once, at construction.
+        for (class, slab) in classes.iter().zip(&slabs) {
+            assert_eq!(
+                class.size,
+                slab.slot_size(),
+                "size class {} does not match its slab's slot size",
+                class.size
+            );
+        }
         Self { classes, slabs }
     }
 
@@ -102,6 +114,14 @@ impl<S: Slab> Pool<S> {
     /// The index of the smallest class whose slot size is at least `size`.
     pub(crate) fn class_for(&self, size: usize) -> Option<u8> {
         class_for(&self.classes, size)
+    }
+
+    /// The alignment every slot of size class `class` is guaranteed to have:
+    /// the class's slot size capped at one page. Class sizes are powers of two
+    /// and the slab base is aligned to the widest class, so this is exact for
+    /// every slot, not just slot 0.
+    pub(crate) fn slot_align(&self, class: u8) -> u32 {
+        self.classes[class as usize].size.min(BUFFER_MAX_ALIGN)
     }
 
     /// The slab backing size class `class`.
@@ -144,8 +164,9 @@ impl Pool<FixedSlab> {
 
     /// Pops a free slot of size class `class` and builds an exclusive
     /// [`SliceMut<T>`] covering the whole slot. The class-indexed counterpart
-    /// of [`FixedSlab::acquire_slice_mut`].
-    #[allow(dead_code)]
+    /// of [`FixedSlab::acquire_slice_mut`]. Backs
+    /// [`crate::buf::alloc_slice_mut`], which sizes a message's `iovec` and
+    /// control arrays by their declared length.
     pub(crate) fn acquire_slice_mut<T>(&mut self, class: u8) -> Option<SliceMut<T>> {
         self.slab_mut(class).acquire_slice_mut()
     }

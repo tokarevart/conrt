@@ -601,9 +601,25 @@ fn split_exclusive(bid: u32, generation: NonZeroU32) {
     with_pools(|r| r.with_slab(bid, |slab, local| slab.tracker_mut().split_exclusive(local)))
 }
 
+/// Panics unless size class `class` hands out slots aligned at least as
+/// strictly as `T` requires. A slot is only guaranteed `min(slot size, one
+/// page)` alignment, so a type aligned beyond a page cannot be pooled.
+fn assert_class_alignment<T>(pool: &FixedPool, class: u8, what: &str) {
+    let slot_align = pool.slot_align(class) as usize;
+    assert!(
+        core::mem::align_of::<T>() <= slot_align,
+        "{what}: the size class for {} aligns its slots to {slot_align} bytes, less than the \
+         type's {}-byte alignment",
+        core::any::type_name::<T>(),
+        core::mem::align_of::<T>(),
+    );
+}
+
 /// Allocates a slot of pooled op-argument memory for `T` from the runtime's
 /// fixed buffer slab, or `None` when the size class is exhausted or no size
-/// class fits `T`. Panics if `T` is zero-sized: a ZST needs no pinned memory.
+/// class fits `T`. The slot is aligned to `min(slot size, one page)`, which
+/// always covers `T`'s alignment for a sized type; a type aligned beyond a
+/// page is rejected. Panics if `T` is zero-sized: a ZST needs no pinned memory.
 /// The slot is uninitialized; initialize it through the returned
 /// `Ref<MaybeUninit<T>>` before use. The slot is recycled when the allocation
 /// is dropped.
@@ -623,6 +639,7 @@ pub fn alloc<T>() -> Option<Ref<MaybeUninit<T>>> {
     );
     with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
+        assert_class_alignment::<T>(&r.fixed_pool, class, "alloc");
         r.fixed_pool.acquire_ref::<MaybeUninit<T>>(class)
     })
 }
@@ -633,7 +650,9 @@ pub fn alloc<T>() -> Option<Ref<MaybeUninit<T>>> {
 /// the returned [`RefMut`] cannot be cloned and converts to a shared [`Ref`]
 /// with [`RefMut::into_ref`] while it is the sole holder. This is the root of
 /// the exclusive views the [`crate::io::Msg`]/[`crate::io::MsgMut`] arguments
-/// use. Panics if `T` is zero-sized.
+/// use. The slot carries the same `min(slot size, one page)` alignment
+/// guarantee as [`alloc`], so `T` aligned beyond a page is rejected. Panics if
+/// `T` is zero-sized.
 ///
 /// # Panics
 ///
@@ -645,7 +664,48 @@ pub fn alloc_mut<T>() -> Option<RefMut<MaybeUninit<T>>> {
     );
     with_pools(|r| {
         let class = r.fixed_pool.class_for(core::mem::size_of::<T>())?;
+        assert_class_alignment::<T>(&r.fixed_pool, class, "alloc_mut");
         r.fixed_pool.acquire_mut::<MaybeUninit<T>>(class)
+    })
+}
+
+/// Allocates a pooled slot sized for `count` elements of `T` and returns it as
+/// an exclusive typed slice of exactly `count` elements. The slot may be
+/// larger (it comes from a size class), but the view never exposes the unused
+/// tail, so the declared length is the length callers see. Returns `None` when
+/// `count` is zero, when no size class fits `count * size_of::<T>()`, or when
+/// that class is exhausted.
+///
+/// Unlike [`alloc_mut`], the length is a runtime value: the class is chosen
+/// from the requested byte count rather than from the type's own size. This is
+/// how the [`crate::io::Msg`] arguments allocate only the `iovec`s and control
+/// bytes a message actually declares, instead of the kernel maximum. The
+/// elements are aligned to `T` as long as `T`'s alignment is at most one page;
+/// a stricter alignment is rejected because pooled slots never exceed it.
+///
+/// # Panics
+///
+/// Calling this outside an active runtime panics.
+pub fn alloc_slice_mut<T>(count: usize) -> Option<SliceMut<T>> {
+    assert!(
+        core::mem::size_of::<T>() > 0,
+        "alloc_slice_mut: zero-sized types cannot be pooled"
+    );
+    let bytes = count.checked_mul(core::mem::size_of::<T>())?;
+    if bytes == 0 {
+        return None;
+    }
+    with_pools(|r| {
+        let class = r.fixed_pool.class_for(bytes)?;
+        assert_class_alignment::<T>(&r.fixed_pool, class, "alloc_slice_mut");
+        let slot = r.fixed_pool.acquire_slice_mut::<T>(class)?;
+        // Cover exactly `count` elements, not the whole class-sized slot, so a
+        // caller's declared capacity is the capacity it gets. The view still
+        // owns the slot, so the unused tail is never handed to anyone else.
+        let base = slot.into_ref();
+        // SAFETY: `class_for` chose a slot at least `count * size_of::<T>()`
+        // bytes, so `count` elements stay within it.
+        Some(unsafe { SliceMut::new(base, count as u32) })
     })
 }
 

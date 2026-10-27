@@ -21,6 +21,7 @@ use crate::buf::Slice;
 use crate::buf::SliceMut;
 use crate::buf::pool::Slab;
 use crate::buf::tracker::BorrowTracker;
+use crate::classes::BUFFER_MAX_ALIGN;
 use crate::classes::pack_bid;
 
 pub struct FixedSlab {
@@ -46,6 +47,11 @@ impl FixedSlab {
     pub(crate) fn new(slab_base: NonNull<u8>, size: u32, count: u32, class: u8) -> Self {
         assert!(size > 0);
         assert!(count > 0);
+        assert_eq!(
+            slab_base.as_ptr() as usize % size.min(BUFFER_MAX_ALIGN) as usize,
+            0,
+            "a class base must be aligned to min(size, one page)"
+        );
 
         // Seed the free stack so the first acquire returns slot 0.
         let mut free = Vec::with_capacity(count as usize);
@@ -58,6 +64,20 @@ impl FixedSlab {
             free,
             tracker: BorrowTracker::new(count as usize),
         }
+    }
+
+    /// Panics in debug builds if slot `local` is not aligned for `T`. The
+    /// layout guarantees `min(size, one page)` alignment for every slot, so
+    /// this catches a regression in `layout_classes`/`build_pools` exactly
+    /// where a typed view would otherwise be built from a misaligned pointer.
+    fn debug_assert_slot_aligned<T>(&self, local: u32) {
+        debug_assert_eq!(
+            self.slot_ptr(local).as_ptr() as usize % core::mem::align_of::<T>(),
+            0,
+            "slot {local} of a {}-byte class is not aligned for {}",
+            self.size,
+            core::any::type_name::<T>(),
+        );
     }
 
     #[cfg(test)]
@@ -96,6 +116,7 @@ impl FixedSlab {
             "acquire_ref: zero-sized types cannot be pooled"
         );
         let local = self.acquire_slot_shared()?;
+        self.debug_assert_slot_aligned::<T>(local);
         let generation = active_gen().expect("acquire_ref outside an active runtime");
         // SAFETY: acquire_shared registered a shared borrow on the slot and the
         // generation is the live one.
@@ -113,6 +134,7 @@ impl FixedSlab {
             "acquire_mut: zero-sized types cannot be pooled"
         );
         let local = self.acquire_slot()?;
+        self.debug_assert_slot_aligned::<T>(local);
         let generation = active_gen().expect("acquire_mut outside an active runtime");
         // SAFETY: acquire registered an exclusive borrow on the slot and the
         // generation is the live one.
@@ -127,6 +149,7 @@ impl FixedSlab {
     #[allow(dead_code)]
     pub fn acquire_slice<T>(&mut self) -> Option<Slice<T>> {
         let local = self.acquire_slot_shared()?;
+        self.debug_assert_slot_aligned::<T>(local);
         let generation = active_gen().expect("acquire_slice outside an active runtime");
         let elements = self.size / core::mem::size_of::<T>() as u32;
         // SAFETY: acquire_shared registered a shared borrow on the slot and the
@@ -144,6 +167,7 @@ impl FixedSlab {
     /// the class is exhausted.
     pub fn acquire_slice_mut<T>(&mut self) -> Option<SliceMut<T>> {
         let local = self.acquire_slot()?;
+        self.debug_assert_slot_aligned::<T>(local);
         let generation = active_gen().expect("acquire_slice_mut outside an active runtime");
         let elements = self.size / core::mem::size_of::<T>() as u32;
         // SAFETY: acquire registered an exclusive borrow on the slot and the
@@ -204,12 +228,65 @@ impl Slab for FixedSlab {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::alloc::Layout;
+    use std::alloc::alloc_zeroed;
+    use std::alloc::dealloc;
+    use std::panic::AssertUnwindSafe;
 
-    fn make_slab(count: u32, size: u32) -> (FixedSlab, Vec<u8>) {
-        let mut slab = vec![0u8; count as usize * size as usize];
-        let base = unsafe { NonNull::new_unchecked(slab.as_mut_ptr()) };
-        (FixedSlab::new(base, size, count, 0), slab)
+    use super::*;
+    use crate::buf::pool::Pool;
+    use crate::classes::SizeClass;
+
+    /// Backing storage for a test slab, aligned like the real one and freed on
+    /// drop. `Layout` is kept because `dealloc` needs the original size and
+    /// alignment.
+    struct Backing {
+        base: NonNull<u8>,
+        layout: Layout,
+    }
+
+    impl Drop for Backing {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        }
+    }
+
+    fn make_slab(count: u32, size: u32) -> (FixedSlab, Backing) {
+        let align = size.min(BUFFER_MAX_ALIGN) as usize;
+        let layout = Layout::from_size_align(count as usize * size as usize, align).unwrap();
+        let base = unsafe { alloc_zeroed(layout) };
+        assert!(!base.is_null(), "test slab allocation failed");
+        let base = unsafe { NonNull::new_unchecked(base) };
+        (FixedSlab::new(base, size, count, 0), Backing {
+            base,
+            layout,
+        })
+    }
+
+    #[test]
+    fn new_rejects_a_misaligned_base() {
+        let layout = Layout::from_size_align(32, 16).unwrap();
+        let raw = unsafe { alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "test slab allocation failed");
+        let base = unsafe { NonNull::new_unchecked(raw) };
+        let backing = Backing { base, layout };
+        let misaligned = unsafe { NonNull::new_unchecked(raw.add(1)) };
+        let res =
+            std::panic::catch_unwind(AssertUnwindSafe(|| FixedSlab::new(misaligned, 16, 2, 0)));
+        assert!(res.is_err(), "a misaligned class base must be rejected");
+        drop(backing);
+    }
+
+    #[test]
+    fn pool_rejects_a_class_that_does_not_match_its_slab() {
+        let (slab, _backing) = make_slab(2, 16);
+        let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            Pool::new(vec![SizeClass { size: 32, count: 2 }], vec![slab])
+        }));
+        assert!(
+            res.is_err(),
+            "a class table that disagrees with its slabs must be rejected"
+        );
     }
 
     #[test]
