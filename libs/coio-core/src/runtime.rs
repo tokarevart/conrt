@@ -6,6 +6,7 @@
 //! can neither invoke a completion callback nor touch `G` or an op's local.
 
 use core::cell::Cell;
+use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
@@ -278,6 +279,12 @@ type OpShim<G, L, B: Backend> = fn(&mut Runtime<G, L, B>, OpShimArgs<'_, L>);
 /// neither name a slot the runtime has since recycled (the new occupant has a
 /// fresh id) nor be mistaken for an op of a later runtime (the counter never
 /// resets). Copyable and inert.
+///
+/// The handle is deliberately neither `Send` nor `Sync`. Ids are unique only
+/// *within* a thread: every thread's counter starts at 1, so an `Op` moved to
+/// another thread would be indistinguishable from that runtime's first op and
+/// could cancel the wrong one. The thread-local runtime must be reached with an
+/// `Op` minted on the same thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Op {
     pub(crate) slot: u32,
@@ -286,6 +293,9 @@ pub struct Op {
     /// `user_data` for `ASYNC_CANCEL`.
     pub(crate) class: u8,
     id: NonZeroU64,
+    /// Raw pointers are `!Send`/`!Sync`; the zero-sized marker borrows that
+    /// property without storing anything or affecting `Copy`.
+    _not_send: PhantomData<*const ()>,
 }
 
 /// The payload of a live op: the shim that decodes the CQE and the erased
@@ -751,6 +761,7 @@ impl<G, L, B: Backend> Runtime<G, L, B> {
             slot: index,
             class,
             id,
+            _not_send: PhantomData,
         };
         match self.backend.arm(index, class, req) {
             Ok(()) => Ok(op),
