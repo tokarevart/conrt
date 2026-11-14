@@ -78,7 +78,16 @@ cargo run kill <pid>
 cargo run logs <pid>
 ```
 
-No root required — user namespaces handle privilege escalation.
+Join another container's network (both see the same `127.0.0.1`):
+
+```bash
+A=$(cargo run -- run --detach --rootfs /tmp/alpine -- /bin/sleep 3600)
+cargo run -- run --rootfs /tmp/alpine --net-pid "$A" /bin/sh -c '...'
+```
+
+No root required — user namespaces handle privilege escalation, including
+`--net-pid` joins.
+
 
 ## Phases
 
@@ -106,6 +115,20 @@ No root required — user namespaces handle privilege escalation.
 ### Phase 4 — Network 
 
 - `CLONE_NEWNET` with `lo` up
+- `--net-pid <pid>` joins a running container's user+net namespaces, so both
+  containers share loopback, ports and sockets
+- The join is done by a transient *shim* process, never by the daemon: the
+  clone child runs `setns(CLONE_NEWUSER)` → `setns(CLONE_NEWNET)` and only
+  then `unshare(NEWNS | NEWUTS | NEWIPC | NEWPID)` + `fork`. A namespace is
+  owned by the userns of the process that creates it, so creating mount/uts/
+  pid at `clone3` time would leave them owned by the daemon's userns and
+  mounts inside the joined container would fail with `EPERM`
+- The shim exits with the payload's status (exit codes and `waitpid` reaping
+  are unchanged), forwards catchable signals, and the payload is tied to the
+  shim with `PR_SET_PDEATHSIG(SIGKILL)` so `conrt kill` tears down the whole
+  joined namespace
+- Because the daemon keeps its own userns/netns, joins are repeatable: any
+  container can be joined any number of times, in any order
 
 ### Phase 5 — Daemon-managed run-attach 
 

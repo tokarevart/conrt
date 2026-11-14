@@ -886,12 +886,57 @@ pub fn send_request(socket_path: &Path, request: &Request) -> io::Result<Vec<u8>
     Ok(buf)
 }
 
+/// Target namespaces for `--net-pid`, opened by the daemon.
+///
+/// The daemon only holds these fds. `setns()` is performed by the clone child
+/// (see [`maybe_become_shim`]), so the daemon's own user/net namespaces are
+/// never modified and joins stay repeatable for the daemon's whole lifetime.
+struct JoinNamespaces {
+    user: std::fs::File,
+    net: std::fs::File,
+}
+
+/// Open the target container's user+net namespaces, waiting briefly for a
+/// just-spawned join container to finish switching.
+///
+/// A container started with `--net-pid` enters its namespaces in its shim
+/// shortly after `clone3`. Until then `/proc/<pid>/ns/*` still points at the
+/// daemon's namespaces. Every conrt container ends up in a userns/netns of its
+/// own, never in the daemon's, so "both differ from ours" is exactly the
+/// readiness condition; it also rejects pids that are not containers at all.
+fn open_join_namespaces(pid: i32) -> Result<JoinNamespaces, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let user = std::fs::File::open(format!("/proc/{pid}/ns/user"))
+            .map_err(|e| format!("cannot open pid {pid} user ns: {e}"))?;
+        let net = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+            .map_err(|e| format!("cannot open pid {pid} net ns: {e}"))?;
+        let user_ready = !same_namespace(&user, "/proc/self/ns/user")
+            .map_err(|e| format!("cannot stat pid {pid} user ns: {e}"))?;
+        let net_ready = !same_namespace(&net, "/proc/self/ns/net")
+            .map_err(|e| format!("cannot stat pid {pid} net ns: {e}"))?;
+        if user_ready && net_ready {
+            return Ok(JoinNamespaces { user, net });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "pid {pid} has not entered its container namespaces yet"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 struct PreparedResources {
     rootfs: Option<PathBuf>,
     overlay_dir: Option<PathBuf>,
     signal: interprocess::OneshotSignal,
     clone_flags: libc::c_int,
     needs_userns_maps: bool,
+    /// `--net-pid` target namespaces. `Some` means the container joins an
+    /// existing container's user+net namespaces; the clone child becomes the
+    /// shim that performs the join.
+    join: Option<JoinNamespaces>,
     command: Vec<CString>,
     /// Death pipe for the default init: `(read, write)`. Present only when
     /// running the built-in init. The daemon keeps the write end; the init
@@ -905,7 +950,7 @@ struct PreparedResources {
 
 /// Resolve all container resources needed before `clone3`: canonicalize
 /// rootfs, create overlay tempdir, allocate the interprocess OneshotSignal,
-/// join the target netns if `net_pid` is set, and compute `clone_flags`.
+/// open the target namespaces if `net_pid` is set, and compute `clone_flags`.
 /// Cleanup of acquired resources (overlay dir, signal) is the caller's
 /// responsibility on error.
 fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
@@ -934,22 +979,20 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
         Err(e) => return Err(format!("sync pipe creation failed: {e}")),
     };
 
-    let (clone_flags, needs_userns_maps) = match args.net_pid {
+    let (join, clone_flags, needs_userns_maps) = match args.net_pid {
         Some(pid) => {
-            let user_f = std::fs::File::open(format!("/proc/{pid}/ns/user"))
-                .map_err(|e| format!("cannot open pid {pid} user ns: {e}"))?;
-            let net_f = std::fs::File::open(format!("/proc/{pid}/ns/net"))
-                .map_err(|e| format!("cannot open pid {pid} net ns: {e}"))?;
-            sys::setns(user_f.as_raw_fd(), libc::CLONE_NEWUSER)
-                .map_err(|e| format!("setns(CLONE_NEWUSER) into pid {pid} failed: {e}"))?;
-            sys::setns(net_f.as_raw_fd(), libc::CLONE_NEWNET)
-                .map_err(|e| format!("setns(CLONE_NEWNET) into pid {pid} failed: {e}"))?;
-            (
-                libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC,
-                false,
-            )
+            // Only open the target namespaces here. Joining them mutates the
+            // caller's namespace view irreversibly, so it must not happen in
+            // the daemon: the clone child performs the switch. `open_...`
+            // waits for a join target's shim to finish switching, so chained
+            // joins right after spawn are deterministic.
+            let join = open_join_namespaces(pid)?;
+            // No namespaces at clone time: the shim creates the remaining ones
+            // after entering the target's userns (see `maybe_become_shim`).
+            (Some(join), 0, false)
         }
         None => (
+            None,
             libc::CLONE_NEWPID
                 | libc::CLONE_NEWNS
                 | libc::CLONE_NEWUTS
@@ -992,6 +1035,7 @@ fn prepare_run(args: RunArgs) -> Result<PreparedResources, String> {
         signal,
         clone_flags,
         needs_userns_maps,
+        join,
         command: args.command,
         death_pipe,
         init_argv,
@@ -1011,6 +1055,133 @@ fn parent_setup_maps_and_signal(
     }
     signal.signal();
     Ok(())
+}
+
+// ── `--net-pid`: namespace join shim ──────────────────────────────────────
+
+/// Payload pid while the shim waits for it; read from the signal handler below.
+static SHIM_PAYLOAD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Async-signal-safe forwarder: a signal sent to the container pid reaches the
+/// shim, which passes it on to the payload. `SIGKILL` needs no handler — the
+/// payload's parent-death signal covers it.
+extern "C" fn shim_forward_signal(sig: libc::c_int) {
+    let pid = SHIM_PAYLOAD.load(std::sync::atomic::Ordering::Relaxed);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+/// True if `fd` refers to the namespace at `path` (`/proc/self/ns/...`).
+fn same_namespace(fd: &std::fs::File, path: &str) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = std::fs::metadata(path)?;
+    let target = fd.metadata()?;
+    Ok(current.dev() == target.dev() && current.ino() == target.ino())
+}
+
+/// Enter the joined user and network namespaces, then create the remaining
+/// namespaces *after* the switch.
+///
+/// A namespace is owned by the user namespace of the process that creates it,
+/// and every later check — `mount(2)`, `sethostname(2)`, mounting procfs, and
+/// `setns(2)` itself — asks for `CAP_SYS_ADMIN` in that owning userns. Creating
+/// mount/uts/ipc/pid at `clone3` time would leave them owned by the daemon's
+/// userns, so mounts inside the joined container would fail with `EPERM`.
+fn enter_joined_namespaces(join: &JoinNamespaces) -> io::Result<()> {
+    // Re-entering the current userns is `EINVAL`; skip it (root daemons and
+    // containers already in the target userns hit this).
+    if !same_namespace(&join.user, "/proc/self/ns/user")? {
+        sys::setns(join.user.as_raw_fd(), libc::CLONE_NEWUSER)?;
+    }
+    // Inside the target userns we own its netns, so the capability check for
+    // `setns(CLONE_NEWNET)` passes even for an unprivileged daemon.
+    sys::setns(join.net.as_raw_fd(), libc::CLONE_NEWNET)?;
+    sys::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC | libc::CLONE_NEWPID)?;
+    Ok(())
+}
+
+/// In `--net-pid` mode, turn the clone child into a shim: enter the target
+/// namespaces, create the rest, fork the real payload and report its status.
+///
+/// Doing the switch here instead of in the daemon keeps the daemon in its own
+/// user/net namespaces. That is what makes joins repeatable: the daemon can
+/// join any container it created, in any order, any number of times.
+///
+/// Returns only in the payload; the shim waits for the payload and exits with
+/// its status, so the daemon's reaper and exit-code propagation are unchanged.
+fn maybe_become_shim(join: Option<&JoinNamespaces>, death_pipe: Option<&sys::FdPair>) {
+    let Some(join) = join else {
+        return;
+    };
+
+    if let Err(e) = enter_joined_namespaces(join) {
+        tracing::error!(%e, "join namespaces failed");
+        std::process::exit(1);
+    }
+
+    let payload = unsafe { libc::fork() };
+    if payload < 0 {
+        tracing::error!(e = %io::Error::last_os_error(), "fork failed in join shim");
+        std::process::exit(1);
+    }
+    if payload == 0 {
+        // Payload. Die with the shim: the payload is a grandchild of the
+        // daemon, and `conrt kill` signals the shim. SIGKILL cannot be
+        // forwarded, so tie the payload's lifetime to the shim's. The setting
+        // survives `execve` (it is only cleared for setuid/capability execs).
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        }
+        return;
+    }
+
+    // Shim. Forward catchable signals, then wait and mirror the status.
+    SHIM_PAYLOAD.store(payload, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            shim_forward_signal as *const () as usize as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            shim_forward_signal as *const () as usize as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            shim_forward_signal as *const () as usize as libc::sighandler_t,
+        );
+    }
+
+    // The daemon must remain the only holder of the death-pipe write end:
+    // otherwise the built-in init never sees `POLLHUP` when the daemon exits.
+    // (The payload closes its own copy in the caller.)
+    if let Some(dp) = death_pipe {
+        sys::close(dp.write);
+    }
+
+    let mut status: libc::c_int = 0;
+    loop {
+        let ret = unsafe { libc::waitpid(payload, &mut status, 0) };
+        if ret == payload {
+            break;
+        }
+        if ret < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        std::process::exit(1);
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    };
+    std::process::exit(code);
 }
 
 /// Called in the child process after `clone3`. Never returns — either execs
@@ -1676,6 +1847,9 @@ fn handle_run(rt: &mut Rt, sender: &libc::sockaddr_un, sender_len: libc::socklen
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
             }
+            // In `--net-pid` mode this enters the target namespaces and forks
+            // the payload; the shim below exits with the payload's status.
+            maybe_become_shim(prep.join.as_ref(), prep.death_pipe.as_ref());
             // Default init: drop the write end so the daemon is the sole
             // holder; keep the read end for the init loop.
             let death_pipe_read = prep.death_pipe.map(|dp| {
@@ -2779,6 +2953,9 @@ fn handle_run_attach(rt: &mut Rt, session_id: u64, request: Request) -> bool {
                 tracing::error!(%e, "sync wait failed");
                 std::process::exit(1);
             }
+            // In `--net-pid` mode this enters the target namespaces and forks
+            // the payload; the shim below exits with the payload's status.
+            maybe_become_shim(prep.join.as_ref(), prep.death_pipe.as_ref());
             let death_pipe_read = prep.death_pipe.map(|dp| {
                 sys::close(dp.write);
                 dp.read

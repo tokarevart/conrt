@@ -415,6 +415,315 @@ fn net_pid_localhost_communication() {
     );
 }
 
+/// Starts a detached container and returns its container PID.
+fn start_detached(daemon: &Daemon, args: &[&str]) -> i32 {
+    let mut full = vec!["run", "--detach"];
+    full.extend_from_slice(args);
+    let (ok, stdout, stderr) = run_conrt(daemon, &full);
+    assert!(ok, "detached run failed: {stderr}");
+    container_stdout(&stdout)
+        .trim()
+        .lines()
+        .last()
+        .expect("detached run should print a pid")
+        .trim()
+        .parse()
+        .expect("detached run pid should be numeric")
+}
+
+/// Host PIDs of `pid`'s direct children, via /proc/.../children.
+fn children_of(pid: i32) -> Vec<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn gone_or_zombie(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                == Some("Z")
+        }
+    }
+}
+
+#[test]
+fn net_pid_join_is_repeatable() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let parent = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let parent_arg = parent.to_string();
+
+    for tag in ["first_join", "second_join"] {
+        let (ok, stdout, stderr) = run_conrt(&daemon, &[
+            "run",
+            "--rootfs",
+            &rootfs,
+            "--net-pid",
+            &parent_arg,
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo {tag}"),
+        ]);
+        assert!(ok, "join #{tag} into the same container failed: {stderr}");
+        assert!(
+            container_stdout(&stdout).contains(tag),
+            "{tag}: unexpected output: {stdout:?}"
+        );
+    }
+
+    let _ = run_conrt(&daemon, &["kill", &parent_arg]);
+}
+
+#[test]
+fn net_pid_joins_containers_created_before_the_first_join() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let a = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let b = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let (a, b) = (a.to_string(), b.to_string());
+
+    for (tag, parent) in [("joined_a", &a), ("joined_b", &b)] {
+        let (ok, stdout, stderr) = run_conrt(&daemon, &[
+            "run",
+            "--rootfs",
+            &rootfs,
+            "--net-pid",
+            parent,
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo {tag}"),
+        ]);
+        assert!(ok, "join into {parent} failed: {stderr}");
+        assert!(container_stdout(&stdout).contains(tag));
+    }
+
+    let _ = run_conrt(&daemon, &["kill", &a]);
+    let _ = run_conrt(&daemon, &["kill", &b]);
+}
+
+#[test]
+fn net_pid_join_shares_netns_and_keeps_isolation() {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let parent = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let parent_arg = parent.to_string();
+    let parent_netns = std::fs::metadata(format!("/proc/{parent}/ns/net"))
+        .unwrap()
+        .ino();
+
+    let (ok, stdout, stderr) = run_conrt(&daemon, &[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        &parent_arg,
+        "--no-init",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo pid=$$; echo host=$(hostname); echo ns=$(stat -Lc %i /proc/self/ns/net); test -r \
+         /proc/self/stat && echo proc-ok",
+    ]);
+    assert!(ok, "joined run failed: {stderr}");
+    let out = container_stdout(&stdout);
+    assert!(
+        out.contains("pid=1"),
+        "joined container should be PID 1: {out}"
+    );
+    assert!(out.contains("host=conrt"), "UTS should be isolated: {out}");
+    assert!(
+        out.contains(&format!("ns={parent_netns}")),
+        "joined container should share the parent netns inode {parent_netns}: {out}"
+    );
+    assert!(out.contains("proc-ok"), "/proc should be mounted: {out}");
+
+    let _ = run_conrt(&daemon, &["kill", &parent_arg]);
+}
+
+#[test]
+fn net_pid_does_not_move_the_daemon() {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let parent = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let parent_arg = parent.to_string();
+
+    let (ok, _, stderr) = run_conrt(&daemon, &[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        &parent_arg,
+        "--",
+        "/bin/true",
+    ]);
+    assert!(ok, "join failed: {stderr}");
+
+    let host = std::fs::metadata("/proc/self/ns/net").unwrap();
+    let daemon_ns = std::fs::metadata(format!("/proc/{}/ns/net", daemon.0.id())).unwrap();
+    assert_eq!(
+        (host.dev(), host.ino()),
+        (daemon_ns.dev(), daemon_ns.ino()),
+        "the daemon must stay in the host netns after a join"
+    );
+
+    let _ = run_conrt(&daemon, &["kill", &parent_arg]);
+}
+
+#[test]
+fn net_pid_kill_tears_down_the_joined_container() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let parent = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let parent_arg = parent.to_string();
+    let joiner = start_detached(&daemon, &[
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        &parent_arg,
+        "--",
+        "/bin/sleep",
+        "60",
+    ]);
+    let joiner_arg = joiner.to_string();
+
+    // shim -> payload (PID 1 in the container pidns) -> user command.
+    // The daemon replies as soon as the shim is forked, so poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let payload = loop {
+        if let Some(pid) = children_of(joiner).first() {
+            break *pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the join shim did not fork a payload"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let user_cmd = loop {
+        if let Some(pid) = children_of(payload).first() {
+            break Some(*pid);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let (ok, _, stderr) = run_conrt(&daemon, &["kill", &joiner_arg]);
+    assert!(ok, "kill failed: {stderr}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let payload_gone = gone_or_zombie(payload);
+        let user_gone = user_cmd.is_none_or(gone_or_zombie);
+        if payload_gone && user_gone {
+            let _ = run_conrt(&daemon, &["kill", &parent_arg]);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("payload {payload} / user command {user_cmd:?} survived kill of the joined container");
+}
+
+#[test]
+fn net_pid_join_propagates_exit_code() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let parent = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let parent_arg = parent.to_string();
+
+    let output = Command::new(conrt_binary())
+        .args([
+            "run",
+            "--socket-path",
+            daemon.socket().to_str().unwrap(),
+            "--rootfs",
+            &rootfs,
+            "--net-pid",
+            &parent_arg,
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 42",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "exit code should survive the shim, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = run_conrt(&daemon, &["kill", &parent_arg]);
+}
+
+#[test]
+fn net_pid_chained_join() {
+    let Some(rootfs) = ensure_rootfs() else {
+        return;
+    };
+    let daemon = Daemon::new();
+    let a = start_detached(&daemon, &["--rootfs", &rootfs, "--", "/bin/sleep", "60"]);
+    let a_arg = a.to_string();
+    // A container that is itself a joiner lives in A's namespaces, so a join
+    // of that joiner must land in A's netns too.
+    let b = start_detached(&daemon, &[
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        &a_arg,
+        "--",
+        "/bin/sleep",
+        "60",
+    ]);
+    let b_arg = b.to_string();
+
+    let (ok, stdout, stderr) = run_conrt(&daemon, &[
+        "run",
+        "--rootfs",
+        &rootfs,
+        "--net-pid",
+        &b_arg,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo chained",
+    ]);
+    assert!(ok, "chained join failed: {stderr}");
+    assert!(container_stdout(&stdout).contains("chained"));
+
+    let _ = run_conrt(&daemon, &["kill", &a_arg]);
+    let _ = run_conrt(&daemon, &["kill", &b_arg]);
+}
+
 #[test]
 fn overlay_write_file() {
     let Some(rootfs) = ensure_rootfs() else {

@@ -294,6 +294,14 @@ pub fn setns(fd: RawFd, nstype: c_int) -> io::Result<()> {
     sys_ensure(unsafe { libc::setns(fd, nstype) }).map(|_| ())
 }
 
+/// `unshare(flags)` — disassociate parts of the calling process's execution
+/// context (namespaces). All namespace creation flags are accepted; the new
+/// namespaces are owned by the caller's current user namespace.
+#[inline]
+pub fn unshare(flags: c_int) -> io::Result<()> {
+    sys_ensure(unsafe { libc::unshare(flags) }).map(|_| ())
+}
+
 /// `dup2(oldfd, newfd)` — duplicate a file descriptor. If `newfd` is already
 /// open, it is atomically closed before the duplication.
 #[inline]
